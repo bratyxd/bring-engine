@@ -1,7 +1,7 @@
 # Agent Guide 05 — glTF 2.0 First-Class Pipeline & 3D Rendering
 
 ## Loading `.glb` and `.gltf` Files
-Bring Engine includes a pure NativeAOT, zero-reflection `Utf8JsonReader` glTF 2.0 loader (`BringEngine.Assets.Gltf.GltfLoader`) that reads directly into a bundle's `LinearArena`:
+Bring Engine includes a zero-reflection `Utf8JsonReader` glTF 2.0 loader (`BringEngine.Assets.Gltf.GltfLoader`) that reads directly into a bundle's `LinearArena`:
 - Supports `.glb` binary files AND `.gltf` JSON + external `.bin` / base64 URIs.
 - Extracts PBR Metallic-Roughness materials, embedded/external PNG/JPEG textures, vertex positions/normals/UV0/colors, auto-computed normals, `JOINTS_0`/`WEIGHTS_0` skinning, node hierarchies, skins (inverse bind matrices), and Step/Linear/CubicSpline animations.
 

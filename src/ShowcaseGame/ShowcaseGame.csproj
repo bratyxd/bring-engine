@@ -3,9 +3,14 @@
     <OutputType>Exe</OutputType>
     <RootNamespace>ShowcaseGame</RootNamespace>
     <AssemblyName>ShowcaseGame</AssemblyName>
-    <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <OptimizationPreference>Speed</OptimizationPreference>
+  </PropertyGroup>
+
+  <!-- Self-contained single-file ReadyToRun desktop build when publishing for a target RID -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' != ''">
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishReadyToRun>true</PublishReadyToRun>
   </PropertyGroup>
 
   <ItemGroup>

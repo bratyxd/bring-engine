@@ -17,6 +17,7 @@ public static unsafe class SimulationTests
         Assert.Run("TransformTable_ParentChildHierarchyPropagation", &TestTransformHierarchy);
         Assert.Run("CameraSystem_FollowShakeFrustumAndRayPick", &TestCameraSystem);
         Assert.Run("InputState_BitsetEdgesAndWASD", &TestInputState);
+        Assert.Run("GamepadInput_ButtonsAxesRadialDeadzoneMultiSlotAndCombinedMoveZeroGc", &TestGamepadInput);
     }
 
     private static void TestEntities()
@@ -151,5 +152,86 @@ public static unsafe class SimulationTests
 
         input.SetKey(KeyCode.W, false);
         Assert.True(input.IsKeyReleased(KeyCode.W), "W released");
+    }
+
+    private static void TestGamepadInput()
+    {
+        InputState input = default;
+        Assert.Equal((byte)0, input.ConnectedGamepadCount, "Initially 0 gamepads");
+        Assert.True(!input.IsGamepadConnected(0), "Slot 0 disconnected");
+
+        // Connect two gamepads (slot 0 & slot 2)
+        input.SetGamepadConnected(0, true, instanceId: 101u);
+        input.SetGamepadConnected(2, true, instanceId: 202u);
+        Assert.Equal((byte)2, input.ConnectedGamepadCount, "2 connected gamepads");
+        Assert.True(input.IsGamepadConnected(0) && input.IsGamepadConnected(2), "Slots 0 and 2 connected");
+
+        // Frame 1: press South (A) + Steam Deck LeftPaddle1 + trigger + sticks
+        input.BeginFrame();
+        input.SetGamepadButton(0, GamepadButton.South, true);
+        input.SetGamepadButton(0, GamepadButton.LeftPaddle1, true);
+        input.SetGamepadButton(2, GamepadButton.Start, true);
+        input.SetGamepadAxis(0, GamepadAxis.LeftX, 0.08f);  // inside 0.15 radial deadzone
+        input.SetGamepadAxis(0, GamepadAxis.LeftY, 0.06f);  // magnitude 0.10 <= 0.15 -> Zero!
+        input.SetGamepadAxis(0, GamepadAxis.RightX, 1.0f);
+        input.SetGamepadAxis(0, GamepadAxis.RightY, 1.0f);  // diagonal clamped to length 1.0
+        input.SetGamepadAxis(0, GamepadAxis.LeftTrigger, 0.75f);
+        input.SetGamepadAxis(0, GamepadAxis.RightTrigger, 1.5f); // clamped to 1.0
+
+        Assert.True(input.IsGamepadButtonDown(GamepadButton.South, 0), "South down");
+        Assert.True(input.IsGamepadButtonPressed(GamepadButton.South, 0), "South newly pressed");
+        Assert.True(input.IsGamepadButtonPressed(GamepadButton.LeftPaddle1, 0), "Steam Deck LeftPaddle1 pressed");
+        Assert.True(input.IsAnyGamepadButtonPressed(GamepadButton.Start), "Any-controller Start pressed on slot 2");
+
+        Vec2 deadStick = input.GetGamepadLeftStick(0, deadzone: 0.15f);
+        Assert.Near(0f, deadStick.X, 1e-5f, "Inside radial deadzone X == 0");
+        Assert.Near(0f, deadStick.Y, 1e-5f, "Inside radial deadzone Y == 0");
+
+        Vec2 clampedRight = input.GetGamepadRightStick(0, deadzone: 0.15f);
+        float rightLen = DetMath.Sqrt(clampedRight.X * clampedRight.X + clampedRight.Y * clampedRight.Y);
+        Assert.Near(1f, rightLen, 1e-4f, "Diagonal stick clamped to unit length");
+        Assert.Near(0.75f, input.GetGamepadLeftTrigger(0), 1e-4f, "Left trigger 0.75");
+        Assert.Near(1.0f, input.GetGamepadRightTrigger(0), 1e-4f, "Right trigger clamped to 1.0");
+
+        // Halfway past deadzone (0.15 + 0.5 * 0.85 = 0.575) -> exact 0.50 scaled output
+        input.SetGamepadAxis(0, GamepadAxis.LeftX, 0.575f);
+        input.SetGamepadAxis(0, GamepadAxis.LeftY, 0f);
+        Vec2 halfStick = input.GetGamepadLeftStick(0, deadzone: 0.15f);
+        Assert.Near(0.5f, halfStick.X, 1e-4f, "Scaled radial deadzone midpoint == 0.5");
+
+        // Unified GetMoveAxis combines keyboard + left stick + D-pad, clamped <= 1
+        input.SetKey(KeyCode.W, true);
+        Vec2 combined = input.GetMoveAxis(gamepadSlot: 0, deadzone: 0.15f);
+        float combLen = DetMath.Sqrt(combined.X * combined.X + combined.Y * combined.Y);
+        Assert.True(combined.X > 0.3f && combined.Y > 0.7f, "Combined keyboard W + stick right produces diagonal");
+        Assert.True(combLen <= 1.0001f, $"Combined move vector clamped to unit circle (got {combLen:F4})");
+
+        // Frame 2: hold South, release LeftPaddle1
+        input.BeginFrame();
+        input.SetGamepadButton(0, GamepadButton.LeftPaddle1, false);
+        Assert.True(input.IsGamepadButtonDown(GamepadButton.South, 0), "South still down");
+        Assert.True(!input.IsGamepadButtonPressed(GamepadButton.South, 0), "South not newly pressed");
+        Assert.True(input.IsGamepadButtonReleased(GamepadButton.LeftPaddle1, 0), "LeftPaddle1 released");
+
+        // Disconnect clears slot cleanly
+        input.SetGamepadConnected(0, false);
+        Assert.Equal((byte)1, input.ConnectedGamepadCount, "1 connected gamepad after disconnect");
+        Assert.True(!input.IsGamepadButtonDown(GamepadButton.South, 0), "Disconnected pad reports false");
+
+        // Zero-GC hot loop verification across 1000 frames
+        input.SetGamepadConnected(0, true, 101u);
+        long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+        float acc = 0f;
+        for (int i = 0; i < 1000; i++)
+        {
+            input.BeginFrame();
+            input.SetGamepadAxis(0, GamepadAxis.LeftX, (i & 1) == 0 ? 0.6f : -0.6f);
+            input.SetGamepadButton(0, GamepadButton.South, (i & 3) == 0);
+            Vec2 m = input.GetMoveAxis(0);
+            acc += m.X + (input.IsGamepadButtonPressed(GamepadButton.South, 0) ? 1f : 0f);
+        }
+        long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+        Assert.Equal(0L, gcAfter - gcBefore, "Gamepad input hot loop allocates 0 GC bytes");
+        Assert.True(acc > 0f, "Gamepad loop produced non-zero inputs");
     }
 }

@@ -1,7 +1,7 @@
 # Agent Guide 13 — Unity-Style Asset Compression, Default Texture Atlasing, `.bpack` Bundling & 9-Slice UI
 
 ## Overview
-Bring Engine ships a full **Unity-style asset bundling & compression pipeline** designed for minimal distribution size, minimal VRAM, minimal draw calls (`DRAWS` / `SETPASS`), and strict **NativeAOT / Zero-OOP** compatibility:
+Bring Engine ships a full **Unity-style asset bundling & compression pipeline** designed for minimal distribution size, minimal VRAM, minimal draw calls (`DRAWS` / `SETPASS`), and strict **Zero-OOP / Zero-GC** compatibility:
 
 1. **GPU Block Texture Compression (`TextureCompressionSystem`, `BRTX`)**:
    - **BC1 / DXT1** (`TexturePixelFormat.Bc1Rgba`): 4 bpp (**8:1 VRAM savings** over RGBA8) for opaque textures.

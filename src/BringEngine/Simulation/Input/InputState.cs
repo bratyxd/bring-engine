@@ -24,11 +24,179 @@ public enum KeyCode : int
 }
 
 /// <summary>
-/// Unmanaged input snapshot populated by SDL3 platform OR fed synthetically in headless tests/replays.
+/// Platform-agnostic standard gamepad buttons matching SDL3's SDL_GamepadButton layout
+/// (Xbox / PlayStation / Nintendo / Steam Deck including back grip paddles and touchpad click).
+/// </summary>
+public enum GamepadButton : byte
+{
+    South = 0,          // Xbox A / PS Cross / Nintendo B / Steam Deck A
+    East = 1,           // Xbox B / PS Circle / Nintendo A / Steam Deck B
+    West = 2,           // Xbox X / PS Square / Nintendo Y / Steam Deck X
+    North = 3,          // Xbox Y / PS Triangle / Nintendo X / Steam Deck Y
+    Back = 4,           // View / Share / Select
+    Guide = 5,          // Xbox / PS / Steam button
+    Start = 6,          // Menu / Options / Start
+    LeftStick = 7,      // L3
+    RightStick = 8,     // R3
+    LeftShoulder = 9,   // LB / L1
+    RightShoulder = 10, // RB / R1
+    DPadUp = 11,
+    DPadDown = 12,
+    DPadLeft = 13,
+    DPadRight = 14,
+    Misc1 = 15,         // Share / Capture / Mic
+    RightPaddle1 = 16,  // Steam Deck R4 / Xbox Elite P1
+    LeftPaddle1 = 17,   // Steam Deck L4 / Xbox Elite P3
+    RightPaddle2 = 18,  // Steam Deck R5 / Xbox Elite P2
+    LeftPaddle2 = 19,   // Steam Deck L5 / Xbox Elite P4
+    Touchpad = 20,      // DualSense / DualShock / Steam Deck touchpad click
+    Count = 21,
+}
+
+/// <summary>
+/// Platform-agnostic standard gamepad analog axes.
+/// Stick Y axes follow Bring Engine's +Y = Up convention (SDL3 raw negative-up is inverted automatically by PlatformSystem).
+/// </summary>
+public enum GamepadAxis : byte
+{
+    LeftX = 0,         // [-1, 1], +X = Right
+    LeftY = 1,         // [-1, 1], +Y = Up
+    RightX = 2,        // [-1, 1], +X = Right
+    RightY = 3,        // [-1, 1], +Y = Up
+    LeftTrigger = 4,   // [0, 1]
+    RightTrigger = 5,  // [0, 1]
+    Count = 6,
+}
+
+/// <summary>
+/// Per-controller unmanaged state snapshot (zero pointers, zero GC, deterministic across headless tests & 2-thread pipeline).
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct GamepadState
+{
+    public uint InstanceId;
+    public uint ButtonsDown;
+    public uint ButtonsPrev;
+    public float LeftX;
+    public float LeftY;
+    public float RightX;
+    public float RightY;
+    public float LeftTrigger;
+    public float RightTrigger;
+    public byte Connected;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void BeginFrame()
+    {
+        ButtonsPrev = ButtonsDown;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Clear()
+    {
+        InstanceId = 0;
+        ButtonsDown = 0;
+        ButtonsPrev = 0;
+        LeftX = 0f;
+        LeftY = 0f;
+        RightX = 0f;
+        RightY = 0f;
+        LeftTrigger = 0f;
+        RightTrigger = 0f;
+        Connected = 0;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SetButton(GamepadButton button, bool down)
+    {
+        byte idx = (byte)button;
+        if (idx >= (byte)GamepadButton.Count) return;
+        uint bit = 1u << idx;
+        if (down) ButtonsDown |= bit;
+        else ButtonsDown &= ~bit;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SetAxis(GamepadAxis axis, float value)
+    {
+        switch (axis)
+        {
+            case GamepadAxis.LeftX: LeftX = DetMath.Clamp(value, -1f, 1f); break;
+            case GamepadAxis.LeftY: LeftY = DetMath.Clamp(value, -1f, 1f); break;
+            case GamepadAxis.RightX: RightX = DetMath.Clamp(value, -1f, 1f); break;
+            case GamepadAxis.RightY: RightY = DetMath.Clamp(value, -1f, 1f); break;
+            case GamepadAxis.LeftTrigger: LeftTrigger = DetMath.Clamp01(value); break;
+            case GamepadAxis.RightTrigger: RightTrigger = DetMath.Clamp01(value); break;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IsButtonDown(GamepadButton button)
+    {
+        byte idx = (byte)button;
+        return Connected != 0 && idx < (byte)GamepadButton.Count && (ButtonsDown & (1u << idx)) != 0;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IsButtonPressed(GamepadButton button)
+    {
+        byte idx = (byte)button;
+        if (Connected == 0 || idx >= (byte)GamepadButton.Count) return false;
+        uint bit = 1u << idx;
+        return (ButtonsDown & bit) != 0 && (ButtonsPrev & bit) == 0;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IsButtonReleased(GamepadButton button)
+    {
+        byte idx = (byte)button;
+        if (Connected == 0 || idx >= (byte)GamepadButton.Count) return false;
+        uint bit = 1u << idx;
+        return (ButtonsDown & bit) == 0 && (ButtonsPrev & bit) != 0;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly Vec2 GetLeftStick(float deadzone = 0.15f)
+        => Connected != 0 ? ApplyRadialDeadzone(LeftX, LeftY, deadzone) : Vec2.Zero;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly Vec2 GetRightStick(float deadzone = 0.15f)
+        => Connected != 0 ? ApplyRadialDeadzone(RightX, RightY, deadzone) : Vec2.Zero;
+
+    public readonly Vec2 GetDPadAxis()
+    {
+        if (Connected == 0) return Vec2.Zero;
+        float x = (IsButtonDown(GamepadButton.DPadRight) ? 1f : 0f) - (IsButtonDown(GamepadButton.DPadLeft) ? 1f : 0f);
+        float y = (IsButtonDown(GamepadButton.DPadUp) ? 1f : 0f) - (IsButtonDown(GamepadButton.DPadDown) ? 1f : 0f);
+        float len = DetMath.Sqrt(x * x + y * y);
+        return len > 1e-4f ? new Vec2(x / len, y / len) : Vec2.Zero;
+    }
+
+    /// <summary>
+    /// Applies a smooth scaled radial deadzone and clamps magnitude to 1.0 (ideal for twin-stick & Steam Deck controls).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vec2 ApplyRadialDeadzone(float x, float y, float deadzone)
+    {
+        float dz = DetMath.Clamp(deadzone, 0f, 0.95f);
+        float mag = DetMath.Sqrt(x * x + y * y);
+        if (mag <= dz || mag <= 1e-5f) return Vec2.Zero;
+        float scaled = (mag - dz) / (1f - dz);
+        if (scaled > 1f) scaled = 1f;
+        float factor = scaled / mag;
+        return new Vec2(x * factor, y * factor);
+    }
+}
+
+/// <summary>
+/// Unmanaged input snapshot populated by SDL3 platform (keyboard, mouse, up to 4 gamepads)
+/// OR fed synthetically in headless tests and deterministic playtests.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct InputState
 {
+    public const int MaxGamepads = 4;
+
     public fixed ulong KeysDown[8];     // 512 scancodes bitset
     public fixed ulong KeysPrev[8];
     public float MouseX;
@@ -38,6 +206,13 @@ public unsafe struct InputState
     public float MouseWheelY;
     public uint MouseButtonsDown;
     public uint MouseButtonsPrev;
+
+    // Inline fixed 4-controller state (copies cleanly by value across Logic/Render threads with 0 pointers)
+    public GamepadState Gamepad0;
+    public GamepadState Gamepad1;
+    public GamepadState Gamepad2;
+    public GamepadState Gamepad3;
+    public byte ConnectedGamepadCount;
     public byte QuitRequested;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -49,6 +224,10 @@ public unsafe struct InputState
         MouseDeltaX = 0f;
         MouseDeltaY = 0f;
         MouseWheelY = 0f;
+        Gamepad0.BeginFrame();
+        Gamepad1.BeginFrame();
+        Gamepad2.BeginFrame();
+        Gamepad3.BeginFrame();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -102,6 +281,138 @@ public unsafe struct InputState
         return (MouseButtonsDown & bit) != 0 && (MouseButtonsPrev & bit) == 0;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly GamepadState GetGamepad(int slot = 0) => slot switch
+    {
+        0 => Gamepad0,
+        1 => Gamepad1,
+        2 => Gamepad2,
+        3 => Gamepad3,
+        _ => default,
+    };
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void RecountConnectedGamepads()
+    {
+        ConnectedGamepadCount = (byte)(Gamepad0.Connected + Gamepad1.Connected + Gamepad2.Connected + Gamepad3.Connected);
+    }
+
+    public void SetGamepadConnected(int slot, bool connected, uint instanceId = 0)
+    {
+        if ((uint)slot >= MaxGamepads) return;
+        ref GamepadState pad = ref GetGamepadRef(slot);
+        if (connected)
+        {
+            pad.Clear();
+            pad.Connected = 1;
+            pad.InstanceId = instanceId;
+        }
+        else
+        {
+            pad.Clear();
+        }
+        RecountConnectedGamepads();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SetGamepadButton(int slot, GamepadButton button, bool down)
+    {
+        if ((uint)slot >= MaxGamepads) return;
+        ref GamepadState pad = ref GetGamepadRef(slot);
+        if (pad.Connected == 0)
+        {
+            pad.Connected = 1;
+            RecountConnectedGamepads();
+        }
+        pad.SetButton(button, down);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SetGamepadAxis(int slot, GamepadAxis axis, float value)
+    {
+        if ((uint)slot >= MaxGamepads) return;
+        ref GamepadState pad = ref GetGamepadRef(slot);
+        if (pad.Connected == 0)
+        {
+            pad.Connected = 1;
+            RecountConnectedGamepads();
+        }
+        pad.SetAxis(axis, value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void CopyGamepadsFrom(in InputState source)
+    {
+        CopyGamepadDownState(ref Gamepad0, in source.Gamepad0);
+        CopyGamepadDownState(ref Gamepad1, in source.Gamepad1);
+        CopyGamepadDownState(ref Gamepad2, in source.Gamepad2);
+        CopyGamepadDownState(ref Gamepad3, in source.Gamepad3);
+        ConnectedGamepadCount = source.ConnectedGamepadCount;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void CopyGamepadDownState(ref GamepadState dst, in GamepadState src)
+    {
+        dst.Connected = src.Connected;
+        dst.InstanceId = src.InstanceId;
+        dst.ButtonsDown = src.ButtonsDown;
+        dst.LeftX = src.LeftX;
+        dst.LeftY = src.LeftY;
+        dst.RightX = src.RightX;
+        dst.RightY = src.RightY;
+        dst.LeftTrigger = src.LeftTrigger;
+        dst.RightTrigger = src.RightTrigger;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ref GamepadState GetGamepadRef(int slot)
+    {
+        switch (slot)
+        {
+            case 0: return ref Gamepad0;
+            case 1: return ref Gamepad1;
+            case 2: return ref Gamepad2;
+            default: return ref Gamepad3;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IsGamepadConnected(int slot = 0) => GetGamepad(slot).Connected != 0;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IsGamepadButtonDown(GamepadButton button, int slot = 0) => GetGamepad(slot).IsButtonDown(button);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IsGamepadButtonPressed(GamepadButton button, int slot = 0) => GetGamepad(slot).IsButtonPressed(button);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IsGamepadButtonReleased(GamepadButton button, int slot = 0) => GetGamepad(slot).IsButtonReleased(button);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IsAnyGamepadButtonPressed(GamepadButton button)
+        => Gamepad0.IsButtonPressed(button) || Gamepad1.IsButtonPressed(button)
+        || Gamepad2.IsButtonPressed(button) || Gamepad3.IsButtonPressed(button);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly Vec2 GetGamepadLeftStick(int slot = 0, float deadzone = 0.15f) => GetGamepad(slot).GetLeftStick(deadzone);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly Vec2 GetGamepadRightStick(int slot = 0, float deadzone = 0.15f) => GetGamepad(slot).GetRightStick(deadzone);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly float GetGamepadLeftTrigger(int slot = 0)
+    {
+        GamepadState g = GetGamepad(slot);
+        return g.Connected != 0 ? g.LeftTrigger : 0f;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly float GetGamepadRightTrigger(int slot = 0)
+    {
+        GamepadState g = GetGamepad(slot);
+        return g.Connected != 0 ? g.RightTrigger : 0f;
+    }
+
     public readonly Vec2 GetMoveAxisWASD()
     {
         float x = (IsKeyDown(KeyCode.D) || IsKeyDown(KeyCode.Right) ? 1f : 0f)
@@ -110,5 +421,27 @@ public unsafe struct InputState
                 - (IsKeyDown(KeyCode.S) || IsKeyDown(KeyCode.Down) ? 1f : 0f);
         float len = DetMath.Sqrt(x * x + y * y);
         return len > 1e-4f ? new Vec2(x / len, y / len) : Vec2.Zero;
+    }
+
+    /// <summary>
+    /// Unified movement axis combining Keyboard (WASD / Arrow keys) + Gamepad Left Stick + Gamepad D-Pad,
+    /// clamped to unit circle (length <= 1.0) so desktop and Steam Deck / controller controls work seamlessly together.
+    /// </summary>
+    public readonly Vec2 GetMoveAxis(int gamepadSlot = 0, float deadzone = 0.15f)
+    {
+        Vec2 kb = GetMoveAxisWASD();
+        GamepadState pad = GetGamepad(gamepadSlot);
+        Vec2 stick = pad.GetLeftStick(deadzone);
+        Vec2 dpad = pad.GetDPadAxis();
+
+        float x = kb.X + stick.X + dpad.X;
+        float y = kb.Y + stick.Y + dpad.Y;
+        float lenSq = x * x + y * y;
+        if (lenSq > 1f)
+        {
+            float inv = 1f / DetMath.Sqrt(lenSq);
+            return new Vec2(x * inv, y * inv);
+        }
+        return new Vec2(x, y);
     }
 }

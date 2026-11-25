@@ -13,7 +13,7 @@ public static class Program
             if (args[i] == "--headless-only") headlessOnly = true;
         }
 
-        Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - NativeAOT Test Suite{(headlessOnly ? " (Headless Only)" : "")}");
+        Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - CoreCLR Test Suite{(headlessOnly ? " (Headless Only)" : "")}");
         CoreTests.RunAll();
         JobSystemTests.RunAll();
         SimulationTests.RunAll();

@@ -1,4 +1,4 @@
-# Agent Guide 03 — Data-Driven ECS World, Transforms & Input
+# Agent Guide 03 — Data-Driven ECS World, Transforms & Input (Keyboard, Mouse & SDL3 Gamepads)
 
 ## Entity Lifecycle (`EntityTable` + `EntitySystem`)
 Entities are lightweight 32-bit generational handles (`EntityId`), tagged with their owning `SceneId`.
@@ -28,5 +28,39 @@ Follow the exact same pattern in your game project:
 2. Iterate `0..set.Count` densely in `public static unsafe class MyGameSystem`.
 3. Remove components cleanly when destroying an entity or unloading a scene.
 
-## Platform-Agnostic `InputState`
-`InputState` is a plain unmanaged bitset struct. In windowed mode, `PlatformSystem.PollEvents` fills it from SDL3. In headless mode / tests, set keys directly (`input.BeginFrame(); input.SetKey(KeyCode.W, true);`) for deterministic replay.
+## Platform-Agnostic `InputState` (Keyboard, Mouse & Up to 4 SDL3 Gamepads)
+`InputState` is a single flat unmanaged struct (zero pointers, zero GC) that copies atomically across the 2-thread pipeline. In windowed mode, `PlatformSystem.PollEvents` populates keyboard, mouse, and all connected SDL3 gamepads (Xbox, PlayStation, Nintendo, and **Steam Deck** / Steam Input, including hot-plug and Steam Deck's 4 back grip paddles `LeftPaddle1`, `LeftPaddle2`, `RightPaddle1`, `RightPaddle2` and `Touchpad` click).
+
+### Unified Keyboard + Controller Movement (Desktop & Steam Deck Ready!)
+```csharp
+// Combines WASD / Arrow keys + Gamepad Left Stick (scaled radial deadzone) + D-Pad, clamped to length <= 1.0
+Vec2 move = input.GetMoveAxis(gamepadSlot: 0, deadzone: 0.15f);
+
+// Direct gamepad queries (zero SDL references — 100% Simulation-safe & headless-testable!)
+bool jump    = input.IsKeyPressed(KeyCode.Space) || input.IsGamepadButtonPressed(GamepadButton.South);
+bool dash    = input.IsKeyPressed(KeyCode.LeftShift) || input.IsGamepadButtonPressed(GamepadButton.East)
+               || input.IsGamepadButtonPressed(GamepadButton.LeftPaddle1);
+bool pause   = input.IsKeyPressed(KeyCode.Escape) || input.IsAnyGamepadButtonPressed(GamepadButton.Start);
+Vec2 aim     = input.GetGamepadRightStick(slot: 0, deadzone: 0.15f);
+float fire   = input.GetGamepadRightTrigger(slot: 0); // [0, 1]
+```
+
+### Controller Haptics / Rumble (Main Thread / View Only)
+Trigger rumble on the Main Thread (never in `Simulation/` or the Logic Thread) when draining `SimEvent` feedback:
+```csharp
+// Dual-motor rumble (low/heavy left motor, high/sharp right motor, duration in ms)
+PlatformSystem.RumbleGamepad(ref window, slot: 0, lowFreq01: 0.6f, highFreq01: 0.8f, durationMs: 140);
+
+// Optional impulse triggers (Xbox controllers)
+PlatformSystem.RumbleGamepadTriggers(ref window, slot: 0, left01: 0.3f, right01: 0.7f, durationMs: 100);
+```
+
+### Deterministic Headless Testing & Synthetic Replay
+```csharp
+InputState input = default;
+input.SetGamepadConnected(0, true, instanceId: 1);
+input.BeginFrame();
+input.SetKey(KeyCode.W, true);
+input.SetGamepadButton(0, GamepadButton.South, true);
+input.SetGamepadAxis(0, GamepadAxis.LeftX, 0.75f); // +X = Right, +Y = Up
+```

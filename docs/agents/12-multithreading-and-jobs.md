@@ -11,7 +11,7 @@ Because Bring Engine is strictly **Data-Oriented** (64-byte aligned SoA tables, 
    - Async **`JobSystem.Schedule`** / **`JobSystem.ScheduleParallelFor`** + DAG **`JobSystem.CombineDependencies`**.
    - Cooperative cancellation (**`JobSystem.RequestCancel`** / **`IsCancelRequested`**) for multi-frame background generation.
    - Lock-free per-worker native scratch arenas (**`JobSystem.GetWorkerScratch(sched, workerIndex)`**).
-   - **0 GC bytes allocated** per job, **0 OOP**, **100% NativeAOT**, and **`NativeMemoryTracker.LiveBytes == 0`** on teardown.
+   - **0 GC bytes allocated** per job, **0 OOP**, and **`NativeMemoryTracker.LiveBytes == 0`** on teardown.
 
 ## 2. CRITICAL RULE: Do NOT Multithread Everything!
 > **Only parallelize when it genuinely makes sense.** Multithreading tiny loops wastes CPU on synchronization, cache-line bouncing, and wakeups — making frames *slower*, not faster.

@@ -5,14 +5,14 @@
 ## 1. Folder Structure (Strict Simulation vs. View Separation)
 ```text
 src/<YourGame>/
-├── <YourGame>.csproj           # PublishAot=true, ProjectReference -> BringEngine
+├── <YourGame>.csproj           # Desktop CoreCLR (.NET 10) + ReadyToRun on publish, ProjectReference -> BringEngine
 ├── Program.cs                  # Bootstraps allocators, EngineWorld, Bundles, Scenes, Headless & Windowed loops
 ├── Simulation/                 # ZERO SDL/GPU references! Runs headlessly & deterministically.
 │   ├── GameAllocators.cs       # Persistent, Level, Frame LinearArenas created at startup
 │   ├── GameSimState.cs         # Unmanaged SoA structs (Fix32/FixVec3, DetRng, SimEventQueue)
 │   └── GameSimSystems.cs       # Static unsafe systems: ResetMatch, StepFixed, ComputeStateHash
 ├── View/                       # Reads GameSimState & SimEventQueue; never mutates gameplay truth.
-│   ├── GameAssets.cs           # Asset bundle loader function pointers (.glb, textures, SDF fonts)
+│   ├── GameAssets.cs           # Asset bundle loader function pointers (.bpack, .glb, textures, SDF fonts)
 │   ├── GameViewState.cs        # Visual handles (EntityId, SpriteHandle, TextHandle, CameraHandle, EmitterHandle)
 │   └── GameViewSystems.cs      # Scene hooks (OnLoad, OnUnload, OnViewSync) syncing visuals
 └── Assets/
@@ -21,13 +21,13 @@ src/<YourGame>/
 ```
 
 ## 2. Golden Rules Checklist for Game Agents
-1. **Mandatory NativeAOT Release Target (Non-Negotiable)**:
-   - **All Bring Engine games are released as NativeAOT native binaries.** Every game `.csproj` MUST set `<PublishAot>true</PublishAot>` (plus inheriting `Directory.Build.props`, where all `IL2xxx` and `IL3xxx` AOT/trim analyzer warnings are hard compile errors).
-   - **NEVER** use `System.Reflection`, `System.Linq.Expressions`, `dynamic`, runtime codegen (`Reflection.Emit`), reflection-based JSON (`JsonSerializer` without source gen — use `Utf8JsonReader`/`Utf8JsonWriter` or binary formats instead), or non-AOT-compatible NuGet packages.
-   - Always treat `dotnet publish -c Release -r <rid>` (not just `dotnet build` or `dotnet run`) as the required verification gate before considering any game feature done.
+1. **Desktop CoreCLR (.NET 10) + Self-Contained ReadyToRun (Windows, Linux / Steam Deck, macOS)**:
+   - Games run on **CoreCLR JIT** for fast 1–2s `dotnet build` / `dotnet run` iteration, Dynamic PGO SIMD throughput, and full .NET NuGet package compatibility (physics, audio, networking, modding, serializers, etc.).
+   - Publishing with `-r <rid>` (`win-x64`, `linux-x64`, `osx-arm64`) automatically produces a standalone **self-contained single-file ReadyToRun** executable (no .NET install required on the player's PC or Steam Deck).
+   - Keep hot loops (`StepFixed`, `OnViewSync`, `ExtractRenderPacket`) strictly zero-OOP and zero-GC so CoreCLR never pauses mid-frame.
 2. **Allocate once at startup**: Create `EngineAllocators` and `GameAllocators` in `Program.Main`. Call `BeginFrame()` every frame; NEVER allocate managed objects in `StepFixed` or `OnViewSync`.
 3. **Pure Data + Static Systems**: No classes for entities, enemies, bullets, or UI widgets. Put arrays in `GameSimState` (`FixVec3* EnemyPos`, `byte* EnemyAlive`, ...) and iterate linearly in `static unsafe class GameSimSystems`.
-4. **Deterministic Gameplay**: Use `Fix32` / `FixVec3` and `DetRng` inside `Simulation/`. Never call `Random.Shared` or `DateTime.Now`.
+4. **Deterministic Gameplay + Seamless Keyboard & Gamepad Input**: Use `Fix32` / `FixVec3` and `DetRng` inside `Simulation/`. Never call `Random.Shared` or `DateTime.Now`. Use `input.GetMoveAxis()` and `GamepadButton` (`South`/`East`/`Start`/Steam Deck paddles) alongside keyboard bindings so games play natively on Desktop AND Steam Deck; trigger `PlatformSystem.RumbleGamepad` on the Main Thread for hit/explosion haptics.
 5. **Decoupled View Sync via Events**: Emit plain `SimEvent` structs from `Simulation/` (`EnemyHit`, `EnemyKilled`, `ItemCollected`). Consume them in `View/` to trigger `ParticleSystem.Burst`, `CameraSystem.AddTrauma`, `TweenSystem`, and floating 3D SDF `TextData`.
 6. **Compressed Asset Bundles (`.bpack`), Default Atlasing, 9-Slice UI & Unity-Like Scenes**:
    - Store raw source `.png`/`.jpg`/`.glb`/`.ttf` assets outside `dist/` (e.g., `raw_assets/<bundle>/`) and compile them with `BringPacker` (`tools/BringPacker`) into compressed `assets/<bundle>.bpack` bundles (BC1/BC3 GPU-compressed default atlases + 9-slice `SpriteRegionData` + Brotli/LZ4-compressed `.glb` models with BC1/BC3 embedded textures). Load via `BundleSystem.RegisterPack`.
@@ -49,7 +49,7 @@ src/<YourGame>/
    - Use `JobScheduler` + `JobSystem` (`ParallelFor`, async `ScheduleParallelFor` + `IsComplete`, `CombineDependencies`, `RequestCancel`, per-worker `GetWorkerScratch`) when profiling shows a genuinely heavy SoA loop (hundreds/thousands of independent entities, particles, transforms, spatial/flow grids) or multi-frame background generation (maps, nav grids, chunk meshes).
    - **Do NOT multithread tiny loops** (< ~500–1000 items or < 0.5 ms) — pass a sensible `minParallelCount` so small workloads stay single-threaded inline with zero sync overhead.
    - Keep parallel kernels deterministic (disjoint writes, per-item seeded `DetRng`, zero SDL3/GPU calls, always `RequestCancel` + `Complete` before resetting/disposing arenas). See [`docs/agents/12-multithreading-and-jobs.md`](../../docs/agents/12-multithreading-and-jobs.md).
-10. **Always Verify NativeAOT Publish, Headless Determinism & GPU Render**:
+10. **Verify Desktop Publish, Headless Determinism & GPU Render**:
    ```bash
    dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64
    ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --headless --ticks 600

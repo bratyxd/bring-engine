@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using BringEngine.Core.Math;
 using BringEngine.Simulation.Input;
 using SDL3;
 
@@ -13,11 +14,11 @@ public enum WindowMode : byte
 }
 
 /// <summary>
-/// Unmanaged SDL3 window & timing state. Only initialized in non-headless mode.
+/// Unmanaged SDL3 window, gamepad handles & timing state. Only initialized in non-headless mode.
 /// MUST be owned and polled on the Main Thread (SDL3 platform requirement).
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
-public struct PlatformWindow
+public unsafe struct PlatformWindow
 {
     public nint Window;
     public int Width;
@@ -27,8 +28,11 @@ public struct PlatformWindow
     public int WindowedWidth;
     public int WindowedHeight;
     public ulong LastTicksNs;
+    public fixed long GamepadHandles[InputState.MaxGamepads];
+    public fixed uint GamepadIds[InputState.MaxGamepads];
     public WindowMode Mode;
     public byte Initialized;
+    public byte GamepadSubsystemActive;
     public byte Closed;
     public byte Resized;
 }
@@ -36,7 +40,8 @@ public struct PlatformWindow
 public static unsafe class PlatformSystem
 {
     /// <summary>
-    /// Creates an SDL3 window. All Bring Engine games default to BorderlessFullscreen (desktop borderless full window).
+    /// Creates an SDL3 window (with Gamepad subsystem initialized for Xbox / PlayStation / Steam Deck / Steam Input).
+    /// All Bring Engine games default to BorderlessFullscreen (desktop borderless full window).
     /// Hidden windows (used by --verify-render and GPU unit tests) stay at exact (width, height) in Windowed mode.
     /// </summary>
     public static PlatformWindow InitWindow(
@@ -46,8 +51,14 @@ public static unsafe class PlatformSystem
         bool hidden = false,
         WindowMode mode = WindowMode.BorderlessFullscreen)
     {
-        if (!SDL.Init(SDL.InitFlags.Video | SDL.InitFlags.Events))
-            throw new InvalidOperationException($"SDL_Init failed: {SDL.GetError()}");
+        byte gamepadReady = 1;
+        if (!SDL.Init(SDL.InitFlags.Video | SDL.InitFlags.Events | SDL.InitFlags.Gamepad))
+        {
+            // Graceful fallback for restricted headless containers without gamepad support
+            gamepadReady = 0;
+            if (!SDL.Init(SDL.InitFlags.Video | SDL.InitFlags.Events))
+                throw new InvalidOperationException($"SDL_Init failed: {SDL.GetError()}");
+        }
 
         WindowMode effectiveMode = hidden ? WindowMode.Windowed : mode;
 
@@ -92,6 +103,7 @@ public static unsafe class PlatformSystem
             LastTicksNs = SDL.GetTicksNS(),
             Mode = effectiveMode,
             Initialized = 1,
+            GamepadSubsystemActive = gamepadReady,
         };
     }
 
@@ -203,14 +215,188 @@ public static unsafe class PlatformSystem
                 case SDL.EventType.MouseWheel:
                     input.MouseWheelY += ev.Wheel.Y;
                     break;
+
+                case SDL.EventType.GamepadAdded:
+                    HandleGamepadAdded(ref win, ref input, ev.GDevice.Which);
+                    break;
+
+                case SDL.EventType.GamepadRemoved:
+                    HandleGamepadRemoved(ref win, ref input, ev.GDevice.Which);
+                    break;
+
+                case SDL.EventType.GamepadButtonDown:
+                case SDL.EventType.GamepadButtonUp:
+                {
+                    int slot = FindGamepadSlot(in win, ev.GButton.Which);
+                    if (slot >= 0 && TryMapGamepadButton((SDL.GamepadButton)ev.GButton.Button, out GamepadButton mapped))
+                        input.SetGamepadButton(slot, mapped, type == SDL.EventType.GamepadButtonDown);
+                    break;
+                }
+
+                case SDL.EventType.GamepadAxisMotion:
+                {
+                    int slot = FindGamepadSlot(in win, ev.GAxis.Which);
+                    if (slot >= 0 && TryMapGamepadAxis((SDL.GamepadAxis)ev.GAxis.Axis, ev.GAxis.Value, out GamepadAxis axis, out float norm))
+                        input.SetGamepadAxis(slot, axis, norm);
+                    break;
+                }
             }
         }
 
         SyncPixelSize(ref win);
     }
 
+    /// <summary>
+    /// Triggers dual-motor controller rumble (Main Thread / View only).
+    /// lowFreq01 and highFreq01 are in [0, 1]; durationMs = 0 stops active rumble.
+    /// </summary>
+    public static bool RumbleGamepad(ref PlatformWindow win, int slot, float lowFreq01, float highFreq01, uint durationMs)
+    {
+        if ((uint)slot >= InputState.MaxGamepads) return false;
+        nint handle = (nint)win.GamepadHandles[slot];
+        if (handle == nint.Zero) return false;
+        ushort low = (ushort)(DetMath.Clamp01(lowFreq01) * 65535f);
+        ushort high = (ushort)(DetMath.Clamp01(highFreq01) * 65535f);
+        return SDL.RumbleGamepad(handle, low, high, durationMs);
+    }
+
+    /// <summary>
+    /// Triggers impulse trigger rumble on supported controllers (Main Thread / View only).
+    /// </summary>
+    public static bool RumbleGamepadTriggers(ref PlatformWindow win, int slot, float left01, float right01, uint durationMs)
+    {
+        if ((uint)slot >= InputState.MaxGamepads) return false;
+        nint handle = (nint)win.GamepadHandles[slot];
+        if (handle == nint.Zero) return false;
+        ushort left = (ushort)(DetMath.Clamp01(left01) * 65535f);
+        ushort right = (ushort)(DetMath.Clamp01(right01) * 65535f);
+        return SDL.RumbleGamepadTriggers(handle, left, right, durationMs);
+    }
+
+    public static string? GetGamepadName(in PlatformWindow win, int slot)
+    {
+        if ((uint)slot >= InputState.MaxGamepads) return null;
+        nint handle = (nint)win.GamepadHandles[slot];
+        return handle != nint.Zero ? SDL.GetGamepadName(handle) : null;
+    }
+
+    private static void HandleGamepadAdded(ref PlatformWindow win, ref InputState input, uint instanceId)
+    {
+        if (instanceId == 0 || FindGamepadSlot(in win, instanceId) >= 0) return;
+        int freeSlot = -1;
+        for (int i = 0; i < InputState.MaxGamepads; i++)
+        {
+            if (win.GamepadHandles[i] == 0) { freeSlot = i; break; }
+        }
+        if (freeSlot < 0) return;
+
+        nint pad = SDL.OpenGamepad(instanceId);
+        if (pad == nint.Zero) return;
+
+        win.GamepadHandles[freeSlot] = pad;
+        win.GamepadIds[freeSlot] = instanceId;
+        input.SetGamepadConnected(freeSlot, true, instanceId);
+    }
+
+    private static void HandleGamepadRemoved(ref PlatformWindow win, ref InputState input, uint instanceId)
+    {
+        int slot = FindGamepadSlot(in win, instanceId);
+        if (slot < 0) return;
+
+        nint pad = (nint)win.GamepadHandles[slot];
+        if (pad != nint.Zero) SDL.CloseGamepad(pad);
+        win.GamepadHandles[slot] = 0;
+        win.GamepadIds[slot] = 0;
+        input.SetGamepadConnected(slot, false, 0);
+    }
+
+    private static int FindGamepadSlot(in PlatformWindow win, uint instanceId)
+    {
+        for (int i = 0; i < InputState.MaxGamepads; i++)
+        {
+            if (win.GamepadHandles[i] != 0 && win.GamepadIds[i] == instanceId)
+                return i;
+        }
+        return -1;
+    }
+
+    private static bool TryMapGamepadButton(SDL.GamepadButton sdlBtn, out GamepadButton mapped)
+    {
+        switch (sdlBtn)
+        {
+            case SDL.GamepadButton.South: mapped = GamepadButton.South; return true;
+            case SDL.GamepadButton.East: mapped = GamepadButton.East; return true;
+            case SDL.GamepadButton.West: mapped = GamepadButton.West; return true;
+            case SDL.GamepadButton.North: mapped = GamepadButton.North; return true;
+            case SDL.GamepadButton.Back: mapped = GamepadButton.Back; return true;
+            case SDL.GamepadButton.Guide: mapped = GamepadButton.Guide; return true;
+            case SDL.GamepadButton.Start: mapped = GamepadButton.Start; return true;
+            case SDL.GamepadButton.LeftStick: mapped = GamepadButton.LeftStick; return true;
+            case SDL.GamepadButton.RightStick: mapped = GamepadButton.RightStick; return true;
+            case SDL.GamepadButton.LeftShoulder: mapped = GamepadButton.LeftShoulder; return true;
+            case SDL.GamepadButton.RightShoulder: mapped = GamepadButton.RightShoulder; return true;
+            case SDL.GamepadButton.DPadUp: mapped = GamepadButton.DPadUp; return true;
+            case SDL.GamepadButton.DPadDown: mapped = GamepadButton.DPadDown; return true;
+            case SDL.GamepadButton.DPadLeft: mapped = GamepadButton.DPadLeft; return true;
+            case SDL.GamepadButton.DPadRight: mapped = GamepadButton.DPadRight; return true;
+            case SDL.GamepadButton.Misc1: mapped = GamepadButton.Misc1; return true;
+            case SDL.GamepadButton.RightPaddle1: mapped = GamepadButton.RightPaddle1; return true;
+            case SDL.GamepadButton.LeftPaddle1: mapped = GamepadButton.LeftPaddle1; return true;
+            case SDL.GamepadButton.RightPaddle2: mapped = GamepadButton.RightPaddle2; return true;
+            case SDL.GamepadButton.LeftPaddle2: mapped = GamepadButton.LeftPaddle2; return true;
+            case SDL.GamepadButton.Touchpad: mapped = GamepadButton.Touchpad; return true;
+            default: mapped = default; return false;
+        }
+    }
+
+    private static bool TryMapGamepadAxis(SDL.GamepadAxis sdlAxis, short rawValue, out GamepadAxis axis, out float normalized)
+    {
+        float signed = rawValue < 0 ? (rawValue / 32768f) : (rawValue / 32767f);
+        switch (sdlAxis)
+        {
+            case SDL.GamepadAxis.LeftX:
+                axis = GamepadAxis.LeftX;
+                normalized = signed;
+                return true;
+            case SDL.GamepadAxis.LeftY:
+                axis = GamepadAxis.LeftY;
+                normalized = -signed; // Flip SDL negative-up to Bring Engine +Y = Up
+                return true;
+            case SDL.GamepadAxis.RightX:
+                axis = GamepadAxis.RightX;
+                normalized = signed;
+                return true;
+            case SDL.GamepadAxis.RightY:
+                axis = GamepadAxis.RightY;
+                normalized = -signed; // Flip SDL negative-up to Bring Engine +Y = Up
+                return true;
+            case SDL.GamepadAxis.LeftTrigger:
+                axis = GamepadAxis.LeftTrigger;
+                normalized = DetMath.Clamp01(rawValue / 32767f);
+                return true;
+            case SDL.GamepadAxis.RightTrigger:
+                axis = GamepadAxis.RightTrigger;
+                normalized = DetMath.Clamp01(rawValue / 32767f);
+                return true;
+            default:
+                axis = default;
+                normalized = 0f;
+                return false;
+        }
+    }
+
     public static void Shutdown(ref PlatformWindow win)
     {
+        for (int i = 0; i < InputState.MaxGamepads; i++)
+        {
+            nint pad = (nint)win.GamepadHandles[i];
+            if (pad != nint.Zero)
+            {
+                SDL.CloseGamepad(pad);
+                win.GamepadHandles[i] = 0;
+                win.GamepadIds[i] = 0;
+            }
+        }
         if (win.Window != nint.Zero)
         {
             SDL.DestroyWindow(win.Window);
@@ -220,6 +406,7 @@ public static unsafe class PlatformSystem
         {
             SDL.Quit();
             win.Initialized = 0;
+            win.GamepadSubsystemActive = 0;
         }
     }
 }
