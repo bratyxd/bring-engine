@@ -33,7 +33,12 @@ src/<YourGame>/
 6. **Custom Shaders + Tweens**:
    - Compile custom HLSL shaders via `ShaderSystem.CompileFromFile(...)` and attach to `MaterialAssetData.CustomShader`, `SpriteData.CustomShader`, `TextData.CustomShader`, or `ParticleEmitterData.CustomShader`.
    - Animate `MaterialAssetData.CustomParams` directly with `TweenSystem.TweenFloatPtr(ref world.Tweens, &mat->CustomParams.X, ...)`.
-7. **Always Verify Both Headless & NativeAOT**:
+7. **VSync, FPS Cap & Common Profiler UI (Standard in Every Game)**:
+   - Default to **VSync ON** and **60 FPS cap** via `FramePacer.CreateDefault()` + `FramePacerSystem.ApplyVSync(ref pacer, ref *gpu, true)`.
+   - Wire `FrameProfiler` (`FrameProfiler.Create(ref engAlloc.Persistent)`) and `ProfilerOverlaySystem.Create(ref world, mainFont, whiteTex, w, h)` so every game automatically gets the drop-in CPU ms, GPU ms, FPS, Draw Calls, SetPass Calls, and CPU scope overlay (persisting across all scenes!).
+   - Standard debug hotkeys: **`F1`** toggle Profiler UI, **`F2`** toggle VSync, **`F3`** cycle FPS cap (60/120/144/Max/30).
+   - See [`docs/agents/11-vsync-fps-cap-and-profiling.md`](../../docs/agents/11-vsync-fps-cap-and-profiling.md) for the exact per-frame loop ordering (`BeginFrame` -> scopes -> `RenderFrame(..., profiler)` -> `EndCpuWork` -> `EndFrameAndPace` -> `EndFrame`).
+8. **Always Verify Both Headless & NativeAOT**:
    ```bash
    dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64
    ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --headless --ticks 600

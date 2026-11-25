@@ -35,11 +35,12 @@
 - `BringEngine.sln` & `Directory.Build.props` — Solution and strict AOT compiler settings.
 - `src/BringEngine/` — Core Engine Library (`IsAotCompatible=true`):
   - `Core/Memory/` — `NativeMemoryTracker`, `LinearArena`, `PoolAllocator<T>`, `FreeListAllocator`, `EngineAllocators`, `NativeSlice<T>`, `NativeList<T>`, `NativeSparseSet<T>`, `NativeHashMap<T>`, `FixedString64/256`, `StringId`.
+  - `Core/Profiling/` — `FrameProfiler`, `ProfilerSystem` (zero-GC CPU/GPU ms timing, named scopes, rolling FPS).
   - `Core/Handles/` — 32-bit generational handles (`HandlePacking`, `EntityId`, ...).
   - `Core/Math/` — `Fix32`, `Fix64`, `FixVec2/3`, `FixQuat`, `DetMath`, `DetRng`, `Vec2/3/4`, `Quat`, `Mat4`, `ColorF/32`, `Bounds3`, `Plane`, `Frustum`, `Ray`.
   - `Simulation/` — `EntityTable`, `TransformTable`, `EngineWorld`, `CameraTable`, `InputState`, `Easing`, `TweenTable`, `AnimationTable`, `ParticleTable`, `RenderComponentTables`, `SceneManager`.
   - `Assets/` — `AssetRegistry`, `BundleManager`, `TextureLoader`, `SdfFontLoader`, `GltfLoader`, `GlbBuilder`.
-  - `Rendering/` — `SdlPlatform`, `GpuContext`, `ShaderSystem` (`SDL_shadercross`), `SceneLighting`, `TextLayoutSystem`, `BatchRenderer`.
+  - `Rendering/` — `SdlPlatform`, `FramePacer` (default VSync ON + 60 FPS cap), `GpuContext`, `ShaderSystem` (`SDL_shadercross`), `SceneLighting`, `TextLayoutSystem`, `BatchRenderer`, `ProfilerOverlay` (common drop-in UI tool).
   - `Shaders/` — `pbr_mesh.hlsl`, `sprite_3d.hlsl`, `sdf_text.hlsl`, `particle.hlsl`.
 - `src/ShowcaseGame/` — Playable Reference Game **"Bring Arena"** (`PublishAot=true`, depends on `BringEngine`).
 - `tests/BringEngine.Tests/` — Zero-reflection NativeAOT test suite (`PublishAot=true`, 19 tests covering core, sim, tweens, animation, particles, bundles, scenes, glTF, SDF fonts, text layout, and real SDL3_gpu instanced rendering).
@@ -55,6 +56,7 @@
 - [`docs/agents/08-tweening-and-animation.md`](docs/agents/08-tweening-and-animation.md)
 - [`docs/agents/09-particles-and-shaders.md`](docs/agents/09-particles-and-shaders.md)
 - [`docs/agents/10-camera-and-headless-testing.md`](docs/agents/10-camera-and-headless-testing.md)
+- [`docs/agents/11-vsync-fps-cap-and-profiling.md`](docs/agents/11-vsync-fps-cap-and-profiling.md) — VSync (default ON), FPS cap (default 60), `FrameProfiler`, `SetPassCalls`, and common `ProfilerOverlay` UI.
 - [`src/ShowcaseGame/AGENT_README.md`](src/ShowcaseGame/AGENT_README.md) — Complete template for creating a new game.
 
 ## 4. Build, NativeAOT Publish & Verification Commands

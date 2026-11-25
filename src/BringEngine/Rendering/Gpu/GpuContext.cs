@@ -59,7 +59,10 @@ public struct GpuShaderSlot
 public struct RenderStats
 {
     public int DrawCalls;
+    public int SetPassCalls;     // Unity-equivalent SetPass calls (pipeline or shader/material state transitions)
     public int PipelineBinds;
+    public int RenderPasses;
+    public int CopyPasses;
     public int MeshInstances;
     public int SpriteInstances;
     public int GlyphInstances;
@@ -134,6 +137,8 @@ public unsafe struct GpuContext
     public ShaderHandle BuiltinParticleShader;
 
     public RenderStats LastFrameStats;
+    public SDL.GPUPresentMode ActivePresentMode;
+    public byte VSyncEnabled;
     public byte Initialized;
 }
 
@@ -184,7 +189,37 @@ public static unsafe class GpuSystem
         };
 
         CreateDefaultSamplersAndBuffers(ref ctx);
+        SetVSync(ref ctx, enabled: true); // VSync ON by default
         return ctx;
+    }
+
+    /// <summary>
+    /// Configures swapchain VSync mode on SDL3_gpu.
+    /// - enabled = true  -> SDL_GPU_PRESENTMODE_VSYNC (always supported, tear-free)
+    /// - enabled = false -> SDL_GPU_PRESENTMODE_IMMEDIATE if supported, else MAILBOX, else VSYNC
+    /// </summary>
+    public static bool SetVSync(ref GpuContext ctx, bool enabled)
+    {
+        if (ctx.Device == nint.Zero || ctx.Window == nint.Zero) return false;
+
+        SDL.GPUPresentMode desired = SDL.GPUPresentMode.VSync;
+        if (!enabled)
+        {
+            if (SDL.WindowSupportsGPUPresentMode(ctx.Device, ctx.Window, SDL.GPUPresentMode.Immediate))
+                desired = SDL.GPUPresentMode.Immediate;
+            else if (SDL.WindowSupportsGPUPresentMode(ctx.Device, ctx.Window, SDL.GPUPresentMode.Mailbox))
+                desired = SDL.GPUPresentMode.Mailbox;
+            else
+                desired = SDL.GPUPresentMode.VSync;
+        }
+
+        bool ok = SDL.SetGPUSwapchainParameters(ctx.Device, ctx.Window, SDL.GPUSwapchainComposition.SDR, desired);
+        if (ok)
+        {
+            ctx.ActivePresentMode = desired;
+            ctx.VSyncEnabled = (byte)(desired == SDL.GPUPresentMode.VSync ? 1 : 0);
+        }
+        return ok;
     }
 
     public static void BindAssetCleanupHooks(ref GpuContext ctx, ref AssetRegistry assets)

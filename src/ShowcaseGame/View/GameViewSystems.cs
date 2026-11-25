@@ -553,22 +553,12 @@ public static unsafe class GameViewSystems
         scoreTd.AnimFlags = TextAnimFlags.GlowPulse | TextAnimFlags.ShineSweep;
         v->HudScoreText = RenderComponentSystem.AddText(ref w.RenderComponents, in scoreTd);
 
-        // Top-right Engine Telemetry SDF HUD Text (DrawCalls, Instances, FrameArena KB)
-        var statsEnt = EntitySystem.Spawn(ref w.Entities, sc);
-        TransformSystem.Add(ref w.Transforms, statsEnt, new Vec3(1256f, 696f, 0f));
-        var statsTd = RenderComponentSystem.DefaultHudText(statsEnt, font, "BRING ENGINE AOT", sc);
-        statsTd.FontScale = 0.44f;
-        statsTd.AlignH = TextAlignmentH.Right;
-        statsTd.Color = ColorF.Cyan;
-        statsTd.OutlineWidth = 0.14f;
-        v->HudStatsText = RenderComponentSystem.AddText(ref w.RenderComponents, in statsTd);
-
-        // Bottom-left Controls hint
+        // Bottom-left Controls hint (Top-Right is occupied by Bring Engine's common ProfilerOverlay!)
         var ctrlEnt = EntitySystem.Spawn(ref w.Entities, sc);
         TransformSystem.Add(ref w.Transforms, ctrlEnt, new Vec3(24f, 34f, 0f));
-        var ctrlTd = RenderComponentSystem.DefaultHudText(ctrlEnt, font, "WASD Move | SPACE Dash | 1 Title | ESC Quit", sc);
-        ctrlTd.FontScale = 0.38f;
-        ctrlTd.Color = new ColorF(0.75f, 0.85f, 0.98f, 0.9f);
+        var ctrlTd = RenderComponentSystem.DefaultHudText(ctrlEnt, font, "WASD Move | SPACE Dash | F1 Profiler | F2 VSync | F3 FPS Cap | 1 Title | ESC Quit", sc);
+        ctrlTd.FontScale = 0.36f;
+        ctrlTd.Color = new ColorF(0.75f, 0.85f, 0.98f, 0.92f);
         v->HudControlsText = RenderComponentSystem.AddText(ref w.RenderComponents, in ctrlTd);
 
         // 2D HUD HP Bar background & fill sprites
@@ -606,16 +596,6 @@ public static unsafe class GameViewSystems
         TextData* scoreTxt = RenderComponentSystem.TryGetText(in w.RenderComponents, v->HudScoreText);
         if (scoreTxt != null && span.TryWrite($"SCORE: {sim.Score}   WAVE: {sim.Wave}   COMBO x{sim.Combo}", out int len1))
             scoreTxt->Content = FixedString256.From(span.Slice(0, len1));
-
-        TextData* statsTxt = RenderComponentSystem.TryGetText(in w.RenderComponents, v->HudStatsText);
-        if (statsTxt != null)
-        {
-            var st = v->CachedRenderStats;
-            int totalObj = st.MeshInstances + st.SpriteInstances + st.ParticleInstances + st.GlyphInstances;
-            int kb = (int)(st.FrameArenaUsedBytes / 1024);
-            if (span.TryWrite($"DRAWS: {st.DrawCalls} | OBJS: {totalObj} | FRAME: {kb}KB", out int len2))
-                statsTxt->Content = FixedString256.From(span.Slice(0, len2));
-        }
 
         SpriteData* hpBar = RenderComponentSystem.TryGetSprite(in w.RenderComponents, v->HudHpFillSprite);
         if (hpBar != null)

@@ -13,6 +13,7 @@ public static class Program
         TweenAnimParticleTests.RunAll();
         AssetBundleSceneGltfTests.RunAll();
         RenderTests.RunAll();
+        ProfilingAndPacingTests.RunAll();
 
         Console.WriteLine($"\nSummary: {Assert.Passed} passed, {Assert.Failed} failed.");
         return Assert.Failed == 0 ? 0 : 1;

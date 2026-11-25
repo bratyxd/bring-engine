@@ -35,7 +35,7 @@ Spawn a sprite with `LayerMask = 1u << 31` (matching your Orthographic UI camera
 3. **SDF Text**: Adjacent text objects sharing a font atlas + shader + depth mode merge into 1 instanced glyph draw call.
 4. **Particles**: All live particles sharing `(Texture, Shader, BlendMode)` draw in 1 instanced quad call.
 5. **Single Copy Pass**: All per-frame instance, joint, sprite, glyph, and particle storage buffers upload in ONE `SDL_GPUCopyPass` before any `SDL_GPURenderPass`.
-6. Read `gpu.LastFrameStats` (`DrawCalls`, `PipelineBinds`, `MeshInstances`, `SpriteInstances`, `GlyphInstances`, `ParticleInstances`, `Triangles`, `CulledMeshes`) to audit performance!
+6. Read `gpu.LastFrameStats` (`DrawCalls`, `SetPassCalls`, `PipelineBinds`, `RenderPasses`, `CopyPasses`, `MeshInstances`, `SpriteInstances`, `GlyphInstances`, `ParticleInstances`, `Triangles`, `CulledMeshes`, `FrameArenaUsedBytes`) — or enable Bring Engine's built-in `ProfilerOverlay` (`docs/agents/11-vsync-fps-cap-and-profiling.md`) to inspect live CPU/GPU ms, FPS, DrawCalls, and SetPassCalls!
 
 ## Writing Custom HLSL Shaders
 Follow `SDL_shadercross` register spaces:

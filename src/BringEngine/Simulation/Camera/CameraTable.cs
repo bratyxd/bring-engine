@@ -123,7 +123,7 @@ public static unsafe class CameraSystem
         float farPlane = 500f,
         SceneId ownerScene = default,
         int depthOrder = 0,
-        uint layerMask = 0xFFFF_FFFFu)
+        uint layerMask = 0x3FFF_FFFFu) // World layers 0..29 (excludes bit 30 ProfilerOverlay & bit 31 UI HUD)
     {
         int slot = FindFreeSlot(in table);
         if (slot < 0) throw new OutOfMemoryException("CameraTable exhausted.");

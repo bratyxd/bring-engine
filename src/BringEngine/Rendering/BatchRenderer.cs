@@ -1,10 +1,12 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using BringEngine.Assets;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
+using BringEngine.Core.Profiling;
 using BringEngine.Rendering.Gpu;
 using BringEngine.Rendering.Shaders;
 using BringEngine.Simulation.Camera;
@@ -157,22 +159,30 @@ public static unsafe class BatchRenderer
 
     /// <summary>
     /// Renders all active cameras in DepthOrder to the swapchain (and optionally to CaptureColorTexture for PNG export).
+    /// Pass a FrameProfiler* to measure RenderGather / GpuUpload / GpuEncode CPU scopes and real GPU fence execution time (ms).
     /// </summary>
     public static void RenderFrame(
         ref GpuContext gpu,
         ref EngineWorld world,
         ref EngineAllocators alloc,
         in SceneLighting lighting,
-        bool captureToOffscreen = false)
+        bool captureToOffscreen = false,
+        FrameProfiler* profiler = null)
     {
         if (gpu.Initialized == 0) return;
+
+        int gatherScope = profiler != null ? ProfilerSystem.BeginScope(ref *profiler, "RenderGather") : -1;
 
         // 1. Ensure newly loaded assets are uploaded to GPU
         UploadPendingAssets(ref gpu, ref world);
 
         // 2. Acquire command buffer and render target (swapchain or offscreen capture)
         nint cmd = SDL.AcquireGPUCommandBuffer(gpu.Device);
-        if (cmd == nint.Zero) return;
+        if (cmd == nint.Zero)
+        {
+            if (gatherScope >= 0) ProfilerSystem.EndScope(ref *profiler, gatherScope);
+            return;
+        }
 
         nint colorTarget;
         uint targetW, targetH;
@@ -189,6 +199,7 @@ public static unsafe class BatchRenderer
             if (!SDL.WaitAndAcquireGPUSwapchainTexture(cmd, gpu.Window, out colorTarget, out targetW, out targetH) || colorTarget == nint.Zero)
             {
                 SDL.SubmitGPUCommandBuffer(cmd);
+                if (gatherScope >= 0) ProfilerSystem.EndScope(ref *profiler, gatherScope);
                 return;
             }
         }
@@ -211,6 +222,7 @@ public static unsafe class BatchRenderer
             nint rp = SDL.BeginGPURenderPass(cmd, (nint)(&ct), 1, nint.Zero);
             SDL.EndGPURenderPass(rp);
             SDL.SubmitGPUCommandBuffer(cmd);
+            if (gatherScope >= 0) ProfilerSystem.EndScope(ref *profiler, gatherScope);
             return;
         }
 
@@ -260,16 +272,24 @@ public static unsafe class BatchRenderer
             slice.ParticleBatchCount = allParticleBatches.Count - slice.ParticleBatchStart;
         }
 
+        if (gatherScope >= 0) ProfilerSystem.EndScope(ref *profiler, gatherScope);
+
         // 4. SINGLE SDL_GPUCopyPass uploading ALL dynamic buffers for the whole frame!
-        UploadFrameBuffersInSingleCopyPass(
+        int uploadScope = profiler != null ? ProfilerSystem.BeginScope(ref *profiler, "GpuUpload") : -1;
+        if (UploadFrameBuffersInSingleCopyPass(
             ref gpu, cmd,
             in allInstances3D,
             in world.Animations.FrameJointPalette,
             in allSprites,
             in allGlyphs,
-            in allParticles);
+            in allParticles))
+        {
+            stats.CopyPasses++;
+        }
+        if (uploadScope >= 0) ProfilerSystem.EndScope(ref *profiler, uploadScope);
 
         // 5. Execute RenderPass per active camera in DepthOrder (with GPU state deduplication)
+        int encodeScope = profiler != null ? ProfilerSystem.BeginScope(ref *profiler, "GpuEncode") : -1;
         nint* vStorage = stackalloc nint[2] { gpu.Instance3DBuffer, gpu.JointPaletteBuffer };
         nint quadIndexBuf = gpu.QuadIndexBuffer;
 
@@ -303,6 +323,7 @@ public static unsafe class BatchRenderer
             };
 
             nint pass = SDL.BeginGPURenderPass(cmd, (nint)(&colorInfo), 1, in depthInfo);
+            stats.RenderPasses++;
 
             var vp = new SDL.GPUViewport
             {
@@ -317,6 +338,7 @@ public static unsafe class BatchRenderer
 
             nint boundPipeline = nint.Zero;
             int boundMeshSlot = -1;
+            int boundTexSlot = int.MinValue;
 
             // --- Draw 3D Instanced Batches ---
             if (slice.Batch3DCount > 0)
@@ -334,12 +356,14 @@ public static unsafe class BatchRenderer
                     GpuShaderSlot* sSlot = ShaderSystem.TryGetShader(in gpu, sh);
                     if (sSlot == null) continue;
 
+                    bool passChanged = false;
                     nint pipe = b.AlphaMode == MaterialAlphaMode.Blend ? sSlot->PipelineAlphaBlend : sSlot->PipelineOpaque;
                     if (pipe != boundPipeline)
                     {
                         SDL.BindGPUGraphicsPipeline(pass, pipe);
                         boundPipeline = pipe;
                         stats.PipelineBinds++;
+                        passChanged = true;
                     }
 
                     if (b.MeshGpuSlot != boundMeshSlot)
@@ -352,7 +376,13 @@ public static unsafe class BatchRenderer
                         boundMeshSlot = b.MeshGpuSlot;
                     }
 
-                    BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
+                    if (b.TextureGpuSlot != boundTexSlot || passChanged)
+                    {
+                        BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
+                        boundTexSlot = b.TextureGpuSlot;
+                        passChanged = true;
+                    }
+                    if (passChanged) stats.SetPassCalls++;
 
                     var bu = new BatchUniformsGpu { BaseInstance = b.BaseInstance };
                     SDL.PushGPUVertexUniformData(cmd, 1, (nint)(&bu), (uint)sizeof(BatchUniformsGpu));
@@ -391,15 +421,23 @@ public static unsafe class BatchRenderer
                     GpuShaderSlot* sSlot = ShaderSystem.TryGetShader(in gpu, sh);
                     if (sSlot == null) continue;
 
+                    bool passChanged = false;
                     nint pipe = SelectQuadPipeline(sSlot, b.BlendMode == SpriteBlendMode.Additive ? 2 : (b.BlendMode == SpriteBlendMode.AlphaCutout ? 0 : 1), b.DepthTest != 0);
                     if (pipe != boundPipeline)
                     {
                         SDL.BindGPUGraphicsPipeline(pass, pipe);
                         boundPipeline = pipe;
                         stats.PipelineBinds++;
+                        passChanged = true;
                     }
 
-                    BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
+                    if (b.TextureGpuSlot != boundTexSlot || passChanged)
+                    {
+                        BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
+                        boundTexSlot = b.TextureGpuSlot;
+                        passChanged = true;
+                    }
+                    if (passChanged) stats.SetPassCalls++;
 
                     var bu = new BatchUniformsGpu { BaseInstance = b.BaseInstance };
                     SDL.PushGPUVertexUniformData(cmd, 1, (nint)(&bu), (uint)sizeof(BatchUniformsGpu));
@@ -431,15 +469,23 @@ public static unsafe class BatchRenderer
                     GpuShaderSlot* sSlot = ShaderSystem.TryGetShader(in gpu, sh);
                     if (sSlot == null) continue;
 
+                    bool passChanged = false;
                     nint pipe = b.BlendMode == ParticleBlendMode.Additive ? sSlot->PipelineAdditive : sSlot->PipelineAlphaBlend;
                     if (pipe != boundPipeline)
                     {
                         SDL.BindGPUGraphicsPipeline(pass, pipe);
                         boundPipeline = pipe;
                         stats.PipelineBinds++;
+                        passChanged = true;
                     }
 
-                    BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
+                    if (b.TextureGpuSlot != boundTexSlot || passChanged)
+                    {
+                        BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
+                        boundTexSlot = b.TextureGpuSlot;
+                        passChanged = true;
+                    }
+                    if (passChanged) stats.SetPassCalls++;
 
                     var bu = new BatchUniformsGpu { BaseInstance = b.BaseInstance };
                     SDL.PushGPUVertexUniformData(cmd, 1, (nint)(&bu), (uint)sizeof(BatchUniformsGpu));
@@ -466,15 +512,23 @@ public static unsafe class BatchRenderer
                     GpuShaderSlot* sSlot = ShaderSystem.TryGetShader(in gpu, sh);
                     if (sSlot == null) continue;
 
+                    bool passChanged = false;
                     nint pipe = b.DepthTest != 0 ? sSlot->PipelineAlphaBlend : sSlot->PipelineOverlayNoDepth;
                     if (pipe != boundPipeline)
                     {
                         SDL.BindGPUGraphicsPipeline(pass, pipe);
                         boundPipeline = pipe;
                         stats.PipelineBinds++;
+                        passChanged = true;
                     }
 
-                    BindFragmentTexture(pass, in gpu, b.AtlasTexGpuSlot);
+                    if (b.AtlasTexGpuSlot != boundTexSlot || passChanged)
+                    {
+                        BindFragmentTexture(pass, in gpu, b.AtlasTexGpuSlot);
+                        boundTexSlot = b.AtlasTexGpuSlot;
+                        passChanged = true;
+                    }
+                    if (passChanged) stats.SetPassCalls++;
 
                     var bu = new BatchUniformsGpu { BaseInstance = b.BaseInstance };
                     SDL.PushGPUVertexUniformData(cmd, 1, (nint)(&bu), (uint)sizeof(BatchUniformsGpu));
@@ -488,7 +542,28 @@ public static unsafe class BatchRenderer
             SDL.EndGPURenderPass(pass);
         }
 
-        SDL.SubmitGPUCommandBuffer(cmd);
+        if (encodeScope >= 0) ProfilerSystem.EndScope(ref *profiler, encodeScope);
+
+        // 6. Submit command buffer (with fence GPU time measurement when profiler is enabled)
+        if (profiler != null && profiler->Enabled != 0 && profiler->MeasureGpuWithFence != 0)
+        {
+            long gpuStart = Stopwatch.GetTimestamp();
+            nint fence = SDL.SubmitGPUCommandBufferAndAcquireFence(cmd);
+            if (fence != nint.Zero)
+            {
+                nint* fArr = stackalloc nint[1] { fence };
+                SDL.WaitForGPUFences(gpu.Device, true, (nint)fArr, 1);
+                SDL.ReleaseGPUFence(gpu.Device, fence);
+            }
+            long gpuEnd = Stopwatch.GetTimestamp();
+            long gpuTicks = gpuEnd - gpuStart;
+            double gpuMs = gpuTicks * (1000.0 / Stopwatch.Frequency);
+            ProfilerSystem.RecordGpuTime(ref *profiler, gpuMs, gpuTicks);
+        }
+        else
+        {
+            SDL.SubmitGPUCommandBuffer(cmd);
+        }
 
         stats.FrameArenaUsedBytes = alloc.Frame.Offset;
         gpu.LastFrameStats = stats;
@@ -508,7 +583,7 @@ public static unsafe class BatchRenderer
         }
     }
 
-    private static void UploadFrameBuffersInSingleCopyPass(
+    private static bool UploadFrameBuffersInSingleCopyPass(
         ref GpuContext gpu,
         nint cmd,
         in NativeList<Instance3DGpu> instances3D,
@@ -537,7 +612,7 @@ public static unsafe class BatchRenderer
         uint offParticles = (uint)LinearArena.AlignUp(offGlyphs + bytesGlyphs, 64);
         uint totalNeeded = offParticles + bytesParticles;
 
-        if (totalNeeded == 0) return;
+        if (totalNeeded == 0) return false;
 
         byte* mapped = (byte*)SDL.MapGPUTransferBuffer(gpu.Device, gpu.UploadTransferBuffer, cycle: true);
         if (bytes3D > 0) Buffer.MemoryCopy(instances3D.Data, mapped + off3D, bytes3D, bytes3D);
@@ -562,6 +637,7 @@ public static unsafe class BatchRenderer
         CopySub(gpu.TextGlyphBuffer, offGlyphs, bytesGlyphs);
         CopySub(gpu.ParticleInstanceBuffer, offParticles, bytesParticles);
         SDL.EndGPUCopyPass(copy);
+        return true;
     }
 
     private static void GatherAndBatch3D(
@@ -825,6 +901,7 @@ public static unsafe class BatchRenderer
     {
         int count = world.RenderComponents.TextCount;
         if (count == 0) return;
+        int batchStart = outBatches.Count;
 
         for (int i = 0; i < count; i++)
         {
@@ -842,8 +919,8 @@ public static unsafe class BatchRenderer
 
             ShaderHandle sh = td.CustomShader.IsValid ? td.CustomShader : gpu.BuiltinSdfTextShader;
 
-            // Merge with previous batch if identical font atlas + shader + depthTest
-            if (outBatches.Count > 0)
+            // Merge with previous batch within THIS camera if identical font atlas + shader + depthTest
+            if (outBatches.Count > batchStart)
             {
                 ref TextBatchCmd prev = ref outBatches[outBatches.Count - 1];
                 if (prev.AtlasTexGpuSlot == atlas->GpuSlot && prev.Shader == sh && prev.DepthTest == td.DepthTest)
@@ -879,6 +956,7 @@ public static unsafe class BatchRenderer
     {
         ref readonly ParticleTable pt = ref world.Particles;
         if (pt.ParticleCount == 0) return;
+        int batchStart = outBatches.Count;
 
         // Emit grouped per active emitter matching camera LayerMask (guarantees 1 draw call per emitter or merged group!)
         for (int es = 0; es < pt.EmitterCapacity; es++)
@@ -920,7 +998,7 @@ public static unsafe class BatchRenderer
             if (count == 0) continue;
             ShaderHandle sh = em.CustomShader.IsValid ? em.CustomShader : gpu.BuiltinParticleShader;
 
-            if (outBatches.Count > 0)
+            if (outBatches.Count > batchStart)
             {
                 ref ParticleBatchCmd prev = ref outBatches[outBatches.Count - 1];
                 if (prev.TextureGpuSlot == texSlot && prev.Shader == sh && prev.BlendMode == em.BlendMode)
