@@ -85,3 +85,51 @@ dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64
 # Play ShowcaseGame interactively
 ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe
 ```
+
+## 5. Engine Changes, Mandatory Testing & Releasing
+
+Games built with Bring Engine consume released SDK archives from GitHub (`bratyxd/bring-engine`), so engine changes reach games through verified GitHub releases.
+
+### Mandatory Testing Rules (When Working on the Engine)
+1. **Every added feature or bug fix MUST ship with tests in `tests/BringEngine.Tests/`**:
+   - Whenever you add an engine capability, public API, or subsystem change, add NativeAOT test cases in `tests/BringEngine.Tests/` that thoroughly exercise the new feature (happy paths, edge cases, zero-GC hot loops via `GC.GetAllocatedBytesForCurrentThread() == 0`, and zero native leaks via `NativeMemoryTracker.LiveBytes == 0`).
+   - Whenever you fix an engine bug, add a regression test that fails without the fix and passes with it.
+   - A feature or fix and its tests go in the same commit.
+2. **Always run the full engine test suite before pushing**:
+   - After ANY engine change, verify you did not break anything in the engine by running:
+     ```bash
+     dotnet build BringEngine.sln -c Release
+     dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r win-x64
+     ./tests/BringEngine.Tests/bin/Release/net10.0/win-x64/publish/BringEngine.Tests.exe
+     dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64
+     ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --headless --ticks 600
+     ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --verify-render
+     ```
+   - Update `docs/agents/` and `AGENTS.md` whenever public APIs, defaults, or workflows change.
+3. **Engine changes from a game**:
+   - Only modify the engine when it is wrong (bug, crash, violated contract) or lacks a general capability a game cannot reasonably build on its own. Nothing game-specific goes into the engine.
+   - Never patch files inside a downloaded `~/.bring/sdk/<tag>/` folder or copy engine sources into a game repository.
+
+### GitHub CI & Releasing (`vX.Y.Z`)
+- `.github/workflows/build.yml` runs on every push and PR across Windows (`win-x64`), Linux (`linux-x64`), and macOS (`osx-arm64`), building with strict NativeAOT analyzers, running `BringEngine.Tests`, and verifying `ShowcaseGame`.
+- `.github/workflows/release.yml` runs the full cross-platform NativeAOT test suite, packages `bring-sdk-vX.Y.Z.zip`, verifies a standalone NativeAOT build against the extracted SDK archive, and publishes the GitHub Release ONLY when every test passes.
+- Version numbers live in `src/BringEngine/EngineInfo.cs` (`EngineInfo.Version = "X.Y.Z"`): bump patch for bug fixes, minor for new features/API.
+
+```bash
+# 1. Confirm main CI is green
+gh run list --branch main --limit 1
+
+# 2. Bump version in src/BringEngine/EngineInfo.cs, commit & push
+git add src/BringEngine/EngineInfo.cs
+git commit -m "build: version X.Y.Z"
+git push
+gh run watch --exit-status
+
+# 3. Tag and push to trigger verified GitHub release
+git tag vX.Y.Z
+git push origin vX.Y.Z
+gh run watch --exit-status
+gh release view vX.Y.Z
+```
+
+A release is public and immutable: tag only from a green `main`, never move or reuse a tag; fix any issue in the next patch release.

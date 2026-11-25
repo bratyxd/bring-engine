@@ -20,11 +20,12 @@ namespace BringEngine.Tests;
 
 public static unsafe class RenderTests
 {
-    public static void RunAll()
+    public static void RunAll(bool headlessOnly = false)
     {
         Console.WriteLine("=== Phases 6-7: SDL3_gpu Renderer, Instancing, 3D Sprites, SDF Text & Shaders ===");
         Assert.Run("TextLayoutSystem_WordWrapShadowTypewriterAndAnimZeroGc", &TestTextLayoutHeadless);
-        Assert.Run("GpuBatchRenderer_Sdl3GpuInstancingSpritesSdfTextParticlesAndPngCapture", &TestGpuRenderEndToEnd);
+        if (!headlessOnly)
+            Assert.Run("GpuBatchRenderer_Sdl3GpuInstancingSpritesSdfTextParticlesAndPngCapture", &TestGpuRenderEndToEnd);
     }
 
     private static void TestTextLayoutHeadless()

@@ -1,0 +1,93 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build solution (strict AOT analyzers)
+        run: dotnet build BringEngine.sln -c Release
+      - name: Publish & run NativeAOT Engine Tests (WARP D3D12 + Headless)
+        shell: pwsh
+        run: |
+          dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r win-x64
+          ./tests/BringEngine.Tests/bin/Release/net10.0/win-x64/publish/BringEngine.Tests.exe
+      - name: Publish & verify ShowcaseGame (NativeAOT + Headless + Render)
+        shell: pwsh
+        run: |
+          dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64
+          $exe = "./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe"
+          & $exe --headless --ticks 600
+          & $exe --verify-render --out build/verify-windows
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-windows-x64
+          path: |
+            build/verify-windows/*.png
+            tests/BringEngine.Tests/bin/Release/net10.0/win-x64/publish/verify_engine_test.png
+          if-no-files-found: ignore
+
+  linux-x64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install NativeAOT, SDL3 runtime, fonts & software Vulkan (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang zlib1g-dev xvfb mesa-vulkan-drivers libvulkan1 \
+            fonts-dejavu-core libx11-6 libxext6 libxrandr2 libxcursor1 libxi6 libxss1 libxtst6 \
+            libxkbcommon0 libwayland-client0 libdbus-1-3
+      - name: Build solution (strict AOT analyzers)
+        run: dotnet build BringEngine.sln -c Release
+      - name: Publish & run NativeAOT Engine Tests (lavapipe Vulkan under Xvfb)
+        run: |
+          dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r linux-x64
+          xvfb-run -a ./tests/BringEngine.Tests/bin/Release/net10.0/linux-x64/publish/BringEngine.Tests
+      - name: Publish & verify ShowcaseGame (NativeAOT + Headless + Render)
+        run: |
+          dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r linux-x64
+          EXE=./src/ShowcaseGame/bin/Release/net10.0/linux-x64/publish/ShowcaseGame
+          "$EXE" --headless --ticks 600
+          xvfb-run -a "$EXE" --verify-render --out build/verify-linux
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-linux-x64
+          path: |
+            build/verify-linux/*.png
+            tests/BringEngine.Tests/bin/Release/net10.0/linux-x64/publish/verify_engine_test.png
+          if-no-files-found: ignore
+
+  macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build solution (strict AOT analyzers)
+        run: dotnet build BringEngine.sln -c Release
+      - name: Publish & run NativeAOT Engine Tests (Headless)
+        run: |
+          dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r osx-arm64
+          ./tests/BringEngine.Tests/bin/Release/net10.0/osx-arm64/publish/BringEngine.Tests --headless-only
+      - name: Publish & verify ShowcaseGame (NativeAOT Headless)
+        run: |
+          dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r osx-arm64
+          ./src/ShowcaseGame/bin/Release/net10.0/osx-arm64/publish/ShowcaseGame --headless --ticks 600
