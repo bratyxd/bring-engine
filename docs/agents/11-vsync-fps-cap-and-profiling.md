@@ -49,10 +49,14 @@ if (input.IsKeyPressed(KeyCode.F11)) PlatformSystem.ToggleBorderlessFullscreen(r
 Because **Logic CPU**, **Render Thread**, and **GPU** execute pipelined 1 frame apart, each stage independently receives the full frame budget (`16.67 ms` at 60 FPS). `FrameProfiler` tracks all three separately (zero GC, headless-safe):
 - **`LogicCpuMs` / `SmoothedLogicMs`**: Logic/Update Thread duration (Frame `N`: Sim + ViewSync + Core + Packet Extract).
 - **`RenderCpuMs` / `SmoothedRenderMs`**: Render Thread CPU encoding/upload duration (Frame `N-1`, excludes VSync wait & GPU fence wait).
-- **`GpuFrameMs` / `SmoothedGpuMs`**: Hardware GPU execution time measured via SDL3_gpu fence (Frame `N-1`).
+- **`GpuFrameMs` / `SmoothedGpuMs`**: Pure GPU hardware execution time (CopyPass + Shaders into offscreen `SceneColorTexture`), bracketed by a leading queue barrier fence before `cmdPresent` blits to the swapchain — **excludes ~16 ms VSync Present wait**!
 - **`CurrentFps` / `InstantFps` / `FrameTotalMs`**: 30-frame rolling average and instantaneous FPS.
 - **Named Scopes**: Wrap any Logic-thread subsystem with `ProfilerSystem.BeginScope(ref *profiler, "GameAI")` / `EndScope`.
-- **GPU Batch Metrics (`RenderStats`)**: `DrawCalls`, `SetPassCalls`, `PipelineBinds`, `RenderPasses`, `CopyPasses`, `MeshInstances`, `SpriteInstances`, `GlyphInstances`, `ParticleInstances`, `Triangles`, `CulledMeshes`, `FrameArenaUsedBytes`.
+- **GPU Batch Metrics (`RenderStats`)**:
+  - `DrawCalls` (`DRAWS`): Total `SDL_DrawGPUIndexedPrimitives` calls issued.
+  - `SetPassCalls` (`SETPASS`): Shader/pipeline or texture/material state switches (Unity-equivalent SetPass calls).
+  - `RenderPasses + CopyPasses` (`PASSES`): Hardware SDL3_gpu command-buffer passes opened (1 batched `CopyPass` + 1 `RenderPass` per active camera).
+  - Plus `PipelineBinds`, `MeshInstances`, `SpriteInstances`, `GlyphInstances`, `ParticleInstances`, `Triangles`, `CulledMeshes`, `FrameArenaUsedBytes`.
 
 ## 5. Common Built-In Profiler UI Overlay (`ProfilerOverlaySystem`)
 Drop-in **100% opaque, high-contrast SDF UI** on its own persistent layer (`LayerMask = 1u << 30`, `DepthOrder = 1000`, `OwnerScene = SceneId.Invalid`, `ClearFlags = None`), using virtual 720p vertical scaling so text stays crisp and comfortably readable at 720p, 1080p, 1440p, 4K, and ultrawide:

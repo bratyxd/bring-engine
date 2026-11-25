@@ -29,13 +29,13 @@ SpriteHandle sh = RenderComponentSystem.AddSprite(ref world.RenderComponents, ne
 Spawn a sprite with `LayerMask = 1u << 31` (matching your Orthographic UI camera) and `DepthTest = 0`. Use `SortingLayer` and `OrderInLayer` to control exact draw order.
 
 ## GPU Batching & Performance Rules
-`BatchRenderer.RenderFrame` automatically minimizes draw calls and GPU state changes:
-1. **3D Meshes**: Frustum-culled on CPU, sorted by `(AlphaMode, Shader, Texture, Mesh)` in `FrameArena`, and merged into **instanced draw calls** (`DrawGPUIndexedPrimitives` with `num_instances = batchCount`).
-2. **2D Sprites**: Sorted by `(SortingLayer, OrderInLayer, DepthTest, BlendMode, Shader, Texture)` and drawn in 1 instanced quad call per state group.
+`BatchRenderer` splits rendering into two pipelined stages (`ExtractRenderPacket` on the Logic Thread and `SubmitRenderPacket` on the Main/Render Thread; or single-threaded `RenderFrame` for tests) to minimize draw calls and GPU state changes:
+1. **3D Meshes**: Frustum-culled on CPU, deterministically sorted by `(AlphaMode, Shader, Texture, Mesh, OriginalIndex)` in `Scratch` arena, and merged into **instanced draw calls** (`DrawGPUIndexedPrimitives` with `num_instances = batchCount`).
+2. **2D Sprites**: Deterministically sorted by `(SortingLayer, OrderInLayer, DepthTest, BlendMode, Shader, Texture, OriginalIndex)` and drawn in 1 instanced quad call per state group. Give overlapping UI sprites unique `OrderInLayer` values.
 3. **SDF Text**: Adjacent text objects sharing a font atlas + shader + depth mode merge into 1 instanced glyph draw call.
 4. **Particles**: All live particles sharing `(Texture, Shader, BlendMode)` draw in 1 instanced quad call.
-5. **Single Copy Pass**: All per-frame instance, joint, sprite, glyph, and particle storage buffers upload in ONE `SDL_GPUCopyPass` before any `SDL_GPURenderPass`.
-6. Read `gpu.LastFrameStats` (`DrawCalls`, `SetPassCalls`, `PipelineBinds`, `RenderPasses`, `CopyPasses`, `MeshInstances`, `SpriteInstances`, `GlyphInstances`, `ParticleInstances`, `Triangles`, `CulledMeshes`, `FrameArenaUsedBytes`) — or enable Bring Engine's built-in `ProfilerOverlay` (`docs/agents/11-vsync-fps-cap-and-profiling.md`) to inspect live CPU/GPU ms, FPS, DrawCalls, and SetPassCalls!
+5. **Single Copy Pass + Decoupled Swapchain Present**: All per-frame instance, joint, sprite, glyph, and particle storage buffers upload in ONE `SDL_GPUCopyPass` (`cycle: true`) before any `SDL_GPURenderPass`. Scene & UI cameras render into `SceneColorTexture` (with `depthInfo.Cycle = 1` on initial clear and pipeline bound before storage buffers), then blit to the swapchain on a separate `cmdPresent` so VSync Present wait never pollutes pure GPU execution timing.
+6. Read `gpu.LastFrameStats` (`DrawCalls`, `SetPassCalls` = shader/material switches, `RenderPasses + CopyPasses` = hardware SDL3_gpu passes, `PipelineBinds`, `MeshInstances`, `SpriteInstances`, `GlyphInstances`, `ParticleInstances`, `Triangles`, `CulledMeshes`, `FrameArenaUsedBytes`) — or enable Bring Engine's built-in `ProfilerOverlay` (`docs/agents/11-vsync-fps-cap-and-profiling.md`) to inspect live `LOGIC` / `RENDER` / `GPU` ms, FPS, `DRAWS`, `SETPASS`, and `PASSES`!
 
 ## Writing Custom HLSL Shaders
 Follow `SDL_shadercross` register spaces:

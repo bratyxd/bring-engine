@@ -1,12 +1,12 @@
 # Agent Guide 07 — Advanced SDF Fonts, Text Layout, Animation & Shaders
 
 ## Baking SDF Font Atlases (`SdfFontLoader`)
-Fonts are baked at bundle load time from TrueType (`.ttf`) files into single-channel `R8_UNORM` Signed Distance Field (SDF) textures inside `BundleArena` using `StbTrueTypeSharp` (100% NativeAOT):
+Fonts are baked at bundle load time from TrueType (`.ttf`) files into single-channel `R8_UNORM` Signed Distance Field (SDF) textures inside `BundleArena` using `StbTrueTypeSharp` (100% NativeAOT). `SdfFontLoader` uses a symmetric `onEdgeValue = 128` (`0.502`) with bounded derivative AA in `sdf_text.hlsl` so glyphs render **100% opaque** and razor-sharp even at small HUD sizes:
 ```csharp
 FontHandle font = SdfFontLoader.BakeSdfFromSystemOrFile(
     "Assets/font.ttf", // or null to auto-resolve OS TrueType font with procedural fallback
     ref *ctx.BundleArena, ref ctx.World->Assets, ctx.Bundle, StringId.Hash("main_font"),
-    pixelSize: 48f, atlasSize: 512, sdfPadding: 6);
+    pixelSize: 64f, atlasSize: 1024, sdfPadding: 8);
 ```
 
 ## Creating 3D World-Space & 2D Screen-Space Text

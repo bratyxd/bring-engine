@@ -32,7 +32,7 @@
 5. **Cache Locality & GPU Batching**
    - Pack vertices/instances in 16/64-byte aligned structs with `[StructLayout(LayoutKind.Sequential)]`.
    - `BatchRenderer.ExtractRenderPacket` performs CPU frustum culling, deterministic sorting & merging of 3D meshes, 2D sprites in 3D/HUD, SDF glyphs, and SoA particles into a self-contained `RenderPacket` inside `FrameArena`.
-   - `BatchRenderer.SubmitRenderPacket` uploads all dynamic storage buffers in **ONE `SDL_GPUCopyPass` per frame** (`cycle: true`), cycles depth cleanly on initial clear, binds pipelines before storage buffers, and deduplicates state binds.
+   - `BatchRenderer.SubmitRenderPacket` uploads all dynamic storage buffers in **ONE `SDL_GPUCopyPass` per frame** (`cycle: true`), renders to an offscreen `SceneColorTexture` (cycling color/depth cleanly on initial clear, binding pipelines before storage buffers, and deduplicating state binds), measures pure GPU time via fence bracket before presenting, and blits to the swapchain on a separate `cmdPresent` so VSync wait never pollutes GPU timings.
 
 ## 2. Solution Layout
 - `BringEngine.sln` & `Directory.Build.props` — Solution and strict AOT compiler settings.
@@ -44,7 +44,7 @@
   - `Core/Math/` — `Fix32`, `Fix64`, `FixVec2/3`, `FixQuat`, `DetMath`, `DetRng`, `Vec2/3/4`, `Quat`, `Mat4`, `ColorF/32`, `Bounds3`, `Plane`, `Frustum`, `Ray`.
   - `Simulation/` — `EntityTable`, `TransformTable`, `EngineWorld`, `CameraTable`, `InputState`, `Easing`, `TweenTable`, `AnimationTable`, `ParticleTable`, `RenderComponentTables`, `SceneManager`.
   - `Assets/` — `AssetRegistry`, `BundleManager`, `TextureLoader`, `SdfFontLoader`, `GltfLoader`, `GlbBuilder`.
-  - `Rendering/` — `SdlPlatform` (`WindowMode.BorderlessFullscreen` default + `F11` toggle), `FramePacer` (default VSync ON + 60 FPS cap), `GpuContext`, `ShaderSystem` (`SDL_shadercross`), `SceneLighting`, `TextLayoutSystem`, `RenderPacket`, `BatchRenderer`, `ProfilerOverlay` (opaque drop-in UI tool with separate CPU/Render/GPU bars).
+  - `Rendering/` — `SdlPlatform` (`WindowMode.BorderlessFullscreen` default + `F11` toggle), `FramePacer` (default VSync ON + 60 FPS cap), `GpuContext`, `ShaderSystem` (`SDL_shadercross`), `SceneLighting`, `TextLayoutSystem`, `RenderPacket`, `BatchRenderer`, `ProfilerOverlay` (100% opaque drop-in UI tool with separate `LOGIC` / `RENDER` / `GPU` bars excluding VSync wait).
   - `Shaders/` — `pbr_mesh.hlsl`, `sprite_3d.hlsl`, `sdf_text.hlsl`, `particle.hlsl`.
 - `src/ShowcaseGame/` — Playable Reference Game **"Bring Arena"** (`PublishAot=true`, depends on `BringEngine`).
 - `tests/BringEngine.Tests/` — Zero-reflection NativeAOT test suite (`PublishAot=true`, 23 tests covering core, sim, tweens, animation, particles, bundles, scenes, glTF, SDF fonts, text layout, 2-thread pipelined rendering, and SDL3_gpu debug validation).
@@ -68,7 +68,7 @@
 # Build solution (strict AOT analyzers active)
 dotnet build BringEngine.sln -c Release
 
-# Publish & run NativeAOT Engine Test Suite (19 tests incl. real SDL3_gpu batching)
+# Publish & run NativeAOT Engine Test Suite (23 tests incl. 2-thread pipeline, VSync-decoupled GPU timing & SDL3_gpu debug validation)
 dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r win-x64
 ./tests/BringEngine.Tests/bin/Release/net10.0/win-x64/publish/BringEngine.Tests.exe
 
