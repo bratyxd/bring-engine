@@ -42,4 +42,5 @@ Follow `SDL_shadercross` register spaces:
 - Vertex StorageBuffers: `space0` (`t0`, `t1`), UniformBuffers: `space1` (`b0` camera, `b1` `BaseInstance`).
 - Fragment Samplers/Textures: `space2` (`s0`, `t0`), UniformBuffers: `space3` (`b0`).
 - Always start with `#pragma pack_matrix(column_major)` and index `Instances[BaseInstance + instanceId]`.
+- For `ShaderVertexLayout.Mesh3D` custom shaders, keep all 7 `VSInput` attributes (`TEXCOORD0..TEXCOORD6`) and `AlbedoTex`/`JointPalette` referenced so SPIR-V/DXIL reflection preserves the exact vertex layout on D3D12, Vulkan, and Metal (see `src/ShowcaseGame/Assets/Shaders/hologram_energy.hlsl` as the canonical template).
 - Compile with `ShaderSystem.CompileFromFile(ref gpu, "Assets/my_shader.hlsl", "my_shader", ShaderVertexLayout.Mesh3D)`.
