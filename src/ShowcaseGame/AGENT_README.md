@@ -29,9 +29,10 @@ src/<YourGame>/
 3. **Pure Data + Static Systems**: No classes for entities, enemies, bullets, or UI widgets. Put arrays in `GameSimState` (`FixVec3* EnemyPos`, `byte* EnemyAlive`, ...) and iterate linearly in `static unsafe class GameSimSystems`.
 4. **Deterministic Gameplay**: Use `Fix32` / `FixVec3` and `DetRng` inside `Simulation/`. Never call `Random.Shared` or `DateTime.Now`.
 5. **Decoupled View Sync via Events**: Emit plain `SimEvent` structs from `Simulation/` (`EnemyHit`, `EnemyKilled`, `ItemCollected`). Consume them in `View/` to trigger `ParticleSystem.Burst`, `CameraSystem.AddTrauma`, `TweenSystem`, and floating 3D SDF `TextData`.
-6. **Bundles & Unity-Like Scenes**:
-   - Put shared assets (font, glow texture, UI sprites) in a `common` bundle.
-   - Put scene-specific `.glb` models in scene-specific bundles (`title`, `arena`).
+6. **Compressed Asset Bundles (`.bpack`), Default Atlasing, 9-Slice UI & Unity-Like Scenes**:
+   - Store raw source `.png`/`.jpg`/`.glb`/`.ttf` assets outside `dist/` (e.g., `raw_assets/<bundle>/`) and compile them with `BringPacker` (`tools/BringPacker`) into compressed `assets/<bundle>.bpack` bundles (BC1/BC3 GPU-compressed default atlases + 9-slice `SpriteRegionData` + Brotli/LZ4-compressed `.glb` models with BC1/BC3 embedded textures). Load via `BundleSystem.RegisterPack`.
+   - **Ship ZERO loose PNG/JPG textures in final builds** — verify with `BringPacker --verify-no-loose-textures dist`. Use `RenderComponentSystem.SpriteFromRegion` / `DefaultUiSlicedPanel` for 9-sliced HUD panels that batch in a single draw call (`docs/agents/13-asset-compression-atlases-and-9slice.md`).
+   - Put shared assets (font, glow texture, UI atlas) in a `common` bundle and scene-specific `.glb` models in scene-specific bundles (`title`, `arena`).
    - Switch main scenes with `SceneLoadMode.Single` (automatically frees old unshared bundles & RAM/VRAM!).
    - Overlay HUD/pause menus with `SceneLoadMode.Additive` + a secondary Orthographic camera (`DepthOrder = 100`, `LayerMask = 1u << 31`).
 7. **Custom Shaders + Tweens**:

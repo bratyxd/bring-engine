@@ -1,8 +1,11 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
+using BringEngine.Assets.Compression;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
+using BringEngine.Core.Threading;
 using StbImageSharp;
 
 namespace BringEngine.Assets.Textures;
@@ -19,12 +22,85 @@ public static unsafe class TextureLoader
         BundleId bundle,
         StringId name,
         bool srgb = true,
-        bool clampEdge = false)
+        bool clampEdge = false,
+        TextureCompressionPolicy compression = TextureCompressionPolicy.None,
+        JobScheduler* jobs = null)
     {
-        // StbImageSharp requires byte[] or Stream; decode into RGBA8 then copy to native bundle arena
+        // Fast path: already GPU block-compressed BRTX blob (zero decode, direct BC1/BC3 VRAM upload!)
+        if (encodedBytes.Length >= sizeof(BrtxHeader) &&
+            MemoryMarshal.Read<uint>(encodedBytes) == BrtxHeader.MagicValue)
+        {
+            return LoadBrtxFromMemory(encodedBytes, ref bundleArena, ref assets, bundle, name);
+        }
+
+        // StbImageSharp requires byte[] or Stream; decode into RGBA8 then store (or compress to BC1/BC3) in bundleArena
         byte[] copy = encodedBytes.ToArray();
         ImageResult img = ImageResult.FromMemory(copy, ColorComponents.RedGreenBlueAlpha);
+        if (compression != TextureCompressionPolicy.None)
+        {
+            fixed (byte* px = img.Data)
+            {
+                TexturePixelFormat fmt = TextureCompressionSystem.ResolveFormat(compression, px, img.Width, img.Height);
+                byte* dst = TextureCompressionSystem.EncodeToArena(px, img.Width, img.Height, fmt, ref bundleArena, out int dataBytes, jobs);
+                return RegisterCompressed(dst, dataBytes, img.Width, img.Height, fmt, ref assets, bundle, name, srgb, clampEdge, nearest: false);
+            }
+        }
         return CreateFromRgba(img.Data, img.Width, img.Height, ref bundleArena, ref assets, bundle, name, srgb, clampEdge);
+    }
+
+    public static TextureHandle LoadBrtxFromMemory(
+        ReadOnlySpan<byte> brtxBytes,
+        ref LinearArena bundleArena,
+        ref AssetRegistry assets,
+        BundleId bundle,
+        StringId name)
+    {
+        if (brtxBytes.Length < sizeof(BrtxHeader))
+            throw new InvalidDataException("BRTX buffer truncated.");
+
+        BrtxHeader hdr = MemoryMarshal.Read<BrtxHeader>(brtxBytes);
+        if (hdr.Magic != BrtxHeader.MagicValue)
+            throw new InvalidDataException("Invalid BRTX header magic.");
+
+        int payloadOffset = sizeof(BrtxHeader);
+        if (payloadOffset + hdr.DataBytes > brtxBytes.Length)
+            throw new InvalidDataException("BRTX payload truncated.");
+
+        byte* dst = bundleArena.AllocUninitialized<byte>(hdr.DataBytes, 64);
+        brtxBytes.Slice(payloadOffset, hdr.DataBytes).CopyTo(new Span<byte>(dst, hdr.DataBytes));
+        bool srgb = (hdr.Flags & 1) != 0;
+        bool clamp = (hdr.Flags & 2) != 0;
+        bool nearest = (hdr.Flags & 4) != 0;
+        return RegisterCompressed(dst, hdr.DataBytes, hdr.Width, hdr.Height, hdr.Format, ref assets, bundle, name, srgb, clamp, nearest);
+    }
+
+    public static TextureHandle RegisterCompressed(
+        byte* dataPtr,
+        int dataBytes,
+        int width,
+        int height,
+        TexturePixelFormat format,
+        ref AssetRegistry assets,
+        BundleId bundle,
+        StringId name,
+        bool srgb = true,
+        bool clampEdge = true,
+        bool nearest = false)
+    {
+        return AssetSystem.RegisterTexture(ref assets, new TextureAssetData
+        {
+            OwnerBundle = bundle,
+            Name = name,
+            Pixels = dataPtr,
+            Width = width,
+            Height = height,
+            DataBytes = dataBytes,
+            Format = format,
+            Channels = (byte)(format == TexturePixelFormat.R8 ? 1 : 4),
+            Srgb = (byte)(srgb ? 1 : 0),
+            ClampEdge = (byte)(clampEdge ? 1 : 0),
+            NearestFilter = (byte)(nearest ? 1 : 0),
+        });
     }
 
     public static TextureHandle LoadFromFile(
@@ -34,11 +110,12 @@ public static unsafe class TextureLoader
         BundleId bundle,
         StringId name,
         bool srgb = true,
-        bool clampEdge = false)
+        bool clampEdge = false,
+        TextureCompressionPolicy compression = TextureCompressionPolicy.None,
+        JobScheduler* jobs = null)
     {
         byte[] fileBytes = File.ReadAllBytes(path);
-        ImageResult img = ImageResult.FromMemory(fileBytes, ColorComponents.RedGreenBlueAlpha);
-        return CreateFromRgba(img.Data, img.Width, img.Height, ref bundleArena, ref assets, bundle, name, srgb, clampEdge);
+        return LoadFromMemory(fileBytes, ref bundleArena, ref assets, bundle, name, srgb, clampEdge, compression, jobs);
     }
 
     public static TextureHandle CreateFromRgba(

@@ -25,8 +25,23 @@ SpriteHandle sh = RenderComponentSystem.AddSprite(ref world.RenderComponents, ne
 });
 ```
 
-## 2D HUD / Screen-Space Sprites
+## 2D HUD / Screen-Space Sprites & 9-Slice UI Panels
 Spawn a sprite with `LayerMask = 1u << 31` (matching your Orthographic UI camera) and `DepthTest = 0`. Use `SortingLayer` and `OrderInLayer` to control exact draw order.
+
+For scalable UI panels, buttons, dialogue boxes, and frames, use **packed compressed atlas regions (`SpriteRegionData`) + 9-slicing (`SpriteDrawMode.Sliced` / `SlicedNoCenter`)**:
+```csharp
+// Resolve once in OnLoad (packed from raw_assets via BringPacker or AtlasPacker)
+SpriteRegionData* panelReg = AssetSystem.TryGetSpriteRegion(in world.Assets, StringId.Hash("ui/panel_frame"));
+
+EntityId panelEnt = EntitySystem.Spawn(ref world.Entities, sceneId);
+TransformSystem.Add(ref world.Transforms, panelEnt, new Vec3(24f, 540f, 0f));
+
+// Corners stay crisp at exact SliceBorders pixels; edges & center stretch cleanly;
+// all 9 sub-quads batch into ONE single instanced GPU draw call with other sprites on the same atlas!
+SpriteData panel = RenderComponentSystem.DefaultUiSlicedPanel(panelEnt, in *panelReg, new Vec2(320f, 140f), sceneId, orderInLayer: 10);
+RenderComponentSystem.AddSprite(ref world.RenderComponents, in panel);
+```
+See [`docs/agents/13-asset-compression-atlases-and-9slice.md`](13-asset-compression-atlases-and-9slice.md) for `pack.json` 9-slice border configuration, `SlicedNoCenter` hollow frames, and default BC1/BC3 atlas compression.
 
 ## GPU Batching & Performance Rules
 `BatchRenderer` splits rendering into two pipelined stages (`ExtractRenderPacket` on the Logic Thread and `SubmitRenderPacket` on the Main/Render Thread; or single-threaded `RenderFrame` for tests) to minimize draw calls and GPU state changes:

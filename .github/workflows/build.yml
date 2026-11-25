@@ -24,6 +24,11 @@ jobs:
         run: |
           dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r win-x64
           ./tests/BringEngine.Tests/bin/Release/net10.0/win-x64/publish/BringEngine.Tests.exe
+      - name: Publish & smoke-test BringPacker (NativeAOT)
+        shell: pwsh
+        run: |
+          dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r win-x64
+          ./tools/BringPacker/bin/Release/net10.0/win-x64/publish/BringPacker.exe --help
       - name: Publish & verify ShowcaseGame (NativeAOT + Headless + Render)
         shell: pwsh
         run: |
@@ -59,6 +64,10 @@ jobs:
         run: |
           dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r linux-x64
           xvfb-run -a ./tests/BringEngine.Tests/bin/Release/net10.0/linux-x64/publish/BringEngine.Tests
+      - name: Publish & smoke-test BringPacker (NativeAOT)
+        run: |
+          dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r linux-x64
+          ./tools/BringPacker/bin/Release/net10.0/linux-x64/publish/BringPacker --help
       - name: Publish & verify ShowcaseGame (NativeAOT + Headless + Render)
         run: |
           dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r linux-x64
@@ -87,6 +96,10 @@ jobs:
         run: |
           dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r osx-arm64
           ./tests/BringEngine.Tests/bin/Release/net10.0/osx-arm64/publish/BringEngine.Tests --headless-only
+      - name: Publish & smoke-test BringPacker (NativeAOT)
+        run: |
+          dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r osx-arm64
+          ./tools/BringPacker/bin/Release/net10.0/osx-arm64/publish/BringPacker --help
       - name: Publish & verify ShowcaseGame (NativeAOT Headless)
         run: |
           dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r osx-arm64

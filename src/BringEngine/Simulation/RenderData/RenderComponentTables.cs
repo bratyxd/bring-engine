@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using BringEngine.Assets;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
@@ -39,8 +40,16 @@ public enum SpriteBlendMode : byte
     Additive = 2,
 }
 
+public enum SpriteDrawMode : byte
+{
+    Simple = 0,          // Standard 1-quad sprite (default)
+    Sliced = 1,          // 9-slice UI/sprite: crisp unstretched corners, stretched edges & center (batches in 1 draw call!)
+    SlicedNoCenter = 2,  // 9-slice hollow frame: crisp corners & edges, no center quad (8 quads in 1 draw call)
+}
+
 /// <summary>
 /// Unity-style 2D Sprite living in 3D World Space (or 2D Screen Space via UI camera LayerMask).
+/// Supports sprite atlases (UvRect) and Unity-style 9-slicing (DrawMode = Sliced, SliceBorders).
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct SpriteData
@@ -51,21 +60,27 @@ public struct SpriteData
     public TextureHandle Texture;
     public ShaderHandle CustomShader;
 
-    public Vec2 Size;           // World-space width/height (or pixels in UI ortho camera)
-    public Vec2 Pivot;          // (0.5, 0.5) = center
-    public Vec4 UvRect;         // (u0, v0, uWidth, vHeight)
+    public Vec2 Size;            // World-space width/height (or virtual pixels in UI ortho camera)
+    public Vec2 Pivot;           // (0.5, 0.5) = center
+    public Vec4 UvRect;          // (u0, v0, uWidth, vHeight)
     public ColorF Color;
-    public Vec4 CustomParams;   // Tweenable custom shader parameters
+    public Vec4 CustomParams;    // Tweenable custom shader parameters
+
+    // 9-Slice UI / Panel parameters (used when DrawMode != SpriteDrawMode.Simple)
+    public Vec4 SliceBorders;    // Insets in source sprite pixels: (Left, Bottom, Right, Top)
+    public Vec2 SourcePixelSize; // Unpadded source sprite size in pixels (auto-set by SpriteFromRegion)
+    public float SliceScale;     // Border thickness scale multiplier (0 = treated as 1.0)
 
     public uint LayerMask;
     public short SortingLayer;
     public short OrderInLayer;
     public SpriteBillboardMode Billboard;
     public SpriteBlendMode BlendMode;
+    public SpriteDrawMode DrawMode;
     public byte FlipX;
     public byte FlipY;
     public byte Visible;
-    public byte DepthTest;      // 1 = depth test with 3D world, 0 = always on top (HUD)
+    public byte DepthTest;       // 1 = depth test with 3D world, 0 = always on top (HUD)
 }
 
 public enum TextAlignmentH : byte { Left = 0, Center = 1, Right = 2 }
@@ -247,6 +262,65 @@ public static unsafe class RenderComponentSystem
         if (t.Sprites[d].Size.X == 0f && t.Sprites[d].Size.Y == 0f)
             t.Sprites[d].Size = Vec2.One;
         return h;
+    }
+
+    /// <summary>
+    /// Builds a SpriteData directly from a packed atlas SpriteRegionData.
+    /// Automatically wires the compressed atlas TextureHandle, UV sub-rect, source pixel size,
+    /// and enables 9-slicing (SpriteDrawMode.Sliced) whenever the region carries SliceBorders!
+    /// </summary>
+    public static SpriteData SpriteFromRegion(
+        EntityId entity,
+        in SpriteRegionData region,
+        Vec2 size,
+        SceneId scene = default,
+        uint layerMask = 1u << 31,
+        short orderInLayer = 0,
+        byte depthTest = 0)
+    {
+        bool hasSlice = region.SliceBorders.X > 0f || region.SliceBorders.Y > 0f
+                     || region.SliceBorders.Z > 0f || region.SliceBorders.W > 0f;
+        return new SpriteData
+        {
+            Entity = entity,
+            OwnerScene = scene,
+            Texture = region.AtlasTexture,
+            Size = size,
+            Pivot = region.Pivot,
+            UvRect = region.UvRect,
+            Color = ColorF.White,
+            SliceBorders = region.SliceBorders,
+            SourcePixelSize = region.PixelSize,
+            SliceScale = 1f,
+            LayerMask = layerMask,
+            SortingLayer = 0,
+            OrderInLayer = orderInLayer,
+            Billboard = SpriteBillboardMode.None,
+            BlendMode = SpriteBlendMode.AlphaBlend,
+            DrawMode = hasSlice ? SpriteDrawMode.Sliced : SpriteDrawMode.Simple,
+            Visible = 1,
+            DepthTest = depthTest,
+        };
+    }
+
+    /// <summary>
+    /// Convenience constructor for a 2D HUD 9-sliced panel/button anchored at bottom-left (Pivot = 0,0) on Layer 31.
+    /// </summary>
+    public static SpriteData DefaultUiSlicedPanel(
+        EntityId entity,
+        in SpriteRegionData region,
+        Vec2 size,
+        SceneId scene = default,
+        short orderInLayer = 0,
+        Vec4? overrideBorders = null,
+        float sliceScale = 1f)
+    {
+        SpriteData sp = SpriteFromRegion(entity, in region, size, scene, layerMask: 1u << 31, orderInLayer: orderInLayer, depthTest: 0);
+        sp.Pivot = Vec2.Zero;
+        if (overrideBorders.HasValue) sp.SliceBorders = overrideBorders.Value;
+        sp.SliceScale = sliceScale > 0f ? sliceScale : 1f;
+        sp.DrawMode = SpriteDrawMode.Sliced;
+        return sp;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

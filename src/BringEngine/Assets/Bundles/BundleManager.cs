@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using BringEngine.Assets.Fonts;
 using BringEngine.Assets.Gltf;
+using BringEngine.Assets.Packing;
 using BringEngine.Assets.Textures;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Memory;
@@ -31,6 +32,7 @@ public unsafe struct AssetBundleData
     public StringId Name;
     public FixedString64 NameText;
     public FixedString256 ManifestPath;
+    public FixedString256 PackPath;
     public LinearArena Arena;
     public nuint ArenaCapacityBytes;
     public int RefCount;
@@ -128,6 +130,23 @@ public static unsafe class BundleSystem
         return handle;
     }
 
+    /// <summary>
+    /// Registers a compressed .bpack asset bundle (containing BC1/BC3 atlases, 9-slice sprite regions,
+    /// compressed .glb models, and SDF fonts — no loose textures required in final builds).
+    /// </summary>
+    public static BundleId RegisterPack(
+        ref BundleManager mgr,
+        ReadOnlySpan<char> name,
+        nuint arenaCapacityBytes,
+        ReadOnlySpan<char> bpackPath,
+        delegate*<ref BundleLoadContext, void> postLoadHook = null,
+        void* userData = null)
+    {
+        var handle = Register(ref mgr, name, arenaCapacityBytes, postLoadHook, userData);
+        mgr.Bundles[handle.Index].PackPath = FixedString256.From(bpackPath);
+        return handle;
+    }
+
     public static BundleId Find(in BundleManager mgr, StringId name)
         => mgr.NameToSlot.TryGet(name.Value, out int slot) ? mgr.Bundles[slot].Handle : BundleId.Invalid;
 
@@ -153,6 +172,13 @@ public static unsafe class BundleSystem
 
         b.Arena = LinearArena.Create(b.ArenaCapacityBytes, b.Name.Value);
         b.Loaded = 1;
+
+        if (b.PackPath.Length > 0)
+        {
+            string packPath = b.PackPath.ToString();
+            if (File.Exists(packPath))
+                AssetPackLoader.LoadIntoBundle(packPath, ref b.Arena, ref scratchArena, ref world, id);
+        }
 
         if (b.ManifestPath.Length > 0)
         {

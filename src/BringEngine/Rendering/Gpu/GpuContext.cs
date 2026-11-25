@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using BringEngine.Assets;
+using BringEngine.Assets.Compression;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
@@ -572,9 +573,38 @@ public static unsafe class GpuSystem
         }
         if (slot < 0) throw new OutOfMemoryException("GpuContext texture slots exhausted.");
 
-        SDL.GPUTextureFormat fmt = tex.Channels == 1
-            ? SDL.GPUTextureFormat.R8Unorm
-            : SDL.GPUTextureFormat.R8G8B8A8Unorm;
+        TexturePixelFormat srcFmt = tex.Format;
+        if (srcFmt == TexturePixelFormat.Rgba8 && tex.Channels == 1)
+            srcFmt = TexturePixelFormat.R8;
+
+        SDL.GPUTextureFormat fmt;
+        bool decodeFallbackToRgba = false;
+        if (srcFmt == TexturePixelFormat.R8)
+        {
+            fmt = SDL.GPUTextureFormat.R8Unorm;
+        }
+        else if (srcFmt == TexturePixelFormat.Bc1Rgba)
+        {
+            fmt = SDL.GPUTextureFormat.BC1RGBAUnorm;
+            if (!SDL.GPUTextureSupportsFormat(ctx.Device, fmt, SDL.GPUTextureType.TextureType2D, SDL.GPUTextureUsageFlags.Sampler))
+            {
+                fmt = SDL.GPUTextureFormat.R8G8B8A8Unorm;
+                decodeFallbackToRgba = true;
+            }
+        }
+        else if (srcFmt == TexturePixelFormat.Bc3Rgba)
+        {
+            fmt = SDL.GPUTextureFormat.BC3RGBAUnorm;
+            if (!SDL.GPUTextureSupportsFormat(ctx.Device, fmt, SDL.GPUTextureType.TextureType2D, SDL.GPUTextureUsageFlags.Sampler))
+            {
+                fmt = SDL.GPUTextureFormat.R8G8B8A8Unorm;
+                decodeFallbackToRgba = true;
+            }
+        }
+        else
+        {
+            fmt = SDL.GPUTextureFormat.R8G8B8A8Unorm;
+        }
 
         var info = new SDL.GPUTextureCreateInfo
         {
@@ -591,11 +621,28 @@ public static unsafe class GpuSystem
         if (gpuTex == nint.Zero)
             throw new InvalidOperationException($"SDL_CreateGPUTexture failed: {SDL.GetError()}");
 
-        uint byteSize = (uint)(tex.Width * tex.Height * tex.Channels);
+        uint byteSize;
+        if (decodeFallbackToRgba)
+            byteSize = (uint)(tex.Width * tex.Height * 4);
+        else if (tex.DataBytes > 0)
+            byteSize = (uint)tex.DataBytes;
+        else
+            byteSize = (uint)TextureCompressionSystem.CalcByteSize(srcFmt, tex.Width, tex.Height);
+
         var tbInfo = new SDL.GPUTransferBufferCreateInfo { Usage = SDL.GPUTransferBufferUsage.Upload, Size = byteSize };
         nint tb = SDL.CreateGPUTransferBuffer(ctx.Device, in tbInfo);
         void* mapped = (void*)SDL.MapGPUTransferBuffer(ctx.Device, tb, false);
-        Buffer.MemoryCopy(tex.Pixels, mapped, byteSize, byteSize);
+        if (decodeFallbackToRgba)
+        {
+            if (srcFmt == TexturePixelFormat.Bc1Rgba)
+                TextureCompressionSystem.DecodeBc1ToRgba(tex.Pixels, tex.Width, tex.Height, (byte*)mapped);
+            else
+                TextureCompressionSystem.DecodeBc3ToRgba(tex.Pixels, tex.Width, tex.Height, (byte*)mapped);
+        }
+        else
+        {
+            Buffer.MemoryCopy(tex.Pixels, mapped, byteSize, byteSize);
+        }
         SDL.UnmapGPUTransferBuffer(ctx.Device, tb);
 
         nint cmd = SDL.AcquireGPUCommandBuffer(ctx.Device);
@@ -604,8 +651,8 @@ public static unsafe class GpuSystem
         {
             TransferBuffer = tb,
             Offset = 0,
-            PixelsPerRow = (uint)tex.Width,
-            RowsPerLayer = (uint)tex.Height,
+            PixelsPerRow = 0,
+            RowsPerLayer = 0,
         };
         var dst = new SDL.GPUTextureRegion
         {

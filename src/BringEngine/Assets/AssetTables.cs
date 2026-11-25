@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using BringEngine.Assets.Compression;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
@@ -57,11 +58,29 @@ public unsafe struct TextureAssetData
     public byte* Pixels;
     public int Width;
     public int Height;
-    public byte Channels; // 1 = R8 (SDF font), 4 = RGBA8
+    public int DataBytes;            // Exact byte size of Pixels (auto-computed if 0 for legacy RGBA8/R8)
+    public TexturePixelFormat Format; // Rgba8, R8, Bc1Rgba (DXT1), Bc3Rgba (DXT5)
+    public byte Channels;            // 1 = R8 (SDF font), 4 = RGBA8/BC1/BC3
     public byte Srgb;
     public byte ClampEdge;
     public byte NearestFilter;
-    public int GpuSlot; // -1 if not uploaded to GPU
+    public int GpuSlot;              // -1 if not uploaded to GPU
+}
+
+/// <summary>
+/// Named sprite entry inside a compressed texture atlas, including optional 9-slice borders.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct SpriteRegionData
+{
+    public StringId Name;
+    public BundleId OwnerBundle;
+    public TextureHandle AtlasTexture;
+    public Vec4 UvRect;       // (u0, v0, uWidth, vHeight) inset with bleed padding
+    public Vec2 PixelSize;    // Original unpadded sprite pixel dimensions
+    public Vec4 SliceBorders; // 9-slice insets in source pixels: (Left, Bottom, Right, Top); Vec4.Zero if not 9-sliced
+    public Vec2 Pivot;        // Default pivot (0.5, 0.5)
+    public byte Valid;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -188,12 +207,17 @@ public unsafe struct AssetRegistry
     public int MaxGltfModels;
     public int LiveGltfCount;
 
+    public SpriteRegionData* SpriteRegions;
+    public int MaxSpriteRegions;
+    public int LiveSpriteRegionCount;
+
     // Name -> Handle raw lookup tables
     public NativeHashMap<uint> MeshByName;
     public NativeHashMap<uint> TextureByName;
     public NativeHashMap<uint> MaterialByName;
     public NativeHashMap<uint> FontByName;
     public NativeHashMap<uint> GltfByName;
+    public NativeHashMap<int> SpriteRegionByName;
 
     // Optional GPU cleanup hooks set by GpuContext when running with renderer enabled
     public void* GpuContextPtr;
@@ -206,7 +230,8 @@ public unsafe struct AssetRegistry
         int maxTextures = 512,
         int maxMaterials = 1024,
         int maxFonts = 64,
-        int maxGltfs = 256)
+        int maxGltfs = 256,
+        int maxSpriteRegions = 2048)
     {
         uint* mGens = arena.AllocUninitialized<uint>(maxMeshes, 16);
         uint* tGens = arena.AllocUninitialized<uint>(maxTextures, 16);
@@ -246,11 +271,15 @@ public unsafe struct AssetRegistry
             GltfAlive = arena.Alloc<byte>(maxGltfs, 16),
             MaxGltfModels = maxGltfs,
 
+            SpriteRegions = arena.Alloc<SpriteRegionData>(maxSpriteRegions, 64),
+            MaxSpriteRegions = maxSpriteRegions,
+
             MeshByName = NativeHashMap<uint>.Create(ref arena, maxMeshes),
             TextureByName = NativeHashMap<uint>.Create(ref arena, maxTextures),
             MaterialByName = NativeHashMap<uint>.Create(ref arena, maxMaterials),
             FontByName = NativeHashMap<uint>.Create(ref arena, maxFonts),
             GltfByName = NativeHashMap<uint>.Create(ref arena, maxGltfs),
+            SpriteRegionByName = NativeHashMap<int>.Create(ref arena, maxSpriteRegions),
         };
     }
 }
@@ -288,6 +317,10 @@ public static unsafe class AssetSystem
                 reg.Textures[i] = data;
                 reg.Textures[i].Handle = h;
                 reg.Textures[i].GpuSlot = -1;
+                if (reg.Textures[i].Format == TexturePixelFormat.Rgba8 && reg.Textures[i].Channels == 1)
+                    reg.Textures[i].Format = TexturePixelFormat.R8;
+                if (reg.Textures[i].DataBytes <= 0)
+                    reg.Textures[i].DataBytes = TextureCompressionSystem.CalcByteSize(reg.Textures[i].Format, reg.Textures[i].Width, reg.Textures[i].Height);
                 if (data.Name.IsValid) reg.TextureByName.Set(data.Name.Value, h.Raw);
                 return h;
             }
@@ -385,6 +418,45 @@ public static unsafe class AssetSystem
     public static GltfHandle FindGltf(in AssetRegistry reg, StringId name)
         => reg.GltfByName.TryGet(name.Value, out uint raw) ? new GltfHandle(raw) : GltfHandle.Invalid;
 
+    public static int RegisterSpriteRegion(ref AssetRegistry reg, in SpriteRegionData data)
+    {
+        for (int i = 0; i < reg.MaxSpriteRegions; i++)
+        {
+            if (reg.SpriteRegions[i].Valid == 0)
+            {
+                reg.SpriteRegions[i] = data;
+                reg.SpriteRegions[i].Valid = 1;
+                reg.LiveSpriteRegionCount++;
+                if (data.Name.IsValid) reg.SpriteRegionByName.Set(data.Name.Value, i);
+                return i;
+            }
+        }
+        throw new OutOfMemoryException("AssetRegistry sprite region slots exhausted.");
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static SpriteRegionData* TryGetSpriteRegion(in AssetRegistry reg, StringId name)
+    {
+        if (!name.IsValid || !reg.SpriteRegionByName.TryGet(name.Value, out int slot)) return null;
+        return ((uint)slot < (uint)reg.MaxSpriteRegions && reg.SpriteRegions[slot].Valid != 0)
+            ? reg.SpriteRegions + slot : null;
+    }
+
+    public static bool TryFindSpriteRegion(in AssetRegistry reg, StringId name, out SpriteRegionData region)
+    {
+        SpriteRegionData* ptr = TryGetSpriteRegion(in reg, name);
+        if (ptr == null) { region = default; return false; }
+        region = *ptr;
+        return true;
+    }
+
+    public static SpriteRegionData FindSpriteRegion(in AssetRegistry reg, StringId name)
+    {
+        SpriteRegionData* ptr = TryGetSpriteRegion(in reg, name);
+        if (ptr == null) throw new InvalidOperationException($"SpriteRegion not found in AssetRegistry (hash=0x{name.Value:X16}).");
+        return *ptr;
+    }
+
     /// <summary>
     /// Releases all CPU metadata and GPU resources owned by a bundle.
     /// Called immediately before the bundle's LinearArena is disposed.
@@ -448,6 +520,15 @@ public static unsafe class AssetSystem
                 reg.LiveGltfCount--;
                 uint g = (reg.GltfGens[i] + 1) & HandlePacking.GenerationMask;
                 reg.GltfGens[i] = g == 0 ? 1u : g;
+            }
+        }
+        for (int i = 0; i < reg.MaxSpriteRegions; i++)
+        {
+            if (reg.SpriteRegions[i].Valid != 0 && reg.SpriteRegions[i].OwnerBundle == bundle)
+            {
+                if (reg.SpriteRegions[i].Name.IsValid) reg.SpriteRegionByName.Remove(reg.SpriteRegions[i].Name.Value);
+                reg.SpriteRegions[i] = default;
+                reg.LiveSpriteRegionCount--;
             }
         }
     }

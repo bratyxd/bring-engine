@@ -19,6 +19,7 @@ public static class Program
         SimulationTests.RunAll();
         TweenAnimParticleTests.RunAll();
         AssetBundleSceneGltfTests.RunAll();
+        AssetPackingAndNineSliceTests.RunAll(headlessOnly);
         RenderTests.RunAll(headlessOnly);
         ProfilingAndPacingTests.RunAll(headlessOnly);
 

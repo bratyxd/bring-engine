@@ -3,6 +3,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using BringEngine.Assets.Compression;
 using BringEngine.Assets.Textures;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
@@ -90,6 +91,29 @@ public static unsafe class GltfLoader
         BundleId bundle,
         StringId assetName)
     {
+        // Transparently decompress Bring Compressed GLB ("BGLB" — LZ4 or Brotli compressed .glb)
+        ArenaMarker bglbMark = scratchArena.SaveMarker();
+        if (fileBytes.Length >= sizeof(BglbHeader) &&
+            MemoryMarshal.Read<uint>(fileBytes) == BglbHeader.MagicValue)
+        {
+            BglbHeader hdr = MemoryMarshal.Read<BglbHeader>(fileBytes);
+            int payloadOff = sizeof(BglbHeader);
+            if (payloadOff + hdr.CompressedBytes > fileBytes.Length || hdr.UncompressedBytes <= 0)
+                throw new InvalidDataException("Corrupt BGLB compressed glTF payload.");
+
+            byte* decompressedPtr = scratchArena.AllocUninitialized<byte>(hdr.UncompressedBytes, 64);
+            var decompressedSpan = new Span<byte>(decompressedPtr, hdr.UncompressedBytes);
+            PackCompressionSystem.Decompress(fileBytes.Slice(payloadOff, hdr.CompressedBytes), hdr.Compression, decompressedSpan);
+            try
+            {
+                return LoadFromMemory(decompressedSpan, baseDirectory, ref bundleArena, ref scratchArena, ref assets, ref animations, bundle, assetName);
+            }
+            finally
+            {
+                scratchArena.Rollback(bglbMark);
+            }
+        }
+
         ReadOnlySpan<byte> jsonSpan;
         ReadOnlySpan<byte> glbBinSpan = ReadOnlySpan<byte>.Empty;
 

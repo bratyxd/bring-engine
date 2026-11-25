@@ -19,9 +19,14 @@ static unsafe void LoadArenaBundle(ref BundleLoadContext ctx)
 BundleId commonBundle = BundleSystem.Register(ref bundles, "common", 4 * 1024 * 1024, &LoadCommonBundle);
 BundleId arenaBundle  = BundleSystem.Register(ref bundles, "arena",  8 * 1024 * 1024, &LoadArenaBundle);
 
-// Option B: Zero-reflection JSON manifest bundle
+// Option B: Unity-style compressed .bpack bundle (RECOMMENDED FOR FINAL BUILDS — default compressed BC1/BC3 atlases, 9-slice regions, compressed .glb models, SDF fonts, ZERO loose textures!)
+BundleId packedCommon = BundleSystem.RegisterPack(ref bundles, "common", 16 * 1024 * 1024, "assets/common.bpack");
+
+// Option C: Zero-reflection JSON manifest bundle (development prototyping)
 BundleId level2 = BundleSystem.RegisterManifest(ref bundles, "level2", 8 * 1024 * 1024, "Assets/level2_bundle.json");
 ```
+
+> **Production Bundling Rule**: Keep raw `.png`/`.jpg`/`.glb`/`.ttf` source assets in `raw_assets/`, pack them into compressed `assets/<bundle>.bpack` using `BringPacker` (`tools/BringPacker`), and load via `BundleSystem.RegisterPack` so final builds ship **zero loose textures** — see [`docs/agents/13-asset-compression-atlases-and-9slice.md`](13-asset-compression-atlases-and-9slice.md).
 
 ## Unity-Like Scene Loading (`Single` vs `Additive`)
 ```csharp

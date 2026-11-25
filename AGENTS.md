@@ -31,9 +31,10 @@
    - **Native First-Class Multithreading (`JobScheduler` + `JobSystem`) — Only When It Makes Sense**: Bring Engine ships a zero-GC, zero-OOP data-oriented worker pool (`ParallelFor` with automatic inline `minParallelCount` threshold, async `Schedule`/`ScheduleParallelFor`, DAG `CombineDependencies`, cooperative `RequestCancel`, and lock-free per-worker `GetWorkerScratch` native arenas). **Do NOT multithread everything for the sake of it** — small loops (< ~500–1000 items or < 0.5 ms) stay faster single-threaded in L1 cache. Use `JobSystem` only for genuinely heavy independent SoA loops (thousands of entities/particles/transforms, spatial/flow grids) or multi-frame background generation (`docs/agents/12-multithreading-and-jobs.md`).
    - **Borderless Full Window Default**: ALL Bring Engine games MUST launch in **Borderless Full Window** mode by default (`WindowMode.BorderlessFullscreen`, default in `PlatformSystem.InitWindow`), with `F11` runtime toggle to windowed mode and `--windowed` CLI override.
 
-5. **Cache Locality & GPU Batching**
+5. **Cache Locality, GPU Batching, Default Compressed Atlasing & `.bpack` Bundling**
    - Pack vertices/instances in 16/64-byte aligned structs with `[StructLayout(LayoutKind.Sequential)]`.
-   - `BatchRenderer.ExtractRenderPacket` performs CPU frustum culling, deterministic sorting & merging of 3D meshes, 2D sprites in 3D/HUD, SDF glyphs, and SoA particles into a self-contained `RenderPacket` inside `FrameArena`.
+   - **Default Compressed Atlasing & Unity-Style Asset Compression**: Pack all 2D/UI sprites into **BC1/BC3 GPU block-compressed atlases** by default (`AtlasPacker` / `AssetPackBuilder` / `BringPacker`), compress `.glb`/`.gltf` models (inlining external buffers/images, re-encoding embedded textures to BC1/BC3 `BRTX`, and compressing streams with **Brotli** or **LZ4** into `.bpack` bundles), and ship **ZERO loose PNG/JPG textures** in final builds (`BringPacker --verify-no-loose-textures dist`). Use 9-slice `SpriteDrawMode.Sliced` / `SlicedNoCenter` (`SpriteFromRegion` / `DefaultUiSlicedPanel`) for crisp scalable 2D UI panels that batch into a single instanced draw call (`docs/agents/13-asset-compression-atlases-and-9slice.md`).
+   - `BatchRenderer.ExtractRenderPacket` performs CPU frustum culling, deterministic sorting & merging of 3D meshes, 2D sprites in 3D/HUD (including 9-sliced sub-quads), SDF glyphs, and SoA particles into a self-contained `RenderPacket` inside `FrameArena`.
    - `BatchRenderer.SubmitRenderPacket` uploads all dynamic storage buffers in **ONE `SDL_GPUCopyPass` per frame** (`cycle: true`), renders to an offscreen `SceneColorTexture` (cycling color/depth cleanly on initial clear, binding pipelines before storage buffers, and deduplicating state binds), measures pure GPU time via fence bracket before presenting, and blits to the swapchain on a separate `cmdPresent` so VSync wait never pollutes GPU timings.
 
 ## 2. Solution Layout
@@ -45,11 +46,12 @@
   - `Core/Handles/` — 32-bit generational handles (`HandlePacking`, `EntityId`, ...).
   - `Core/Math/` — `Fix32`, `Fix64`, `FixVec2/3`, `FixQuat`, `DetMath`, `DetRng`, `Vec2/3/4`, `Quat`, `Mat4`, `ColorF/32`, `Bounds3`, `Plane`, `Frustum`, `Ray`.
   - `Simulation/` — `EntityTable`, `TransformTable`, `EngineWorld`, `CameraTable`, `InputState`, `Easing`, `TweenTable`, `AnimationTable`, `ParticleTable`, `RenderComponentTables`, `SceneManager`.
-  - `Assets/` — `AssetRegistry`, `BundleManager`, `TextureLoader`, `SdfFontLoader`, `GltfLoader`, `GlbBuilder`.
-  - `Rendering/` — `SdlPlatform` (`WindowMode.BorderlessFullscreen` default + `F11` toggle), `FramePacer` (default VSync ON + 60 FPS cap), `GpuContext`, `ShaderSystem` (`SDL_shadercross`), `SceneLighting`, `TextLayoutSystem`, `RenderPacket`, `BatchRenderer`, `ProfilerOverlay` (100% opaque drop-in UI tool with separate `LOGIC` / `RENDER` / `GPU` bars excluding VSync wait).
+  - `Assets/` — `AssetRegistry` (incl. `SpriteRegionData`), `BundleManager` (`.bpack`, JSON manifests, loader hooks), `Compression/` (`TextureCompressionSystem` BC1/BC3 `BRTX`, `PackCompressionSystem` LZ4/Brotli & `BGLB`), `Atlases/` (`AtlasPacker`), `Packing/` (`AssetPackBuilder` / `AssetPackLoader`), `TextureLoader`, `SdfFontLoader`, `GltfLoader`, `GlbBuilder`.
+  - `Rendering/` — `SdlPlatform` (`WindowMode.BorderlessFullscreen` default + `F11` toggle), `FramePacer` (default VSync ON + 60 FPS cap), `GpuContext` (native BC1/BC3 VRAM upload + fallback), `ShaderSystem` (`SDL_shadercross`), `SceneLighting`, `TextLayoutSystem`, `RenderPacket`, `BatchRenderer` (incl. 9-slice UI batch expansion), `ProfilerOverlay` (100% opaque drop-in UI tool with separate `LOGIC` / `RENDER` / `GPU` bars excluding VSync wait).
   - `Shaders/` — `pbr_mesh.hlsl`, `sprite_3d.hlsl`, `sdf_text.hlsl`, `particle.hlsl`.
+- `tools/BringPacker/` — NativeAOT CLI asset bundler (`PublishAot=true`): builds default-atlased BC1/BC3 + LZ4/Brotli `.bpack` bundles from raw asset folders and enforces `--verify-no-loose-textures`.
 - `src/ShowcaseGame/` — Playable Reference Game **"Bring Arena"** (`PublishAot=true`, depends on `BringEngine`).
-- `tests/BringEngine.Tests/` — Zero-reflection NativeAOT test suite (`PublishAot=true`, 28 tests covering core, data-oriented `JobSystem` multithreading & bit-exact parallel subsystems, sim, tweens, animation, particles, bundles, scenes, glTF, SDF fonts, text layout, 2-thread pipelined rendering, and SDL3_gpu debug validation).
+- `tests/BringEngine.Tests/` — Zero-reflection NativeAOT test suite (`PublishAot=true`, 34 tests covering core, data-oriented `JobSystem` multithreading & bit-exact parallel subsystems, sim, tweens, animation, particles, bundles, scenes, glTF, BC1/BC3 & LZ4/Brotli compression, default atlasing, `.bpack` zero-loose-texture bundling, 9-slice UI batching, SDF fonts, text layout, 2-thread pipelined rendering, and SDL3_gpu debug validation).
 
 ## 3. Subsystem Agent Guides
 - [`docs/agents/01-memory-and-allocators.md`](docs/agents/01-memory-and-allocators.md)
@@ -64,6 +66,7 @@
 - [`docs/agents/10-camera-and-headless-testing.md`](docs/agents/10-camera-and-headless-testing.md)
 - [`docs/agents/11-vsync-fps-cap-and-profiling.md`](docs/agents/11-vsync-fps-cap-and-profiling.md) — Borderless Full Window default, 2-Thread Pipelined Engine Loop, VSync (default ON), FPS cap (default 60), `FrameProfiler`, `SetPassCalls`, and separate-bar `ProfilerOverlay` UI.
 - [`docs/agents/12-multithreading-and-jobs.md`](docs/agents/12-multithreading-and-jobs.md) — Native first-class data-oriented `JobSystem` (`ParallelFor`, async DAGs, `CombineDependencies`, cooperative cancel, per-worker scratch arenas, and when NOT to multithread).
+- [`docs/agents/13-asset-compression-atlases-and-9slice.md`](docs/agents/13-asset-compression-atlases-and-9slice.md) — Unity-style BC1/BC3 GPU texture compression, LZ4/Brotli `.bpack` & glTF/GLB compression, default texture atlasing (zero loose textures in final builds), `BringPacker` CLI, and 9-slice 2D UI sprites.
 - [`src/ShowcaseGame/AGENT_README.md`](src/ShowcaseGame/AGENT_README.md) — Complete template for creating a new game.
 
 ## 4. Build, NativeAOT Publish & Verification Commands
@@ -71,9 +74,13 @@
 # Build solution (strict AOT analyzers active)
 dotnet build BringEngine.sln -c Release
 
-# Publish & run NativeAOT Engine Test Suite (28 tests incl. JobSystem multithreading, 2-thread pipeline, VSync-decoupled GPU timing & SDL3_gpu debug validation)
+# Publish & run NativeAOT Engine Test Suite (34 tests incl. BC1/BC3 & LZ4/Brotli compression, atlasing, .bpack, 9-slice UI, JobSystem multithreading, 2-thread pipeline & SDL3_gpu debug validation)
 dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r win-x64
 ./tests/BringEngine.Tests/bin/Release/net10.0/win-x64/publish/BringEngine.Tests.exe
+
+# Publish NativeAOT BringPacker CLI tool
+dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r win-x64
+./tools/BringPacker/bin/Release/net10.0/win-x64/publish/BringPacker.exe --help
 
 # Publish ShowcaseGame to NativeAOT binary
 dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64

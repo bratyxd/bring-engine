@@ -108,8 +108,11 @@ public static unsafe class BatchRenderer
             return;
         }
 
+        int spriteSlotsPerCam = 0;
+        for (int si = 0; si < world.RenderComponents.SpriteCount; si++)
+            spriteSlotsPerCam += world.RenderComponents.Sprites[si].DrawMode == SpriteDrawMode.Simple ? 1 : 9;
         int cap3D = Math.Clamp(world.RenderComponents.MeshRendererCount * camCount, 64, 16384);
-        int capSprites = Math.Clamp(world.RenderComponents.SpriteCount * camCount, 64, 8192);
+        int capSprites = Math.Clamp(spriteSlotsPerCam * camCount, 64, 16384);
         int capGlyphs = Math.Clamp(world.RenderComponents.TextCount * 192 * camCount, 128, 16384);
         int capParticles = Math.Clamp(world.Particles.ParticleCount * camCount, 64, 16384);
 
@@ -851,7 +854,17 @@ public static unsafe class BatchRenderer
         ArenaMarker mark = scratchArena.SaveMarker();
         try
         {
-            var items = NativeList<SpriteSortItem>.CreateInArena(ref scratchArena, count, 64);
+            // Count exact sort items needed (1 per simple sprite, up to 9 per 9-sliced sprite)
+            int maxItems = 0;
+            for (int i = 0; i < count; i++)
+            {
+                ref SpriteData sp = ref world.RenderComponents.Sprites[i];
+                if (sp.Visible == 0 || (sp.LayerMask & cam.LayerMask) == 0) continue;
+                maxItems += sp.DrawMode == SpriteDrawMode.Simple ? 1 : 9;
+            }
+            if (maxItems == 0) return;
+
+            var items = NativeList<SpriteSortItem>.CreateInArena(ref scratchArena, maxItems, 64);
 
             for (int i = 0; i < count; i++)
             {
@@ -889,22 +902,16 @@ public static unsafe class BatchRenderer
                 }
 
                 Vec3 origin = pos - right * sp.Pivot.X - up * sp.Pivot.Y;
-                Mat4 quadMat = new Mat4
-                {
-                    C0 = new Vec4(right, 0f),
-                    C1 = new Vec4(up, 0f),
-                    C2 = new Vec4(fwd, 0f),
-                    C3 = new Vec4(origin, 1f),
-                };
 
                 Vec4 uv = sp.UvRect;
                 if (sp.FlipX != 0) { uv.X += uv.Z; uv.Z = -uv.Z; }
                 if (sp.FlipY != 0) { uv.Y += uv.W; uv.W = -uv.W; }
 
                 int texSlot = -1;
+                TextureAssetData* tex = null;
                 if (sp.Texture.IsValid)
                 {
-                    TextureAssetData* tex = AssetSystem.TryGetTexture(in world.Assets, sp.Texture);
+                    tex = AssetSystem.TryGetTexture(in world.Assets, sp.Texture);
                     if (tex != null) texSlot = tex->GpuSlot;
                 }
 
@@ -921,22 +928,41 @@ public static unsafe class BatchRenderer
                 Vec4 cp = sp.CustomParams;
                 if (sp.BlendMode == SpriteBlendMode.AlphaCutout && cp.X <= 0f) cp.X = 0.5f;
 
-                items.Add(new SpriteSortItem
+                bool isSliced = sp.DrawMode != SpriteDrawMode.Simple &&
+                                (sp.SliceBorders.X > 0f || sp.SliceBorders.Y > 0f || sp.SliceBorders.Z > 0f || sp.SliceBorders.W > 0f) &&
+                                sp.Size.X > 1e-4f && sp.Size.Y > 1e-4f;
+
+                if (!isSliced)
                 {
-                    SortKey = key,
-                    OriginalIndex = i,
-                    TextureGpuSlot = texSlot,
-                    Shader = sh,
-                    BlendMode = sp.BlendMode,
-                    DepthTest = sp.DepthTest,
-                    Instance = new SpriteGpuInstance
+                    Mat4 quadMat = new Mat4
                     {
-                        Model = quadMat,
-                        UvRect = uv,
-                        Color = sp.Color,
-                        CustomParams = cp,
-                    },
-                });
+                        C0 = new Vec4(right, 0f),
+                        C1 = new Vec4(up, 0f),
+                        C2 = new Vec4(fwd, 0f),
+                        C3 = new Vec4(origin, 1f),
+                    };
+
+                    items.Add(new SpriteSortItem
+                    {
+                        SortKey = key,
+                        OriginalIndex = i * 9,
+                        TextureGpuSlot = texSlot,
+                        Shader = sh,
+                        BlendMode = sp.BlendMode,
+                        DepthTest = sp.DepthTest,
+                        Instance = new SpriteGpuInstance
+                        {
+                            Model = quadMat,
+                            UvRect = uv,
+                            Color = sp.Color,
+                            CustomParams = cp,
+                        },
+                    });
+                }
+                else
+                {
+                    EmitNineSliceSubQuads(in sp, tex, origin, right, up, fwd, uv, cp, key, i * 9, texSlot, sh, ref items);
+                }
             }
 
             if (items.Count == 0) return;
@@ -979,6 +1005,142 @@ public static unsafe class BatchRenderer
         finally
         {
             scratchArena.Rollback(mark);
+        }
+    }
+
+    /// <summary>
+    /// Expands a 9-sliced SpriteData into up to 9 sub-quads sharing the exact same SortKey/Texture/Pipeline
+    /// so all 9-slice panels using an atlas batch into ONE single instanced GPU draw call (0 GC allocations).
+    /// </summary>
+    private static void EmitNineSliceSubQuads(
+        in SpriteData sp,
+        TextureAssetData* tex,
+        Vec3 origin,
+        Vec3 right,
+        Vec3 up,
+        Vec3 fwd,
+        Vec4 uv,
+        Vec4 customParams,
+        ulong sortKey,
+        int baseOrigIdx,
+        int texSlot,
+        ShaderHandle sh,
+        ref NativeList<SpriteSortItem> items)
+    {
+        float srcW = sp.SourcePixelSize.X;
+        float srcH = sp.SourcePixelSize.Y;
+        if (srcW <= 0f || srcH <= 0f)
+        {
+            if (tex != null && tex->Width > 0 && tex->Height > 0)
+            {
+                srcW = tex->Width * DetMath.Abs(uv.Z);
+                srcH = tex->Height * DetMath.Abs(uv.W);
+            }
+            if (srcW <= 0f) srcW = sp.Size.X;
+            if (srcH <= 0f) srcH = sp.Size.Y;
+        }
+
+        float scale = sp.SliceScale > 0f ? sp.SliceScale : 1f;
+        float bL = DetMath.Max(0f, sp.SliceBorders.X) * scale;
+        float bB = DetMath.Max(0f, sp.SliceBorders.Y) * scale;
+        float bR = DetMath.Max(0f, sp.SliceBorders.Z) * scale;
+        float bT = DetMath.Max(0f, sp.SliceBorders.W) * scale;
+
+        // Graceful proportional shrink when target size is smaller than combined borders (matches Unity UI)
+        if (bL + bR > sp.Size.X && (bL + bR) > 1e-5f)
+        {
+            float s = sp.Size.X / (bL + bR);
+            bL *= s;
+            bR *= s;
+        }
+        if (bB + bT > sp.Size.Y && (bB + bT) > 1e-5f)
+        {
+            float s = sp.Size.Y / (bB + bT);
+            bB *= s;
+            bT *= s;
+        }
+
+        float* xCut = stackalloc float[4];
+        xCut[0] = 0f;
+        xCut[1] = bL / sp.Size.X;
+        xCut[2] = 1f - (bR / sp.Size.X);
+        xCut[3] = 1f;
+
+        float* yCut = stackalloc float[4];
+        yCut[0] = 0f;
+        yCut[1] = bB / sp.Size.Y;
+        yCut[2] = 1f - (bT / sp.Size.Y);
+        yCut[3] = 1f;
+
+        // Source UV cuts (top-down PNG v=0 at top, v=1 at bottom; screen +Y goes bottom row=0 -> middle row=1 -> top row=2)
+        float uL = DetMath.Clamp01(DetMath.Max(0f, sp.SliceBorders.X) / srcW);
+        float uR = DetMath.Clamp01(DetMath.Max(0f, sp.SliceBorders.Z) / srcW);
+        if (uL + uR > 1f) { float inv = 1f / (uL + uR); uL *= inv; uR *= inv; }
+
+        float vB = DetMath.Clamp01(DetMath.Max(0f, sp.SliceBorders.Y) / srcH);
+        float vT = DetMath.Clamp01(DetMath.Max(0f, sp.SliceBorders.W) / srcH);
+        if (vB + vT > 1f) { float inv = 1f / (vB + vT); vB *= inv; vT *= inv; }
+
+        float* uStart = stackalloc float[3];
+        float* uLen = stackalloc float[3];
+        uStart[0] = 0f;        uLen[0] = uL;
+        uStart[1] = uL;        uLen[1] = 1f - uL - uR;
+        uStart[2] = 1f - uR;   uLen[2] = uR;
+
+        // Row 0 = bottom (v in [1-vB, 1]), Row 1 = middle (v in [vT, 1-vB]), Row 2 = top (v in [0, vT])
+        float* vStart = stackalloc float[3];
+        float* vLen = stackalloc float[3];
+        vStart[0] = 1f - vB;   vLen[0] = vB;
+        vStart[1] = vT;        vLen[1] = 1f - vT - vB;
+        vStart[2] = 0f;        vLen[2] = vT;
+
+        int subIdx = 0;
+        for (int row = 0; row < 3; row++)
+        {
+            float dy = yCut[row + 1] - yCut[row];
+            if (dy <= 1e-5f || vLen[row] <= 1e-6f) continue;
+
+            for (int col = 0; col < 3; col++)
+            {
+                if (sp.DrawMode == SpriteDrawMode.SlicedNoCenter && row == 1 && col == 1) continue;
+                float dx = xCut[col + 1] - xCut[col];
+                if (dx <= 1e-5f || uLen[col] <= 1e-6f) continue;
+
+                Vec3 subOrigin = origin + right * xCut[col] + up * yCut[row];
+                Vec3 subRight = right * dx;
+                Vec3 subUp = up * dy;
+
+                Mat4 subMat = new Mat4
+                {
+                    C0 = new Vec4(subRight, 0f),
+                    C1 = new Vec4(subUp, 0f),
+                    C2 = new Vec4(fwd, 0f),
+                    C3 = new Vec4(subOrigin, 1f),
+                };
+
+                Vec4 subUv = new Vec4(
+                    uv.X + uStart[col] * uv.Z,
+                    uv.Y + vStart[row] * uv.W,
+                    uLen[col] * uv.Z,
+                    vLen[row] * uv.W);
+
+                items.Add(new SpriteSortItem
+                {
+                    SortKey = sortKey,
+                    OriginalIndex = baseOrigIdx + subIdx++,
+                    TextureGpuSlot = texSlot,
+                    Shader = sh,
+                    BlendMode = sp.BlendMode,
+                    DepthTest = sp.DepthTest,
+                    Instance = new SpriteGpuInstance
+                    {
+                        Model = subMat,
+                        UvRect = subUv,
+                        Color = sp.Color,
+                        CustomParams = customParams,
+                    },
+                });
+            }
         }
     }
 
