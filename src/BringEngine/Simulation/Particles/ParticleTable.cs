@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
+using BringEngine.Core.Threading;
 using BringEngine.Simulation.World;
 
 namespace BringEngine.Simulation.Particles;
@@ -331,54 +332,29 @@ public static unsafe class ParticleSystem
     }
 
     /// <summary>
-    /// Deterministic SoA particle simulation step. Runs identically headlessly or with GPU view.
-    /// Zero GC allocations.
+    /// Minimum live particle count before Step fans out integration across JobSystem workers.
+    /// Below this threshold, single-threaded L1 linear iteration is faster and runs inline with zero sync cost.
     /// </summary>
-    public static void Step(ref ParticleTable t, in TransformTable transforms, float dt)
+    public const int ParallelThreshold = 2048;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ParticleIntegrateJobCtx
     {
-        // 1. Emit from active emitters
-        for (int s = 0; s < t.EmitterCapacity; s++)
+        public ParticleTable* Table;
+        public float Dt;
+    }
+
+    private static void IntegrateParticleRange(void* userData, int begin, int end, int workerIndex)
+    {
+        _ = workerIndex;
+        ParticleIntegrateJobCtx* ctx = (ParticleIntegrateJobCtx*)userData;
+        ref ParticleTable t = ref *ctx->Table;
+        float dt = ctx->Dt;
+
+        for (int i = begin; i < end; i++)
         {
-            if (t.EmitterAlive[s] == 0) continue;
-            ref ParticleEmitterData em = ref t.Emitters[s];
-
-            if (em.FollowEntity.IsValid)
-                em.Position = TransformSystem.GetWorldPosition(in transforms, em.FollowEntity);
-
-            if (em.PendingBurst > 0)
-            {
-                int burst = em.PendingBurst;
-                em.PendingBurst = 0;
-                for (int b = 0; b < burst; b++)
-                    SpawnParticle(ref t, (ushort)s, ref em);
-            }
-
-            if (em.Enabled != 0 && em.EmitRate > 0f)
-            {
-                em.EmitAccumulator += em.EmitRate * dt;
-                int spawnCount = (int)em.EmitAccumulator;
-                if (spawnCount > 0)
-                {
-                    em.EmitAccumulator -= spawnCount;
-                    for (int k = 0; k < spawnCount; k++)
-                        SpawnParticle(ref t, (ushort)s, ref em);
-                }
-            }
-        }
-
-        // 2. Integrate active particles linearly across SoA arrays
-        int i = 0;
-        while (i < t.ParticleCount)
-        {
-            float age = t.Age[i] + dt;
+            float age = t.Age[i];
             float life = t.Lifetime[i];
-            if (age >= life)
-            {
-                SwapRemoveParticle(ref t, i);
-                continue;
-            }
-            t.Age[i] = age;
-
             ushort eslot = t.EmitterSlot[i];
             ref ParticleEmitterData em = ref t.Emitters[eslot];
 
@@ -414,8 +390,73 @@ public static unsafe class ParticleSystem
                 int frame = (int)(norm * totalFrames);
                 t.FrameIndex[i] = (byte)(frame >= totalFrames ? totalFrames - 1 : frame);
             }
+        }
+    }
 
+    /// <summary>
+    /// Deterministic SoA particle simulation step. Runs identically headlessly or with GPU view.
+    /// Optionally fans out integration across JobSystem workers ONLY when ParticleCount >= ParallelThreshold;
+    /// smaller counts stay single-threaded inline. Bit-exact identical output either way. Zero GC allocations.
+    /// </summary>
+    public static void Step(ref ParticleTable t, in TransformTable transforms, float dt, JobScheduler* jobs = null)
+    {
+        // 1. Emit from active emitters (sequential: preserves exact DetRng order)
+        for (int s = 0; s < t.EmitterCapacity; s++)
+        {
+            if (t.EmitterAlive[s] == 0) continue;
+            ref ParticleEmitterData em = ref t.Emitters[s];
+
+            if (em.FollowEntity.IsValid)
+                em.Position = TransformSystem.GetWorldPosition(in transforms, em.FollowEntity);
+
+            if (em.PendingBurst > 0)
+            {
+                int burst = em.PendingBurst;
+                em.PendingBurst = 0;
+                for (int b = 0; b < burst; b++)
+                    SpawnParticle(ref t, (ushort)s, ref em);
+            }
+
+            if (em.Enabled != 0 && em.EmitRate > 0f)
+            {
+                em.EmitAccumulator += em.EmitRate * dt;
+                int spawnCount = (int)em.EmitAccumulator;
+                if (spawnCount > 0)
+                {
+                    em.EmitAccumulator -= spawnCount;
+                    for (int k = 0; k < spawnCount; k++)
+                        SpawnParticle(ref t, (ushort)s, ref em);
+                }
+            }
+        }
+
+        // 2. Advance ages & swap-remove expired particles sequentially (preserves exact dense layout)
+        int i = 0;
+        while (i < t.ParticleCount)
+        {
+            float age = t.Age[i] + dt;
+            if (age >= t.Lifetime[i])
+            {
+                SwapRemoveParticle(ref t, i);
+                continue;
+            }
+            t.Age[i] = age;
             i++;
+        }
+
+        if (t.ParticleCount == 0) return;
+
+        // 3. Integrate surviving particles (inline when < ParallelThreshold or jobs == null, parallel above)
+        fixed (ParticleTable* tPtr = &t)
+        {
+            var ctx = new ParticleIntegrateJobCtx { Table = tPtr, Dt = dt };
+            JobSystem.ParallelFor(
+                jobs,
+                t.ParticleCount,
+                batchSize: 512,
+                userData: &ctx,
+                callback: &IntegrateParticleRange,
+                minParallelCount: ParallelThreshold);
         }
     }
 }

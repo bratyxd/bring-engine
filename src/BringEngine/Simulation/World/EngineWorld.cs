@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using BringEngine.Assets;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Memory;
+using BringEngine.Core.Threading;
 using BringEngine.Simulation.Animation;
 using BringEngine.Simulation.Camera;
 using BringEngine.Simulation.Input;
@@ -84,19 +85,21 @@ public static unsafe class EngineWorldSystem
 
     /// <summary>
     /// Advances core engine simulation systems (Tweens -> Transforms -> Animations -> Particles -> Cameras -> Text clocks).
-    /// Completely headless and zero-GC.
+    /// Completely headless and zero-GC. Pass an optional JobScheduler* to accelerate large transform hierarchies
+    /// and particle pools automatically above their parallel thresholds (small counts stay single-threaded inline).
     /// </summary>
     public static void StepCoreSystems(
         ref EngineWorld world,
         ref EngineAllocators alloc,
         float dt,
         float viewportWidth = 1280f,
-        float viewportHeight = 720f)
+        float viewportHeight = 720f,
+        JobScheduler* jobs = null)
     {
         TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, dt);
-        TransformSystem.PropagateHierarchy(ref world.Transforms);
+        TransformSystem.PropagateHierarchy(ref world.Transforms, jobs);
         AnimationSystem.StepAll(ref world.Animations, dt, ref alloc.Frame, ref alloc.Scratch);
-        ParticleSystem.Step(ref world.Particles, in world.Transforms, dt);
+        ParticleSystem.Step(ref world.Particles, in world.Transforms, dt, jobs);
         CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, dt, viewportWidth, viewportHeight);
         RenderComponentSystem.StepTextAnimClocks(ref world.RenderComponents, dt);
         world.TickCount++;

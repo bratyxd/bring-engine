@@ -15,6 +15,7 @@ public static class Program
 
         Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - NativeAOT Test Suite{(headlessOnly ? " (Headless Only)" : "")}");
         CoreTests.RunAll();
+        JobSystemTests.RunAll();
         SimulationTests.RunAll();
         TweenAnimParticleTests.RunAll();
         AssetBundleSceneGltfTests.RunAll();

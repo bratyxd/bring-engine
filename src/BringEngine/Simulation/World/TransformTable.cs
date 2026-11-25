@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
+using BringEngine.Core.Threading;
 
 namespace BringEngine.Simulation.World;
 
@@ -193,16 +194,23 @@ public static unsafe class TransformSystem
     }
 
     /// <summary>
-    /// Cache-linear, non-recursive hierarchy propagation by depth level (roots first, then children).
-    /// Zero heap allocations.
+    /// Minimum transform count before PropagateHierarchy fans out depth passes across JobSystem workers.
+    /// Below this threshold, single-threaded iteration runs inline with zero synchronization overhead.
     /// </summary>
-    public static void PropagateHierarchy(ref TransformTable table)
-    {
-        int count = table.Count;
-        if (count == 0) return;
+    public const int ParallelThreshold = 1024;
 
-        // Pass 0: Roots (Depth == 0)
-        for (int i = 0; i < count; i++)
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TransformLevelJobCtx
+    {
+        public TransformTable* Table;
+        public byte Level;
+    }
+
+    private static void PropagateRootRange(void* userData, int begin, int end, int workerIndex)
+    {
+        _ = workerIndex;
+        ref TransformTable table = ref *((TransformLevelJobCtx*)userData)->Table;
+        for (int i = begin; i < end; i++)
         {
             if (table.Depth[i] != 0) continue;
             Mat4 local = Mat4.CreateTRS(table.LocalPosition[i], table.LocalRotation[i], table.LocalScale[i]);
@@ -210,19 +218,58 @@ public static unsafe class TransformSystem
             table.WorldPosition[i] = new Vec3(local.C3.X, local.C3.Y, local.C3.Z);
             table.Dirty[i] = 0;
         }
+    }
 
-        // Subsequent passes: Depth 1..MaxDepth
-        for (byte level = 1; level <= table.MaxDepth; level++)
+    private static void PropagateChildRange(void* userData, int begin, int end, int workerIndex)
+    {
+        _ = workerIndex;
+        TransformLevelJobCtx* ctx = (TransformLevelJobCtx*)userData;
+        ref TransformTable table = ref *ctx->Table;
+        byte level = ctx->Level;
+
+        for (int i = begin; i < end; i++)
         {
-            for (int i = 0; i < count; i++)
+            if (table.Depth[i] != level) continue;
+            Mat4 local = Mat4.CreateTRS(table.LocalPosition[i], table.LocalRotation[i], table.LocalScale[i]);
+            int pd = GetDenseIndex(in table, table.Parent[i]);
+            Mat4 world = pd >= 0 ? Mat4.Multiply(in table.WorldMatrix[pd], in local) : local;
+            table.WorldMatrix[i] = world;
+            table.WorldPosition[i] = new Vec3(world.C3.X, world.C3.Y, world.C3.Z);
+            table.Dirty[i] = 0;
+        }
+    }
+
+    /// <summary>
+    /// Cache-linear, non-recursive hierarchy propagation by depth level (roots first, then children).
+    /// Optionally parallelizes each depth pass when Count >= ParallelThreshold and jobs != null;
+    /// produces bit-exact identical matrices to single-threaded execution. Zero heap allocations.
+    /// </summary>
+    public static void PropagateHierarchy(ref TransformTable table, JobScheduler* jobs = null)
+    {
+        int count = table.Count;
+        if (count == 0) return;
+
+        fixed (TransformTable* tPtr = &table)
+        {
+            var ctx = new TransformLevelJobCtx { Table = tPtr, Level = 0 };
+            JobSystem.ParallelFor(
+                jobs,
+                count,
+                batchSize: 256,
+                userData: &ctx,
+                callback: &PropagateRootRange,
+                minParallelCount: ParallelThreshold);
+
+            for (byte level = 1; level <= table.MaxDepth; level++)
             {
-                if (table.Depth[i] != level) continue;
-                Mat4 local = Mat4.CreateTRS(table.LocalPosition[i], table.LocalRotation[i], table.LocalScale[i]);
-                int pd = GetDenseIndex(in table, table.Parent[i]);
-                Mat4 world = pd >= 0 ? Mat4.Multiply(in table.WorldMatrix[pd], in local) : local;
-                table.WorldMatrix[i] = world;
-                table.WorldPosition[i] = new Vec3(world.C3.X, world.C3.Y, world.C3.Z);
-                table.Dirty[i] = 0;
+                ctx.Level = level;
+                JobSystem.ParallelFor(
+                    jobs,
+                    count,
+                    batchSize: 256,
+                    userData: &ctx,
+                    callback: &PropagateChildRange,
+                    minParallelCount: ParallelThreshold);
             }
         }
     }

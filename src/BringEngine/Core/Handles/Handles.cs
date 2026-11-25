@@ -321,3 +321,24 @@ public readonly struct TextHandle : IEquatable<TextHandle>
     public static bool operator ==(TextHandle a, TextHandle b) => a.Raw == b.Raw;
     public static bool operator !=(TextHandle a, TextHandle b) => a.Raw != b.Raw;
 }
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct JobHandle : IEquatable<JobHandle>
+{
+    public readonly uint Raw;
+    public static readonly JobHandle Invalid = default;
+    public bool IsValid => Raw != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public JobHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static JobHandle Create(uint index, uint generation) => new JobHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(JobHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is JobHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(JobHandle a, JobHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(JobHandle a, JobHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"Job({Index}:g{Generation})" : "Job(Invalid)";
+}

@@ -137,7 +137,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/*.zip \
-            --repo "${{ github.repository }}" \
-            --title "Bring Engine ${{ github.ref_name }}" \
-            --generate-notes
+          for attempt in 1 2 3 4; do
+            echo "Publishing release ${{ github.ref_name }} (attempt $attempt)..."
+            if gh release create "${{ github.ref_name }}" dist/*.zip \
+              --repo "${{ github.repository }}" \
+              --title "Bring Engine ${{ github.ref_name }}" \
+              --generate-notes; then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1

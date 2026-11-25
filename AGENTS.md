@@ -7,7 +7,7 @@
 
 1. **NO OOP — Pure Data + Systems**
    - NEVER use class inheritance, `virtual`, `override`, `abstract`, or interface dispatch in engine or game code.
-   - Store all state in `unmanaged struct` tables (Structure-of-Arrays or dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`).
+   - Store all state in `unmanaged struct` tables (Structure-of-Arrays or dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`).
    - Put all behavior in `public static unsafe class <Feature>System` methods iterating contiguous native memory linearly.
    - Use unmanaged function pointers (`delegate*<...>`) for bundle loaders, scene lifecycle hooks, and tween completion callbacks.
 
@@ -28,6 +28,7 @@
    - **Simulation** (`BringEngine.Simulation.*`, `<Game>.Simulation.*`): Deterministic fixed-timestep (`Fix32`/`FixVec3`, `DetRng`). ZERO SDL3 or GPU calls. Must run headlessly with bit-exact state hashes across runs.
    - **View** (`BringEngine.Rendering.*`, `<Game>.View.*`): Reads simulation state and `SimEvent` queues to sync 3D glTF models, 2D-in-3D sprites, animated SDF text, particles, lighting, and cameras. Never mutates gameplay truth.
    - **2-Thread Pipeline (`EnginePipelineSystem`)**: Interactive games run a dedicated **Logic/Update Thread** (Frame `N`: Sim + ViewSync + CoreSystems + `BatchRenderer.ExtractRenderPacket` into double-buffered `EngineAllocators.Frame`) concurrently with the **Main/Render Thread** (Frame `N-1`: SDL3 window/events + `BatchRenderer.SubmitRenderPacket` from `EngineAllocators.FrameBack` + `FramePacer`). All SDL3 window/swapchain/event calls remain on the Main Thread per SDL3 requirements.
+   - **Native First-Class Multithreading (`JobScheduler` + `JobSystem`) — Only When It Makes Sense**: Bring Engine ships a zero-GC, zero-OOP data-oriented worker pool (`ParallelFor` with automatic inline `minParallelCount` threshold, async `Schedule`/`ScheduleParallelFor`, DAG `CombineDependencies`, cooperative `RequestCancel`, and lock-free per-worker `GetWorkerScratch` native arenas). **Do NOT multithread everything for the sake of it** — small loops (< ~500–1000 items or < 0.5 ms) stay faster single-threaded in L1 cache. Use `JobSystem` only for genuinely heavy independent SoA loops (thousands of entities/particles/transforms, spatial/flow grids) or multi-frame background generation (`docs/agents/12-multithreading-and-jobs.md`).
    - **Borderless Full Window Default**: ALL Bring Engine games MUST launch in **Borderless Full Window** mode by default (`WindowMode.BorderlessFullscreen`, default in `PlatformSystem.InitWindow`), with `F11` runtime toggle to windowed mode and `--windowed` CLI override.
 
 5. **Cache Locality & GPU Batching**
@@ -40,7 +41,7 @@
 - `src/BringEngine/` — Core Engine Library (`IsAotCompatible=true`):
   - `Core/Memory/` — `NativeMemoryTracker`, `LinearArena`, `PoolAllocator<T>`, `FreeListAllocator`, `EngineAllocators` (double-buffered `Frame`/`FrameBack`), `NativeSlice<T>`, `NativeList<T>`, `NativeSparseSet<T>`, `NativeHashMap<T>`, `FixedString64/256`, `StringId`.
   - `Core/Profiling/` — `FrameProfiler`, `ProfilerSystem` (zero-GC independent Logic CPU / Render Thread / GPU ms timing, named scopes, rolling FPS).
-  - `Core/Threading/` — `EnginePipelineState`, `EnginePipelineSystem` (2-thread pipelined Logic + Render orchestrator, zero-GC, zero locks).
+  - `Core/Threading/` — `EnginePipelineState`, `EnginePipelineSystem` (2-thread pipelined Logic + Render orchestrator, zero-GC, zero locks), `JobScheduler`, `JobSystem` (data-oriented `ParallelFor`, async job DAGs, cooperative cancel, per-worker native scratch arenas).
   - `Core/Handles/` — 32-bit generational handles (`HandlePacking`, `EntityId`, ...).
   - `Core/Math/` — `Fix32`, `Fix64`, `FixVec2/3`, `FixQuat`, `DetMath`, `DetRng`, `Vec2/3/4`, `Quat`, `Mat4`, `ColorF/32`, `Bounds3`, `Plane`, `Frustum`, `Ray`.
   - `Simulation/` — `EntityTable`, `TransformTable`, `EngineWorld`, `CameraTable`, `InputState`, `Easing`, `TweenTable`, `AnimationTable`, `ParticleTable`, `RenderComponentTables`, `SceneManager`.
@@ -48,7 +49,7 @@
   - `Rendering/` — `SdlPlatform` (`WindowMode.BorderlessFullscreen` default + `F11` toggle), `FramePacer` (default VSync ON + 60 FPS cap), `GpuContext`, `ShaderSystem` (`SDL_shadercross`), `SceneLighting`, `TextLayoutSystem`, `RenderPacket`, `BatchRenderer`, `ProfilerOverlay` (100% opaque drop-in UI tool with separate `LOGIC` / `RENDER` / `GPU` bars excluding VSync wait).
   - `Shaders/` — `pbr_mesh.hlsl`, `sprite_3d.hlsl`, `sdf_text.hlsl`, `particle.hlsl`.
 - `src/ShowcaseGame/` — Playable Reference Game **"Bring Arena"** (`PublishAot=true`, depends on `BringEngine`).
-- `tests/BringEngine.Tests/` — Zero-reflection NativeAOT test suite (`PublishAot=true`, 23 tests covering core, sim, tweens, animation, particles, bundles, scenes, glTF, SDF fonts, text layout, 2-thread pipelined rendering, and SDL3_gpu debug validation).
+- `tests/BringEngine.Tests/` — Zero-reflection NativeAOT test suite (`PublishAot=true`, 28 tests covering core, data-oriented `JobSystem` multithreading & bit-exact parallel subsystems, sim, tweens, animation, particles, bundles, scenes, glTF, SDF fonts, text layout, 2-thread pipelined rendering, and SDL3_gpu debug validation).
 
 ## 3. Subsystem Agent Guides
 - [`docs/agents/01-memory-and-allocators.md`](docs/agents/01-memory-and-allocators.md)
@@ -62,6 +63,7 @@
 - [`docs/agents/09-particles-and-shaders.md`](docs/agents/09-particles-and-shaders.md)
 - [`docs/agents/10-camera-and-headless-testing.md`](docs/agents/10-camera-and-headless-testing.md)
 - [`docs/agents/11-vsync-fps-cap-and-profiling.md`](docs/agents/11-vsync-fps-cap-and-profiling.md) — Borderless Full Window default, 2-Thread Pipelined Engine Loop, VSync (default ON), FPS cap (default 60), `FrameProfiler`, `SetPassCalls`, and separate-bar `ProfilerOverlay` UI.
+- [`docs/agents/12-multithreading-and-jobs.md`](docs/agents/12-multithreading-and-jobs.md) — Native first-class data-oriented `JobSystem` (`ParallelFor`, async DAGs, `CombineDependencies`, cooperative cancel, per-worker scratch arenas, and when NOT to multithread).
 - [`src/ShowcaseGame/AGENT_README.md`](src/ShowcaseGame/AGENT_README.md) — Complete template for creating a new game.
 
 ## 4. Build, NativeAOT Publish & Verification Commands
@@ -69,7 +71,7 @@
 # Build solution (strict AOT analyzers active)
 dotnet build BringEngine.sln -c Release
 
-# Publish & run NativeAOT Engine Test Suite (23 tests incl. 2-thread pipeline, VSync-decoupled GPU timing & SDL3_gpu debug validation)
+# Publish & run NativeAOT Engine Test Suite (28 tests incl. JobSystem multithreading, 2-thread pipeline, VSync-decoupled GPU timing & SDL3_gpu debug validation)
 dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r win-x64
 ./tests/BringEngine.Tests/bin/Release/net10.0/win-x64/publish/BringEngine.Tests.exe
 

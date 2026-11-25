@@ -44,7 +44,11 @@ src/<YourGame>/
    - **Common Opaque Profiler Overlay**: Wire `FrameProfiler` and `ProfilerOverlaySystem.Create(ref *world, mainFont, whiteTex, w, h)` for automatic independent **`LOGIC`**, **`RENDER`**, and **`GPU`** (pure GPU work excluding VSync wait) fill bars, FPS, `DRAWS`, `SETPASS`, `PASSES`, and named scopes (persists across all scenes!).
    - **Standard Hotkeys**: **`F1`** toggle Profiler UI, **`F2`** toggle VSync, **`F3`** cycle FPS cap (60/120/144/Max/30), **`F11`** toggle Borderless Full Window / Windowed.
    - See [`docs/agents/11-vsync-fps-cap-and-profiling.md`](../../docs/agents/11-vsync-fps-cap-and-profiling.md) for the exact 2-thread loop blueprint.
-9. **Always Verify NativeAOT Publish, Headless Determinism & GPU Render**:
+9. **First-Class Data-Oriented Multithreading (`JobSystem`) — Only When It Makes Sense**:
+   - Use `JobScheduler` + `JobSystem` (`ParallelFor`, async `ScheduleParallelFor` + `IsComplete`, `CombineDependencies`, `RequestCancel`, per-worker `GetWorkerScratch`) when profiling shows a genuinely heavy SoA loop (hundreds/thousands of independent entities, particles, transforms, spatial/flow grids) or multi-frame background generation (maps, nav grids, chunk meshes).
+   - **Do NOT multithread tiny loops** (< ~500–1000 items or < 0.5 ms) — pass a sensible `minParallelCount` so small workloads stay single-threaded inline with zero sync overhead.
+   - Keep parallel kernels deterministic (disjoint writes, per-item seeded `DetRng`, zero SDL3/GPU calls, always `RequestCancel` + `Complete` before resetting/disposing arenas). See [`docs/agents/12-multithreading-and-jobs.md`](../../docs/agents/12-multithreading-and-jobs.md).
+10. **Always Verify NativeAOT Publish, Headless Determinism & GPU Render**:
    ```bash
    dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64
    ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --headless --ticks 600
