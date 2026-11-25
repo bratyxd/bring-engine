@@ -227,37 +227,54 @@ public static unsafe class ProfilerOverlaySystem
         char* buf = stackalloc char[160];
         Span<char> span = new Span<char>(buf, 160);
 
+        // Concrete zero-GC span writer (uses direct int/double.TryFormat — 0 GC bytes even in CoreCLR Tier-0 QuickJIT!)
         // Row 0: Header + VSync + FPS Cap + Pipeline Mode
         bool vsyncOn = pacer.EffectiveVSync != 0;
         ReadOnlySpan<char> modeTag = profiler.PipelinedTwoThread != 0 ? "2T" : "1T";
-        if (pacer.TargetFps > 0)
-        {
-            if (span.TryWrite($"PROFILER [F1]  VSYNC:{(vsyncOn ? "ON" : "OFF")}  CAP:{pacer.TargetFps}  [{modeTag}]", out int n0))
-                WriteText(in world.RenderComponents, ov.HeaderText, span.Slice(0, n0));
-        }
-        else
-        {
-            if (span.TryWrite($"PROFILER [F1]  VSYNC:{(vsyncOn ? "ON" : "OFF")}  CAP:MAX  [{modeTag}]", out int n0))
-                WriteText(in world.RenderComponents, ov.HeaderText, span.Slice(0, n0));
-        }
+        int n0 = 0;
+        AppendStr(span, ref n0, "PROFILER [F1]  VSYNC:");
+        AppendStr(span, ref n0, vsyncOn ? "ON" : "OFF");
+        AppendStr(span, ref n0, "  CAP:");
+        if (pacer.TargetFps > 0) AppendInt(span, ref n0, pacer.TargetFps);
+        else AppendStr(span, ref n0, "MAX");
+        AppendStr(span, ref n0, "  [");
+        AppendStr(span, ref n0, modeTag);
+        AppendStr(span, ref n0, "]");
+        WriteText(in world.RenderComponents, ov.HeaderText, span.Slice(0, n0));
 
         // Row 1: Current FPS & frame total ms
         double fps = profiler.ProfiledFrames > 0 ? profiler.CurrentFps : 0.0;
         double totMs = profiler.ProfiledFrames > 0 ? profiler.SmoothedTotalMs : 0.0;
-        if (span.TryWrite($"FPS: {fps:F1}   FRAME: {totMs:F2} ms", out int n1))
-            WriteText(in world.RenderComponents, ov.FpsText, span.Slice(0, n1));
+        int n1 = 0;
+        AppendStr(span, ref n1, "FPS: ");
+        AppendFixed(span, ref n1, fps, 1);
+        AppendStr(span, ref n1, "   FRAME: ");
+        AppendFixed(span, ref n1, totMs, 2);
+        AppendStr(span, ref n1, " ms");
+        WriteText(in world.RenderComponents, ov.FpsText, span.Slice(0, n1));
 
         // Rows 2, 3, 4: Independent pipelined stage timings (Logic CPU, Render Thread, GPU)
         double logicMs = profiler.ProfiledFrames > 0 ? profiler.SmoothedLogicMs : profiler.LogicCpuMs;
         double renderMs = profiler.ProfiledFrames > 0 ? profiler.SmoothedRenderMs : profiler.RenderCpuMs;
         double gpuMs = profiler.ProfiledFrames > 0 ? profiler.SmoothedGpuMs : profiler.GpuFrameMs;
 
-        if (span.TryWrite($"LOGIC:  {logicMs,5:F2} ms", out int nl))
-            WriteText(in world.RenderComponents, ov.LogicRowText, span.Slice(0, nl));
-        if (span.TryWrite($"RENDER: {renderMs,5:F2} ms", out int nr))
-            WriteText(in world.RenderComponents, ov.RenderRowText, span.Slice(0, nr));
-        if (span.TryWrite($"GPU:    {gpuMs,5:F2} ms", out int ng))
-            WriteText(in world.RenderComponents, ov.GpuRowText, span.Slice(0, ng));
+        int nl = 0;
+        AppendStr(span, ref nl, "LOGIC:  ");
+        AppendFixedPadded(span, ref nl, logicMs, 2, 5);
+        AppendStr(span, ref nl, " ms");
+        WriteText(in world.RenderComponents, ov.LogicRowText, span.Slice(0, nl));
+
+        int nr = 0;
+        AppendStr(span, ref nr, "RENDER: ");
+        AppendFixedPadded(span, ref nr, renderMs, 2, 5);
+        AppendStr(span, ref nr, " ms");
+        WriteText(in world.RenderComponents, ov.RenderRowText, span.Slice(0, nr));
+
+        int ng = 0;
+        AppendStr(span, ref ng, "GPU:    ");
+        AppendFixedPadded(span, ref ng, gpuMs, 2, 5);
+        AppendStr(span, ref ng, " ms");
+        WriteText(in world.RenderComponents, ov.GpuRowText, span.Slice(0, ng));
 
         // Each pipelined stage has its OWN independent fill bar against the full target frame budget (e.g. 16.67ms at 60 FPS)!
         float budgetMs = pacer.TargetFps > 0 ? (1000f / pacer.TargetFps) : 16.6667f;
@@ -269,14 +286,27 @@ public static unsafe class ProfilerOverlaySystem
 
         // Row 5: Draw calls, SetPass calls, Passes
         int totalPasses = stats.RenderPasses + stats.CopyPasses;
-        if (span.TryWrite($"DRAWS: {stats.DrawCalls}  |  SETPASS: {stats.SetPassCalls}  |  PASSES: {totalPasses}", out int n5))
-            WriteText(in world.RenderComponents, ov.DrawsText, span.Slice(0, n5));
+        int n5 = 0;
+        AppendStr(span, ref n5, "DRAWS: ");
+        AppendInt(span, ref n5, stats.DrawCalls);
+        AppendStr(span, ref n5, "  |  SETPASS: ");
+        AppendInt(span, ref n5, stats.SetPassCalls);
+        AppendStr(span, ref n5, "  |  PASSES: ");
+        AppendInt(span, ref n5, totalPasses);
+        WriteText(in world.RenderComponents, ov.DrawsText, span.Slice(0, n5));
 
         // Row 6: Objects, Triangles, Frame Arena KB
         int objs = stats.MeshInstances + stats.SpriteInstances + stats.GlyphInstances + stats.ParticleInstances;
         int kb = (int)(stats.FrameArenaUsedBytes / 1024);
-        if (span.TryWrite($"OBJS: {objs}  |  TRIS: {stats.Triangles}  |  ARENA: {kb}KB", out int n6))
-            WriteText(in world.RenderComponents, ov.ObjectsText, span.Slice(0, n6));
+        int n6 = 0;
+        AppendStr(span, ref n6, "OBJS: ");
+        AppendInt(span, ref n6, objs);
+        AppendStr(span, ref n6, "  |  TRIS: ");
+        AppendInt(span, ref n6, stats.Triangles);
+        AppendStr(span, ref n6, "  |  ARENA: ");
+        AppendInt(span, ref n6, kb);
+        AppendStr(span, ref n6, "KB");
+        WriteText(in world.RenderComponents, ov.ObjectsText, span.Slice(0, n6));
 
         // Row 7: Top Logic/CPU scopes summary (zero allocation!)
         int pos = 0;
@@ -290,8 +320,8 @@ public static unsafe class ProfilerOverlaySystem
                 if (shown > 0 && pos + 2 < 130) { span[pos++] = ' '; span[pos++] = ' '; }
                 int nameChars = CopyUtf8ToChars(sc->Name.Data, sc->Name.Length, span.Slice(pos, Math.Min(8, 130 - pos)));
                 pos += nameChars;
-                if (span.Slice(pos).TryWrite($":{sc->DurationMs:F2}", out int written))
-                    pos += written;
+                AppendStr(span, ref pos, ":");
+                AppendFixed(span, ref pos, sc->DurationMs, 2);
                 shown++;
             }
         }
@@ -475,5 +505,63 @@ public static unsafe class ProfilerOverlaySystem
         int n = byteLen < dst.Length ? byteLen : dst.Length;
         for (int i = 0; i < n; i++) dst[i] = (char)utf8[i];
         return n;
+    }
+
+    private static void AppendStr(Span<char> dst, ref int pos, ReadOnlySpan<char> s)
+    {
+        int avail = dst.Length - pos;
+        int n = s.Length < avail ? s.Length : avail;
+        if (n <= 0) return;
+        s.Slice(0, n).CopyTo(dst.Slice(pos));
+        pos += n;
+    }
+
+    private static void AppendInt(Span<char> dst, ref int pos, int value)
+    {
+        if (pos >= dst.Length) return;
+        if (value < 0)
+        {
+            dst[pos++] = '-';
+            if (value == int.MinValue) { AppendStr(dst, ref pos, "2147483648"); return; }
+            value = -value;
+        }
+        char* tmp = stackalloc char[12];
+        int len = 0;
+        do
+        {
+            tmp[len++] = (char)('0' + (value % 10));
+            value /= 10;
+        } while (value > 0);
+        for (int i = len - 1; i >= 0 && pos < dst.Length; i--)
+            dst[pos++] = tmp[i];
+    }
+
+    private static void AppendFixed(Span<char> dst, ref int pos, double value, int decimals)
+    {
+        if (double.IsNaN(value) || double.IsInfinity(value)) value = 0.0;
+        if (value < 0.0)
+        {
+            if (pos < dst.Length) dst[pos++] = '-';
+            value = -value;
+        }
+        long scale = decimals == 1 ? 10L : 100L;
+        long scaled = (long)(value * scale + 0.5);
+        long whole = scaled / scale;
+        long frac = scaled % scale;
+        AppendInt(dst, ref pos, (int)Math.Min(whole, int.MaxValue));
+        if (pos < dst.Length) dst[pos++] = '.';
+        if (decimals == 2 && frac < 10 && pos < dst.Length) dst[pos++] = '0';
+        AppendInt(dst, ref pos, (int)frac);
+    }
+
+    private static void AppendFixedPadded(Span<char> dst, ref int pos, double value, int decimals, int minWidth)
+    {
+        char* tmp = stackalloc char[24];
+        Span<char> numSpan = new Span<char>(tmp, 24);
+        int len = 0;
+        AppendFixed(numSpan, ref len, value, decimals);
+        for (int p = len; p < minWidth && pos < dst.Length; p++)
+            dst[pos++] = ' ';
+        AppendStr(dst, ref pos, numSpan.Slice(0, len));
     }
 }
