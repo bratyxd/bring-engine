@@ -69,26 +69,23 @@
 - [`docs/agents/13-asset-compression-atlases-and-9slice.md`](docs/agents/13-asset-compression-atlases-and-9slice.md) — Unity-style BC1/BC3 GPU texture compression, LZ4/Brotli `.bpack` & glTF/GLB compression, default texture atlasing (zero loose textures in final builds), `BringPacker` CLI, and 9-slice 2D UI sprites.
 - [`src/ShowcaseGame/AGENT_README.md`](src/ShowcaseGame/AGENT_README.md) — Complete template for creating a new game.
 
-## 4. Build, NativeAOT Publish & Verification Commands
+## 4. Build, NativeAOT Publish & CI Verification Commands
+> **CI-Only Engine Testing**: Do **NOT** run heavy NativeAOT engine test publishes/runs locally and tie up the developer's machine. Push engine changes to GitHub and let GitHub Actions (`.github/workflows/build.yml` / `.github/workflows/release.yml`) execute the full cross-platform NativeAOT test matrix (`gh run watch --exit-status`). The commands below document what CI runs (and how to build/run `ShowcaseGame` or `BringPacker` when needed):
 ```bash
-# Build solution (strict AOT analyzers active)
+# Solution build (strict AOT analyzers active)
 dotnet build BringEngine.sln -c Release
 
-# Publish & run NativeAOT Engine Test Suite (34 tests incl. BC1/BC3 & LZ4/Brotli compression, atlasing, .bpack, 9-slice UI, JobSystem multithreading, 2-thread pipeline & SDL3_gpu debug validation)
+# NativeAOT Engine Test Suite (executed on GitHub Actions CI across win-x64, linux-x64, osx-arm64 — 34 tests)
 dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r win-x64
 ./tests/BringEngine.Tests/bin/Release/net10.0/win-x64/publish/BringEngine.Tests.exe
 
-# Publish NativeAOT BringPacker CLI tool
+# NativeAOT BringPacker CLI tool
 dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r win-x64
 ./tools/BringPacker/bin/Release/net10.0/win-x64/publish/BringPacker.exe --help
 
-# Publish ShowcaseGame to NativeAOT binary
+# Publish & verify ShowcaseGame (executed on GitHub Actions CI)
 dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64
-
-# Run headless determinism, zero-GC & zero-leak audit
 ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --headless --ticks 600
-
-# Run automated GPU render verification (Title + Arena + Additive HUD -> PNGs)
 ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --verify-render
 
 # Play ShowcaseGame interactively
@@ -104,15 +101,12 @@ Games built with Bring Engine consume released SDK archives from GitHub (`bratyx
    - Whenever you add an engine capability, public API, or subsystem change, add NativeAOT test cases in `tests/BringEngine.Tests/` that thoroughly exercise the new feature (happy paths, edge cases, zero-GC hot loops via `GC.GetAllocatedBytesForCurrentThread() == 0`, and zero native leaks via `NativeMemoryTracker.LiveBytes == 0`).
    - Whenever you fix an engine bug, add a regression test that fails without the fix and passes with it.
    - A feature or fix and its tests go in the same commit.
-2. **Always run the full engine test suite before pushing**:
-   - After ANY engine change, verify you did not break anything in the engine by running:
+2. **Run engine tests on GitHub Actions CI ONLY — do NOT keep the local machine busy**:
+   - **NEVER** run the full NativeAOT engine test suite / multi-project NativeAOT publishes locally on the user's machine.
+   - Instead, commit and push your changes (or open a PR) and watch GitHub Actions (`.github/workflows/build.yml`) execute the full NativeAOT build, `BringEngine.Tests` (34 tests), `BringPacker`, and `ShowcaseGame` (`--headless` + `--verify-render`) matrix across Windows, Linux, and macOS:
      ```bash
-     dotnet build BringEngine.sln -c Release
-     dotnet publish tests/BringEngine.Tests/BringEngine.Tests.csproj -c Release -r win-x64
-     ./tests/BringEngine.Tests/bin/Release/net10.0/win-x64/publish/BringEngine.Tests.exe
-     dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64
-     ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --headless --ticks 600
-     ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --verify-render
+     git push origin main
+     gh run watch --exit-status
      ```
    - Update `docs/agents/` and `AGENTS.md` whenever public APIs, defaults, or workflows change.
 3. **Engine changes from a game**:

@@ -30,7 +30,8 @@ dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64
 ```
 
 ## Releases & CI
-- Every push to `main` is verified by GitHub Actions (`.github/workflows/build.yml`) across Windows, Linux, and macOS with NativeAOT `BringEngine.Tests` and `ShowcaseGame` audits.
+- **Engine tests run on GitHub Actions CI only** (do not keep the local machine busy running heavy NativeAOT test publishes).
+- Every push to `main` is verified by GitHub Actions (`.github/workflows/build.yml`) across Windows, Linux, and macOS with NativeAOT `BringEngine.Tests`, `BringPacker`, and `ShowcaseGame` audits.
 - Tagged releases (`vX.Y.Z`) run the full test matrix and standalone SDK consumer verification (`.github/workflows/release.yml`) before publishing `bring-sdk-vX.Y.Z.zip` on GitHub Releases.
 
 ## License
