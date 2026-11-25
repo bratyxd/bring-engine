@@ -39,10 +39,10 @@ public struct ProfilerOverlay
     public const uint OverlayLayerMask = 1u << 30;
     public const int OverlayDepthOrder = 1000;
     public const float VirtualHeight = 720f;
-    public const float PanelWidth = 460f;
+    public const float PanelWidth = 480f;
     public const float PanelHeight = 236f;
     public const float Margin = 14f;
-    public const float BarOffsetX = 186f;
+    public const float BarOffsetX = 206f;
     public const float BarTrackWidth = 258f;
     public const float BarHeight = 13f;
 
@@ -161,9 +161,9 @@ public static unsafe class ProfilerOverlaySystem
         // 100% opaque high-contrast SDF text rows
         ov.HeaderEntity = SpawnRowText(ref world, font, ScaleForPx(19f), new ColorF(0.28f, 0.96f, 1.0f, 1.0f), "PROFILER [F1]  VSYNC:ON  CAP:60", out ov.HeaderText);
         ov.FpsEntity = SpawnRowText(ref world, font, ScaleForPx(22f), new ColorF(1.0f, 0.96f, 0.50f, 1.0f), "FPS: 60.0   FRAME: 16.67 ms", out ov.FpsText);
-        ov.LogicRowEntity = SpawnRowText(ref world, font, ScaleForPx(19f), new ColorF(0.32f, 0.96f, 1.0f, 1.0f), "CPU:  0.00 ms", out ov.LogicRowText);
-        ov.RenderRowEntity = SpawnRowText(ref world, font, ScaleForPx(19f), new ColorF(0.36f, 0.98f, 0.60f, 1.0f), "RND:  0.00 ms", out ov.RenderRowText);
-        ov.GpuRowEntity = SpawnRowText(ref world, font, ScaleForPx(19f), new ColorF(1.0f, 0.84f, 0.28f, 1.0f), "GPU:  0.00 ms", out ov.GpuRowText);
+        ov.LogicRowEntity = SpawnRowText(ref world, font, ScaleForPx(18f), new ColorF(0.32f, 0.96f, 1.0f, 1.0f), "LOGIC:  0.00 ms", out ov.LogicRowText);
+        ov.RenderRowEntity = SpawnRowText(ref world, font, ScaleForPx(18f), new ColorF(0.36f, 0.98f, 0.60f, 1.0f), "RENDER: 0.00 ms", out ov.RenderRowText);
+        ov.GpuRowEntity = SpawnRowText(ref world, font, ScaleForPx(18f), new ColorF(1.0f, 0.84f, 0.28f, 1.0f), "GPU:    0.00 ms", out ov.GpuRowText);
         ov.DrawsEntity = SpawnRowText(ref world, font, ScaleForPx(19f), ColorF.White, "DRAWS: 0  |  SETPASS: 0  |  PASSES: 0", out ov.DrawsText);
         ov.ObjectsEntity = SpawnRowText(ref world, font, ScaleForPx(18f), new ColorF(0.92f, 0.96f, 1.0f, 1.0f), "OBJS: 0  |  TRIS: 0  |  ARENA: 0KB", out ov.ObjectsText);
         ov.ScopesEntity = SpawnRowText(ref world, font, ScaleForPx(16f), new ColorF(0.84f, 0.92f, 1.0f, 1.0f), "SCOPES: --", out ov.ScopesText);
@@ -252,11 +252,11 @@ public static unsafe class ProfilerOverlaySystem
         double renderMs = profiler.ProfiledFrames > 0 ? profiler.SmoothedRenderMs : profiler.RenderCpuMs;
         double gpuMs = profiler.ProfiledFrames > 0 ? profiler.SmoothedGpuMs : profiler.GpuFrameMs;
 
-        if (span.TryWrite($"CPU: {logicMs,5:F2} ms", out int nl))
+        if (span.TryWrite($"LOGIC:  {logicMs,5:F2} ms", out int nl))
             WriteText(in world.RenderComponents, ov.LogicRowText, span.Slice(0, nl));
-        if (span.TryWrite($"RND: {renderMs,5:F2} ms", out int nr))
+        if (span.TryWrite($"RENDER: {renderMs,5:F2} ms", out int nr))
             WriteText(in world.RenderComponents, ov.RenderRowText, span.Slice(0, nr));
-        if (span.TryWrite($"GPU: {gpuMs,5:F2} ms", out int ng))
+        if (span.TryWrite($"GPU:    {gpuMs,5:F2} ms", out int ng))
             WriteText(in world.RenderComponents, ov.GpuRowText, span.Slice(0, ng));
 
         // Each pipelined stage has its OWN independent fill bar against the full target frame budget (e.g. 16.67ms at 60 FPS)!

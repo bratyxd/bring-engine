@@ -200,12 +200,11 @@ public static unsafe class BatchRenderer
         RenderSubmitTimings timings = default;
         if (gpu.Initialized == 0 || packet.Valid == 0) return timings;
 
-        // 1. Acquire command buffer and render target (swapchain wait happens BEFORE Render CPU timer so VSync wait is excluded!)
-        nint cmd = SDL.AcquireGPUCommandBuffer(gpu.Device);
-        if (cmd == nint.Zero) return timings;
-
-        nint colorTarget;
+        // 1. Determine render target dimensions & offscreen color target.
+        //    Rendering to an offscreen SceneColorTexture on cmdRender and blitting to the swapchain on a separate
+        //    cmdPresent completely decouples pure GPU execution time from swapchain VSync Present wait (~16ms)!
         uint targetW, targetH;
+        nint colorTarget;
 
         if (captureToOffscreen)
         {
@@ -216,12 +215,18 @@ public static unsafe class BatchRenderer
         }
         else
         {
-            if (!SDL.WaitAndAcquireGPUSwapchainTexture(cmd, gpu.Window, out colorTarget, out targetW, out targetH) || colorTarget == nint.Zero)
-            {
-                SDL.SubmitGPUCommandBuffer(cmd);
-                return timings;
-            }
+            SDL.GetWindowSizeInPixels(gpu.Window, out int pw, out int ph);
+            if (pw <= 0 || ph <= 0) return timings; // Minimized window
+            targetW = (uint)pw;
+            targetH = (uint)ph;
+            GpuSystem.EnsureSceneColorTarget(ref gpu, targetW, targetH);
+            colorTarget = gpu.SceneColorTexture;
         }
+
+        if (colorTarget == nint.Zero) return timings;
+
+        nint cmd = SDL.AcquireGPUCommandBuffer(gpu.Device);
+        if (cmd == nint.Zero) return timings;
 
         long renderCpuStart = Stopwatch.GetTimestamp();
         GpuSystem.EnsureDepthTexture(ref gpu, targetW, targetH);
@@ -237,13 +242,14 @@ public static unsafe class BatchRenderer
                 ClearColor = new SDL.FColor { R = 0.05f, G = 0.07f, B = 0.12f, A = 1f },
                 LoadOp = SDL.GPULoadOp.Clear,
                 StoreOp = SDL.GPUStoreOp.Store,
-                Cycle = captureToOffscreen,
+                Cycle = true,
             };
             nint rp = SDL.BeginGPURenderPass(cmd, (nint)(&ct), 1, nint.Zero);
             SDL.EndGPURenderPass(rp);
             stats.RenderPasses = 1;
             timings.TotalRenderCpuMs = (Stopwatch.GetTimestamp() - renderCpuStart) * s_ticksToMs;
             SDL.SubmitGPUCommandBuffer(cmd);
+            if (!captureToOffscreen) PresentSceneColorToSwapchain(in gpu, targetW, targetH);
             gpu.LastFrameStats = stats;
             return timings;
         }
@@ -283,7 +289,7 @@ public static unsafe class BatchRenderer
                 ClearColor = new SDL.FColor { R = cam.ClearColor.R, G = cam.ClearColor.G, B = cam.ClearColor.B, A = cam.ClearColor.A },
                 LoadOp = colorLoad,
                 StoreOp = SDL.GPUStoreOp.Store,
-                Cycle = captureToOffscreen && (ci == 0) && (colorLoad == SDL.GPULoadOp.Clear),
+                Cycle = (ci == 0) && (colorLoad == SDL.GPULoadOp.Clear),
             };
             var depthInfo = new SDL.GPUDepthStencilTargetInfo
             {
@@ -543,9 +549,27 @@ public static unsafe class BatchRenderer
         timings.EncodeMs = (encodeEnd - encodeStart) * s_ticksToMs;
         timings.TotalRenderCpuMs = (encodeEnd - renderCpuStart) * s_ticksToMs;
 
-        // 4. Submit command buffer (in 2-thread mode, Logic Thread is concurrently executing Frame N while GPU finishes Frame N-1!)
+        // 4. Submit render command buffer (NO swapchain attached -> measures PURE GPU execution time, zero VSync wait!).
+        //    Wait on a leading queue barrier fence BEFORE starting the GPU timer so any prior frame's VSync Present
+        //    on the command queue finishes outside the bracket, leaving (gpuEnd - gpuStart) = pure Copy + Shader GPU ms!
         if (measureGpuWithFence)
         {
+            long waitBegin = Stopwatch.GetTimestamp();
+            if (!captureToOffscreen)
+            {
+                nint barrierCmd = SDL.AcquireGPUCommandBuffer(gpu.Device);
+                if (barrierCmd != nint.Zero)
+                {
+                    nint barrierFence = SDL.SubmitGPUCommandBufferAndAcquireFence(barrierCmd);
+                    if (barrierFence != nint.Zero)
+                    {
+                        nint* bf = stackalloc nint[1] { barrierFence };
+                        SDL.WaitForGPUFences(gpu.Device, true, (nint)bf, 1);
+                        SDL.ReleaseGPUFence(gpu.Device, barrierFence);
+                    }
+                }
+            }
+
             long gpuStart = Stopwatch.GetTimestamp();
             nint fence = SDL.SubmitGPUCommandBufferAndAcquireFence(cmd);
             if (fence != nint.Zero)
@@ -555,17 +579,57 @@ public static unsafe class BatchRenderer
                 SDL.ReleaseGPUFence(gpu.Device, fence);
             }
             long gpuEnd = Stopwatch.GetTimestamp();
-            long gpuTicks = gpuEnd - gpuStart;
-            timings.GpuWaitTicks = gpuTicks;
-            timings.GpuMs = gpuTicks * s_ticksToMs;
+            timings.GpuWaitTicks = gpuEnd - waitBegin;
+            timings.GpuMs = (gpuEnd - gpuStart) * s_ticksToMs;
         }
         else
         {
             SDL.SubmitGPUCommandBuffer(cmd);
         }
 
+        // 5. Blit offscreen SceneColorTexture -> swapchain & Present on a separate command buffer
+        //    so VSync / monitor refresh wait NEVER pollutes GPU or Render Thread work measurements!
+        if (!captureToOffscreen)
+            PresentSceneColorToSwapchain(in gpu, targetW, targetH);
+
         gpu.LastFrameStats = stats;
         return timings;
+    }
+
+    private static void PresentSceneColorToSwapchain(in GpuContext gpu, uint srcW, uint srcH)
+    {
+        nint presentCmd = SDL.AcquireGPUCommandBuffer(gpu.Device);
+        if (presentCmd == nint.Zero) return;
+
+        if (SDL.WaitAndAcquireGPUSwapchainTexture(presentCmd, gpu.Window, out nint swapTex, out uint swapW, out uint swapH) && swapTex != nint.Zero)
+        {
+            var blit = new SDL.GPUBlitInfo
+            {
+                Source = new SDL.GPUBlitRegion
+                {
+                    Texture = gpu.SceneColorTexture,
+                    X = 0,
+                    Y = 0,
+                    W = srcW,
+                    H = srcH,
+                },
+                Destination = new SDL.GPUBlitRegion
+                {
+                    Texture = swapTex,
+                    X = 0,
+                    Y = 0,
+                    W = swapW,
+                    H = swapH,
+                },
+                LoadOp = SDL.GPULoadOp.DontCare,
+                FlipMode = SDL.FlipMode.None,
+                Filter = (srcW == swapW && srcH == swapH) ? SDL.GPUFilter.Nearest : SDL.GPUFilter.Linear,
+                Cycle = false,
+            };
+            SDL.BlitGPUTexture(presentCmd, in blit);
+        }
+
+        SDL.SubmitGPUCommandBuffer(presentCmd);
     }
 
     /// <summary>

@@ -58,10 +58,10 @@ Because **Logic CPU**, **Render Thread**, and **GPU** execute pipelined 1 frame 
 Drop-in **100% opaque, high-contrast SDF UI** on its own persistent layer (`LayerMask = 1u << 30`, `DepthOrder = 1000`, `OwnerScene = SceneId.Invalid`, `ClearFlags = None`), using virtual 720p vertical scaling so text stays crisp and comfortably readable at 720p, 1080p, 1440p, 4K, and ultrawide:
 - **Survives all `Single` and `Additive` scene switches automatically.**
 - **0 GC bytes per frame.**
-- **Displays 3 SEPARATE horizontal fill bars** (never stacked/combined!):
-  1. **`CPU` (Cyan)** — Logic Thread time vs. `budgetMs` (turns red if `> 85%`)
-  2. **`RND` (Emerald)** — Render Thread time vs. `budgetMs` (turns red if `> 85%`)
-  3. **`GPU` (Gold)** — GPU Hardware time vs. `budgetMs` (turns red if `> 85%`)
+- **Displays 3 SEPARATE horizontal fill bars** (never stacked/combined, all excluding VSync/FPS-cap idle wait!):
+  1. **`LOGIC` (Cyan)** — Logic Thread time (Sim + ViewSync + Core + Packet Extract, Frame `N`) vs. `budgetMs` (turns red if `> 85%`)
+  2. **`RENDER` (Emerald)** — Render Thread CPU time (GPU Upload + Command Recording, Frame `N-1`) vs. `budgetMs` (turns red if `> 85%`)
+  3. **`GPU` (Gold)** — Pure GPU Hardware work (Copy + Shaders into offscreen `SceneColorTexture`, decoupled from swapchain VSync Present blit!) vs. `budgetMs` (turns red if `> 85%`)
 - Plus Header (`PROFILER [F1] VSYNC:ON CAP:60 [2T]`), FPS & Total Frame ms, `DRAWS | SETPASS | PASSES`, `OBJS | TRIS | ARENA`, and Top CPU Scopes.
 
 > **Important GPU Stability Rules (Enforced Automatically by `BatchRenderer`)**:

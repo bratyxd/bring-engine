@@ -186,6 +186,21 @@ public static unsafe class ProfilingAndPacingTests
             Assert.True(profiler->GpuFrameMs > 0.0, $"Expected GPU fence frame time > 0 ms, got {profiler->GpuFrameMs:F4}");
             Assert.True(profiler->RenderCpuMs > 0.0, $"Expected Render CPU time > 0 ms, got {profiler->RenderCpuMs:F4}");
 
+            // Also verify real swapchain blit path (captureToOffscreen: false, VSync ON, debugMode: true)
+            // measures PURE GPU work (< 10ms, NOT ~16.6ms VSync present wait!) with zero D3D12 validation errors!
+            for (int f = 0; f < 4; f++)
+            {
+                ProfilerSystem.BeginFrame(ref *profiler);
+                alloc.BeginFrame();
+                ProfilerOverlaySystem.Update(ref overlay, ref world, in *profiler, in gpu->LastFrameStats, in pacer, 640, 360);
+                EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 1f / 60f, 640, 360);
+                BatchRenderer.RenderFrame(ref *gpu, ref world, ref alloc, SceneLighting.Default, captureToOffscreen: false, profiler: profiler);
+                ProfilerSystem.EndCpuWork(ref *profiler);
+                ProfilerSystem.EndFrame(ref *profiler);
+            }
+            Assert.True(profiler->GpuFrameMs > 0.0 && profiler->GpuFrameMs < 10.0,
+                $"Swapchain VSync-ON GPU time must exclude ~16.6ms VSync wait, got {profiler->GpuFrameMs:F3}ms");
+
             ProfilerOverlaySystem.Destroy(ref overlay, ref world);
         }
         finally

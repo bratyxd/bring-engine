@@ -89,6 +89,11 @@ public unsafe struct GpuContext
     public uint DepthWidth;
     public uint DepthHeight;
 
+    // Offscreen scene color target (decouples GPU render work from swapchain VSync Present wait)
+    public nint SceneColorTexture;
+    public uint SceneColorWidth;
+    public uint SceneColorHeight;
+
     // Optional offscreen target for deterministic screenshot capture
     public nint CaptureColorTexture;
     public nint CaptureTransferBuffer;
@@ -385,6 +390,31 @@ public static unsafe class GpuSystem
         ctx.DepthHeight = height;
     }
 
+    public static void EnsureSceneColorTarget(ref GpuContext ctx, uint width, uint height)
+    {
+        if (width == 0 || height == 0) return;
+        if (ctx.SceneColorTexture != nint.Zero && ctx.SceneColorWidth == width && ctx.SceneColorHeight == height)
+            return;
+
+        if (ctx.SceneColorTexture != nint.Zero)
+            SDL.ReleaseGPUTexture(ctx.Device, ctx.SceneColorTexture);
+
+        var info = new SDL.GPUTextureCreateInfo
+        {
+            Type = SDL.GPUTextureType.TextureType2D,
+            Format = ctx.SwapchainFormat,
+            Usage = SDL.GPUTextureUsageFlags.ColorTarget | SDL.GPUTextureUsageFlags.Sampler,
+            Width = width,
+            Height = height,
+            LayerCountOrDepth = 1,
+            NumLevels = 1,
+            SampleCount = SDL.GPUSampleCount.SampleCount1,
+        };
+        ctx.SceneColorTexture = SDL.CreateGPUTexture(ctx.Device, in info);
+        ctx.SceneColorWidth = width;
+        ctx.SceneColorHeight = height;
+    }
+
     public static void EnsureCaptureTarget(ref GpuContext ctx, uint width, uint height)
     {
         if (ctx.CaptureColorTexture != nint.Zero && ctx.CaptureWidth == width && ctx.CaptureHeight == height)
@@ -639,6 +669,7 @@ public static unsafe class GpuSystem
         }
 
         if (ctx.DepthTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.DepthTexture);
+        if (ctx.SceneColorTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.SceneColorTexture);
         if (ctx.CaptureColorTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.CaptureColorTexture);
         if (ctx.CaptureTransferBuffer != nint.Zero) SDL.ReleaseGPUTransferBuffer(ctx.Device, ctx.CaptureTransferBuffer);
         if (ctx.DefaultWhiteTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.DefaultWhiteTexture);
