@@ -11,6 +11,7 @@ public static class Program
         CoreTests.RunAll();
         SimulationTests.RunAll();
         TweenAnimParticleTests.RunAll();
+        AssetBundleSceneGltfTests.RunAll();
 
         Console.WriteLine($"\nSummary: {Assert.Passed} passed, {Assert.Failed} failed.");
         return Assert.Failed == 0 ? 0 : 1;
