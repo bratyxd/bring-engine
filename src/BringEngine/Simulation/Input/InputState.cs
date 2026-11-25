@@ -299,45 +299,74 @@ public unsafe struct InputState
 
     public void SetGamepadConnected(int slot, bool connected, uint instanceId = 0)
     {
-        if ((uint)slot >= MaxGamepads) return;
-        ref GamepadState pad = ref GetGamepadRef(slot);
-        if (connected)
+        switch (slot)
         {
-            pad.Clear();
-            pad.Connected = 1;
-            pad.InstanceId = instanceId;
-        }
-        else
-        {
-            pad.Clear();
+            case 0: ApplyConnected(ref Gamepad0, connected, instanceId); break;
+            case 1: ApplyConnected(ref Gamepad1, connected, instanceId); break;
+            case 2: ApplyConnected(ref Gamepad2, connected, instanceId); break;
+            case 3: ApplyConnected(ref Gamepad3, connected, instanceId); break;
+            default: return;
         }
         RecountConnectedGamepads();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void SetGamepadButton(int slot, GamepadButton button, bool down)
+    private static void ApplyConnected(ref GamepadState pad, bool connected, uint instanceId)
     {
-        if ((uint)slot >= MaxGamepads) return;
-        ref GamepadState pad = ref GetGamepadRef(slot);
-        if (pad.Connected == 0)
+        pad.Clear();
+        if (connected)
         {
             pad.Connected = 1;
-            RecountConnectedGamepads();
+            pad.InstanceId = instanceId;
         }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SetGamepadButton(int slot, GamepadButton button, bool down)
+    {
+        bool autoConnected;
+        switch (slot)
+        {
+            case 0: autoConnected = ApplyButton(ref Gamepad0, button, down); break;
+            case 1: autoConnected = ApplyButton(ref Gamepad1, button, down); break;
+            case 2: autoConnected = ApplyButton(ref Gamepad2, button, down); break;
+            case 3: autoConnected = ApplyButton(ref Gamepad3, button, down); break;
+            default: return;
+        }
+        if (autoConnected) RecountConnectedGamepads();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool ApplyButton(ref GamepadState pad, GamepadButton button, bool down)
+    {
+        bool newlyConnected = pad.Connected == 0;
+        if (newlyConnected) pad.Connected = 1;
         pad.SetButton(button, down);
+        return newlyConnected;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetGamepadAxis(int slot, GamepadAxis axis, float value)
     {
-        if ((uint)slot >= MaxGamepads) return;
-        ref GamepadState pad = ref GetGamepadRef(slot);
-        if (pad.Connected == 0)
+        bool autoConnected;
+        switch (slot)
         {
-            pad.Connected = 1;
-            RecountConnectedGamepads();
+            case 0: autoConnected = ApplyAxis(ref Gamepad0, axis, value); break;
+            case 1: autoConnected = ApplyAxis(ref Gamepad1, axis, value); break;
+            case 2: autoConnected = ApplyAxis(ref Gamepad2, axis, value); break;
+            case 3: autoConnected = ApplyAxis(ref Gamepad3, axis, value); break;
+            default: return;
         }
+        if (autoConnected) RecountConnectedGamepads();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool ApplyAxis(ref GamepadState pad, GamepadAxis axis, float value)
+    {
+        bool newlyConnected = pad.Connected == 0;
+        if (newlyConnected) pad.Connected = 1;
         pad.SetAxis(axis, value);
+        return newlyConnected;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -362,18 +391,6 @@ public unsafe struct InputState
         dst.RightY = src.RightY;
         dst.LeftTrigger = src.LeftTrigger;
         dst.RightTrigger = src.RightTrigger;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private ref GamepadState GetGamepadRef(int slot)
-    {
-        switch (slot)
-        {
-            case 0: return ref Gamepad0;
-            case 1: return ref Gamepad1;
-            case 2: return ref Gamepad2;
-            default: return ref Gamepad3;
-        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
