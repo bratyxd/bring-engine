@@ -1,0 +1,41 @@
+# .NET / C# Build Outputs
+bin/
+obj/
+publish/
+artifacts/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.nupkg
+*.snupkg
+
+# NativeAOT / C++ Linker Artifacts
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.o
+*.dSYM/
+*.dbg
+
+# IDE / Editors
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test / Verification Temporary Outputs
+TestResults/
+*.trx
+*.coverage
+verify_*.png
+*.log
+
+# OS Files
+.DS_Store
+Thumbs.db
+desktop.ini

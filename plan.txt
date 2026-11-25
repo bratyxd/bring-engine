@@ -1,0 +1,32 @@
+ we will create a c# game engine called Bring Engine.
+
+- Create a git repo with appropriate gitignore file and make meaningful commits when you progress
+- It will be C# engine with aot enabled so it can be cross platform, for every feature we check we should check it and get compile error so it is not get added if not aot compatible
+- it will use sdl3 and sdl3 gpu, with c# bindings.
+- it will be a fully data driven engine, no oop.
+- Game engine should be a seperate project and the game it self should be another c# project that
+depends on the engine.
+- it will be data and systems that iterate over it, it will be like that for both engine and games.
+- Games that uses this engine will fully be ai driven, so for each of your updates,developments,
+create a relevant agent read me file so agents know what to do.
+- since it is data driven, try to use cache hits as much as possible both in the engine and the game
+- engine and game should use memory allocators heavily, alloctarors that rest each frame, when
+we reset them, and that persist during lifetime of the game. game should create them at start of the
+game and use them as they are needed. game should avoid hot path allocations as much as possible unless it is absolutely needed.
+- Since we are using stuff like sta layouts, cache hits and memory allocators, engine will use unsafe
+code, handle them.
+- Engine should also care about performance, both cpu and gpu side. try to batch draw calls, set pass calls and logic for the engine and the game.
+- Engine will not have an editor, but view logic and game logic should be as seperate as possible
+for modularity and testability, so game can play as seperate and as headless.
+- This will be a 3d engine, with excellent 2d support. similart to unity, we should be able to render 2d sprites in 3d world. Also we should support advanced text and font support, and animating/tweening shadering them.
+- Engine should have deterministic math lib, tweening and animation system.
+- Engine will be gltf first citizen engine. so handle its usage
+- we should also have a way to load/unload asseets in bundles/groups. Do the best decision here.
+We can have a scene structure like unity and load unload scenes once they are needed. Try to keep
+memory usage as minimum as possible.
+- We should also have a camera system, and general animating tween system for being able to use on
+everything since everything is data and we just iterate over it for everything.
+- when you are stuck, make educated guesses and search net for latest resources. do not ask me
+anything unless it is absolutely crucial.
+- this is a big task so first create the implementation plans and then execute on them
+- we should also support animating/particles/shaders in the engine, give a way to use them.
