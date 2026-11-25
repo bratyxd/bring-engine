@@ -3,7 +3,7 @@
 A cross-platform, **NativeAOT-first**, **strictly Data-Oriented (Zero-OOP)** 3D & 2D game engine written in C# (.NET 10), powered by **SDL3** and **SDL3_gpu**.
 
 ## Highlights
-- **Strict NativeAOT**: All trimming and AOT analyzer warnings (`IL2xxx`, `IL3xxx`) are compile errors via `Directory.Build.props`.
+- **Strict NativeAOT (Mandatory Release Target)**: All games built on Bring Engine ship as NativeAOT binaries (`<PublishAot>true</PublishAot>`). All trimming and AOT analyzer warnings (`IL2xxx`, `IL3xxx`) are hard compile errors via `Directory.Build.props` (zero reflection / zero dynamic codegen).
 - **Zero-OOP Data + Systems**: Pure unmanaged `struct` tables (SoA / dense sparse sets) iterated by `static unsafe` systems.
 - **Explicit Native Memory Allocators**: 64-byte aligned `LinearArena` (`Persistent`, `Frame`, `Scratch`, per-`Scene`, per-`Bundle`), `PoolAllocator<T>`, and `FreeListAllocator` for zero-GC hot loops.
 - **Headless Simulation / View Separation**: Deterministic fixed-timestep simulation runs completely without SDL or GPU for instant headless tests and replays.

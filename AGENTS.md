@@ -11,10 +11,11 @@
    - Put all behavior in `public static unsafe class <Feature>System` methods iterating contiguous native memory linearly.
    - Use unmanaged function pointers (`delegate*<...>`) for bundle loaders, scene lifecycle hooks, and tween completion callbacks.
 
-2. **Strict NativeAOT Compatibility (Hard Compile Errors)**
+2. **Strict NativeAOT Compatibility — Mandatory Release Target (Hard Compile Errors)**
+   - **All Bring Engine games release as NativeAOT native executables.** Every game `.csproj` MUST enable `<PublishAot>true</PublishAot>`.
    - `Directory.Build.props` enables `IsAotCompatible=true`, `EnableAotAnalyzer=true`, `EnableTrimAnalyzer=true`, and promotes **all `IL2xxx` and `IL3xxx` warnings to compile errors**.
-   - NEVER use `System.Reflection`, `System.Linq.Expressions`, `dynamic`, or reflection-based JSON serialization (use `Utf8JsonReader`).
-   - Always verify with `dotnet publish -c Release -r <rid>`.
+   - NEVER use `System.Reflection`, `System.Linq.Expressions`, `dynamic`, runtime codegen (`Reflection.Emit`), reflection-based JSON serialization (use `Utf8JsonReader`), or non-AOT-compatible packages.
+   - Always verify both engine and game changes with `dotnet publish -c Release -r <rid>` (not just `dotnet build`).
 
 3. **Explicit Native Memory Allocators & Zero-GC Hot Paths**
    - Create `EngineAllocators` (`Persistent`, `Frame`, `Scratch`, `Dynamic`) and `GameAllocators` (`Persistent`, `Level`, `Frame`) at startup.
