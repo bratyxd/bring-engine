@@ -7,7 +7,11 @@ public static class Program
 {
     public static int Main(string[] args)
     {
-        Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - AOT Test Runner bootstrap");
-        return 0;
+        Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - NativeAOT Test Suite");
+        CoreTests.RunAll();
+        SimulationTests.RunAll();
+
+        Console.WriteLine($"\nSummary: {Assert.Passed} passed, {Assert.Failed} failed.");
+        return Assert.Failed == 0 ? 0 : 1;
     }
 }
