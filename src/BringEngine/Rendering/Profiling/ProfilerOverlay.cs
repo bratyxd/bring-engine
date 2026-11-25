@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using BringEngine.Assets;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
@@ -21,48 +22,74 @@ public enum ProfilerAnchor : byte
 }
 
 /// <summary>
-/// Common, drop-in Bring Engine UI Profiler Overlay (Zero-OOP, Zero-GC).
+/// Common, drop-in Bring Engine UI Profiler Overlay (Zero-OOP, Zero-GC, 100% Opaque High-Contrast SDF UI).
 /// Renders on a dedicated persistent overlay layer (LayerMask = 1u << 30, DepthOrder = 1000, SceneId.Invalid)
-/// so it automatically survives Single & Additive scene transitions and displays:
-/// - Current FPS & total frame time (ms)
-/// - CPU frame time (ms) & GPU frame time (ms) + visual frame-budget bar
-/// - VSync state & FPS Cap
-/// - Draw Calls, SetPass Calls, Render/Copy Passes, Objects, Triangles, Frame Arena KB
-/// - Top named CPU scopes from the previous frame
+/// using resolution-independent virtual 720p vertical scaling so text stays crisp and readable on 720p/1080p/1440p/4K.
+/// Displays:
+/// - Current FPS, Total Frame Time (ms), VSync state, FPS Cap, and 2-Thread Pipeline status
+/// - THREE SEPARATE independent frame-budget fill bars (since Logic, Render, and GPU run pipelined 1 frame apart):
+///   1. CPU (Logic Thread, Frame N)
+///   2. RND (Render Thread, Frame N-1)
+///   3. GPU (Hardware Fence, Frame N-1)
+/// - Draw Calls, SetPass Calls, Passes, Objects, Triangles, Frame Arena KB, and Top CPU Scopes
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct ProfilerOverlay
 {
     public const uint OverlayLayerMask = 1u << 30;
     public const int OverlayDepthOrder = 1000;
-    public const float PanelWidth = 392f;
-    public const float PanelHeight = 160f;
-    public const float Margin = 12f;
+    public const float VirtualHeight = 720f;
+    public const float PanelWidth = 460f;
+    public const float PanelHeight = 236f;
+    public const float Margin = 14f;
+    public const float BarOffsetX = 186f;
+    public const float BarTrackWidth = 258f;
+    public const float BarHeight = 13f;
 
     public CameraHandle Camera;
     public ProfilerAnchor Anchor;
     public byte Visible;
     public byte Initialized;
 
-    // Backdrop + accent + CPU/GPU budget bar sprites
+    // 100% opaque backdrop + solid frame borders (strictly distinct OrderInLayer = 0..5)
     public EntityId BgEntity;
     public SpriteHandle BgSprite;
     public EntityId AccentEntity;
     public SpriteHandle AccentSprite;
-    public EntityId BarTrackEntity;
-    public SpriteHandle BarTrackSprite;
-    public EntityId CpuBarEntity;
-    public SpriteHandle CpuBarSprite;
+    public EntityId BorderBottomEntity;
+    public SpriteHandle BorderBottomSprite;
+    public EntityId BorderLeftEntity;
+    public SpriteHandle BorderLeftSprite;
+    public EntityId BorderRightEntity;
+    public SpriteHandle BorderRightSprite;
+
+    // 3 SEPARATE horizontal fill bars + tracks (strictly distinct OrderInLayer = 10..15)
+    public EntityId LogicTrackEntity;
+    public SpriteHandle LogicTrackSprite;
+    public EntityId LogicBarEntity;
+    public SpriteHandle LogicBarSprite;
+
+    public EntityId RenderTrackEntity;
+    public SpriteHandle RenderTrackSprite;
+    public EntityId RenderBarEntity;
+    public SpriteHandle RenderBarSprite;
+
+    public EntityId GpuTrackEntity;
+    public SpriteHandle GpuTrackSprite;
     public EntityId GpuBarEntity;
     public SpriteHandle GpuBarSprite;
 
-    // 6 SDF telemetry rows
+    // 8 100% opaque high-contrast SDF telemetry rows
     public EntityId HeaderEntity;
     public TextHandle HeaderText;
     public EntityId FpsEntity;
     public TextHandle FpsText;
-    public EntityId TimingEntity;
-    public TextHandle TimingText;
+    public EntityId LogicRowEntity;
+    public TextHandle LogicRowText;
+    public EntityId RenderRowEntity;
+    public TextHandle RenderRowText;
+    public EntityId GpuRowEntity;
+    public TextHandle GpuRowText;
     public EntityId DrawsEntity;
     public TextHandle DrawsText;
     public EntityId ObjectsEntity;
@@ -76,10 +103,6 @@ public struct ProfilerOverlay
 
 public static unsafe class ProfilerOverlaySystem
 {
-    /// <summary>
-    /// Creates the common profiler UI overlay on LayerMask (1u << 30) with OwnerScene = SceneId.Invalid
-    /// so it persists seamlessly across all scene loads/unloads.
-    /// </summary>
     public static ProfilerOverlay Create(
         ref EngineWorld world,
         FontHandle font,
@@ -98,30 +121,52 @@ public static unsafe class ProfilerOverlaySystem
             LastScreenH = screenHeight,
         };
 
-        // Dedicated overlay camera (DepthOrder 1000 -> renders cleanly above both 3D world and game HUD)
+        // Normalize SDF scale to exact virtual 720p pixel heights regardless of baked font pixel size
+        FontAssetData* fnt = AssetSystem.TryGetFont(in world.Assets, font);
+        float bakedPx = (fnt != null && fnt->PixelSize > 8f) ? fnt->PixelSize : 48f;
+        float ScaleForPx(float px) => px / bakedPx;
+
+        float uiH = ProfilerOverlay.VirtualHeight;
+        float aspect = (screenHeight > 1f) ? (screenWidth / screenHeight) : (16f / 9f);
+        float uiW = uiH * aspect;
+
+        // Dedicated overlay camera (DepthOrder 1000, ClearFlags.None -> never touches 3D depth!)
         ov.Camera = CameraSystem.CreateOrthographicUI(
-            ref world.Cameras, screenWidth, screenHeight,
+            ref world.Cameras, uiW, uiH,
             ownerScene: SceneId.Invalid,
             depthOrder: ProfilerOverlay.OverlayDepthOrder,
             layerMask: ProfilerOverlay.OverlayLayerMask);
 
-        ov.BgEntity = SpawnSprite(ref world, whiteTexture, new Vec2(ProfilerOverlay.PanelWidth, ProfilerOverlay.PanelHeight),
-            new ColorF(0.03f, 0.05f, 0.10f, 0.86f), 0, out ov.BgSprite);
-        ov.AccentEntity = SpawnSprite(ref world, whiteTexture, new Vec2(ProfilerOverlay.PanelWidth, 3f),
-            new ColorF(0.15f, 0.92f, 1.0f, 0.95f), 1, out ov.AccentSprite);
-        ov.BarTrackEntity = SpawnSprite(ref world, whiteTexture, new Vec2(ProfilerOverlay.PanelWidth - 24f, 8f),
-            new ColorF(0.12f, 0.16f, 0.24f, 0.95f), 1, out ov.BarTrackSprite);
-        ov.CpuBarEntity = SpawnSprite(ref world, whiteTexture, new Vec2(4f, 8f),
-            new ColorF(0.15f, 0.92f, 1.0f, 1.0f), 2, out ov.CpuBarSprite);
-        ov.GpuBarEntity = SpawnSprite(ref world, whiteTexture, new Vec2(4f, 8f),
-            new ColorF(1.0f, 0.78f, 0.18f, 1.0f), 2, out ov.GpuBarSprite);
+        // 100% opaque solid dark card + crisp frame borders (strictly unique OrderInLayer -> zero sort flicker!)
+        ColorF cardBg = new ColorF(0.04f, 0.06f, 0.11f, 1.0f);
+        ColorF borderCol = new ColorF(0.22f, 0.44f, 0.66f, 1.0f);
+        ColorF trackBg = new ColorF(0.14f, 0.19f, 0.29f, 1.0f);
 
-        ov.HeaderEntity = SpawnRowText(ref world, font, 0.34f, new ColorF(0.22f, 0.95f, 1.0f, 1f), "PROFILER [F1]  VSYNC:ON  CAP:60", out ov.HeaderText);
-        ov.FpsEntity = SpawnRowText(ref world, font, 0.38f, new ColorF(1.0f, 0.95f, 0.55f, 1f), "FPS: 60.0  (16.67 ms)", out ov.FpsText);
-        ov.TimingEntity = SpawnRowText(ref world, font, 0.35f, new ColorF(0.95f, 0.98f, 1.0f, 1f), "CPU: 0.00 ms  |  GPU: 0.00 ms", out ov.TimingText);
-        ov.DrawsEntity = SpawnRowText(ref world, font, 0.34f, new ColorF(0.65f, 0.92f, 1.0f, 1f), "DRAWS: 0  |  SETPASS: 0  |  PASSES: 0", out ov.DrawsText);
-        ov.ObjectsEntity = SpawnRowText(ref world, font, 0.32f, new ColorF(0.80f, 0.86f, 0.96f, 0.95f), "OBJS: 0  |  TRIS: 0  |  ARENA: 0KB", out ov.ObjectsText);
-        ov.ScopesEntity = SpawnRowText(ref world, font, 0.28f, new ColorF(0.62f, 0.74f, 0.88f, 0.92f), "SCOPES: --", out ov.ScopesText);
+        ov.BgEntity = SpawnSprite(ref world, whiteTexture, new Vec2(ProfilerOverlay.PanelWidth, ProfilerOverlay.PanelHeight), cardBg, 0, out ov.BgSprite);
+        ov.AccentEntity = SpawnSprite(ref world, whiteTexture, new Vec2(ProfilerOverlay.PanelWidth, 4f), new ColorF(0.18f, 0.94f, 1.0f, 1.0f), 1, out ov.AccentSprite);
+        ov.BorderBottomEntity = SpawnSprite(ref world, whiteTexture, new Vec2(ProfilerOverlay.PanelWidth, 2f), borderCol, 2, out ov.BorderBottomSprite);
+        ov.BorderLeftEntity = SpawnSprite(ref world, whiteTexture, new Vec2(2f, ProfilerOverlay.PanelHeight), borderCol, 3, out ov.BorderLeftSprite);
+        ov.BorderRightEntity = SpawnSprite(ref world, whiteTexture, new Vec2(2f, ProfilerOverlay.PanelHeight), borderCol, 4, out ov.BorderRightSprite);
+
+        // Three separate tracks + fill bars (CPU Logic, Render Thread, GPU Hardware)
+        ov.LogicTrackEntity = SpawnSprite(ref world, whiteTexture, new Vec2(ProfilerOverlay.BarTrackWidth, ProfilerOverlay.BarHeight), trackBg, 10, out ov.LogicTrackSprite);
+        ov.LogicBarEntity = SpawnSprite(ref world, whiteTexture, new Vec2(4f, ProfilerOverlay.BarHeight), new ColorF(0.16f, 0.94f, 1.0f, 1.0f), 11, out ov.LogicBarSprite);
+
+        ov.RenderTrackEntity = SpawnSprite(ref world, whiteTexture, new Vec2(ProfilerOverlay.BarTrackWidth, ProfilerOverlay.BarHeight), trackBg, 12, out ov.RenderTrackSprite);
+        ov.RenderBarEntity = SpawnSprite(ref world, whiteTexture, new Vec2(4f, ProfilerOverlay.BarHeight), new ColorF(0.22f, 0.96f, 0.50f, 1.0f), 13, out ov.RenderBarSprite);
+
+        ov.GpuTrackEntity = SpawnSprite(ref world, whiteTexture, new Vec2(ProfilerOverlay.BarTrackWidth, ProfilerOverlay.BarHeight), trackBg, 14, out ov.GpuTrackSprite);
+        ov.GpuBarEntity = SpawnSprite(ref world, whiteTexture, new Vec2(4f, ProfilerOverlay.BarHeight), new ColorF(1.0f, 0.80f, 0.18f, 1.0f), 15, out ov.GpuBarSprite);
+
+        // 100% opaque high-contrast SDF text rows
+        ov.HeaderEntity = SpawnRowText(ref world, font, ScaleForPx(19f), new ColorF(0.28f, 0.96f, 1.0f, 1.0f), "PROFILER [F1]  VSYNC:ON  CAP:60", out ov.HeaderText);
+        ov.FpsEntity = SpawnRowText(ref world, font, ScaleForPx(22f), new ColorF(1.0f, 0.96f, 0.50f, 1.0f), "FPS: 60.0   FRAME: 16.67 ms", out ov.FpsText);
+        ov.LogicRowEntity = SpawnRowText(ref world, font, ScaleForPx(19f), new ColorF(0.32f, 0.96f, 1.0f, 1.0f), "CPU:  0.00 ms", out ov.LogicRowText);
+        ov.RenderRowEntity = SpawnRowText(ref world, font, ScaleForPx(19f), new ColorF(0.36f, 0.98f, 0.60f, 1.0f), "RND:  0.00 ms", out ov.RenderRowText);
+        ov.GpuRowEntity = SpawnRowText(ref world, font, ScaleForPx(19f), new ColorF(1.0f, 0.84f, 0.28f, 1.0f), "GPU:  0.00 ms", out ov.GpuRowText);
+        ov.DrawsEntity = SpawnRowText(ref world, font, ScaleForPx(19f), ColorF.White, "DRAWS: 0  |  SETPASS: 0  |  PASSES: 0", out ov.DrawsText);
+        ov.ObjectsEntity = SpawnRowText(ref world, font, ScaleForPx(18f), new ColorF(0.92f, 0.96f, 1.0f, 1.0f), "OBJS: 0  |  TRIS: 0  |  ARENA: 0KB", out ov.ObjectsText);
+        ov.ScopesEntity = SpawnRowText(ref world, font, ScaleForPx(16f), new ColorF(0.84f, 0.92f, 1.0f, 1.0f), "SCOPES: --", out ov.ScopesText);
 
         LayoutPanel(ref ov, ref world, screenWidth, screenHeight);
         SetVisible(ref ov, ref world, startVisible);
@@ -139,13 +184,21 @@ public static unsafe class ProfilerOverlaySystem
 
         SetSpriteVis(in world.RenderComponents, ov.BgSprite, vis);
         SetSpriteVis(in world.RenderComponents, ov.AccentSprite, vis);
-        SetSpriteVis(in world.RenderComponents, ov.BarTrackSprite, vis);
-        SetSpriteVis(in world.RenderComponents, ov.CpuBarSprite, vis);
+        SetSpriteVis(in world.RenderComponents, ov.BorderBottomSprite, vis);
+        SetSpriteVis(in world.RenderComponents, ov.BorderLeftSprite, vis);
+        SetSpriteVis(in world.RenderComponents, ov.BorderRightSprite, vis);
+        SetSpriteVis(in world.RenderComponents, ov.LogicTrackSprite, vis);
+        SetSpriteVis(in world.RenderComponents, ov.LogicBarSprite, vis);
+        SetSpriteVis(in world.RenderComponents, ov.RenderTrackSprite, vis);
+        SetSpriteVis(in world.RenderComponents, ov.RenderBarSprite, vis);
+        SetSpriteVis(in world.RenderComponents, ov.GpuTrackSprite, vis);
         SetSpriteVis(in world.RenderComponents, ov.GpuBarSprite, vis);
 
         SetTextVis(in world.RenderComponents, ov.HeaderText, vis);
         SetTextVis(in world.RenderComponents, ov.FpsText, vis);
-        SetTextVis(in world.RenderComponents, ov.TimingText, vis);
+        SetTextVis(in world.RenderComponents, ov.LogicRowText, vis);
+        SetTextVis(in world.RenderComponents, ov.RenderRowText, vis);
+        SetTextVis(in world.RenderComponents, ov.GpuRowText, vis);
         SetTextVis(in world.RenderComponents, ov.DrawsText, vis);
         SetTextVis(in world.RenderComponents, ov.ObjectsText, vis);
         SetTextVis(in world.RenderComponents, ov.ScopesText, vis);
@@ -155,7 +208,7 @@ public static unsafe class ProfilerOverlaySystem
         => SetVisible(ref ov, ref world, ov.Visible == 0);
 
     /// <summary>
-    /// Updates all profiler UI text rows and visual CPU/GPU budget bars with ZERO managed heap allocations.
+    /// Updates all profiler UI text rows and 3 independent stage fill bars (Logic CPU, Render Thread, GPU) with ZERO GC allocations.
     /// </summary>
     public static void Update(
         ref ProfilerOverlay ov,
@@ -171,20 +224,20 @@ public static unsafe class ProfilerOverlaySystem
         if (DetMath.Abs(screenWidth - ov.LastScreenW) > 1f || DetMath.Abs(screenHeight - ov.LastScreenH) > 1f)
             LayoutPanel(ref ov, ref world, screenWidth, screenHeight);
 
-        // Zero-GC formatting into stackalloc char buffer!
         char* buf = stackalloc char[160];
         Span<char> span = new Span<char>(buf, 160);
 
-        // Row 0: Header + VSync + FPS Cap
+        // Row 0: Header + VSync + FPS Cap + Pipeline Mode
         bool vsyncOn = pacer.EffectiveVSync != 0;
+        ReadOnlySpan<char> modeTag = profiler.PipelinedTwoThread != 0 ? "2T" : "1T";
         if (pacer.TargetFps > 0)
         {
-            if (span.TryWrite($"PROFILER [F1]   VSYNC:{(vsyncOn ? "ON" : "OFF")}  CAP:{pacer.TargetFps}", out int n0))
+            if (span.TryWrite($"PROFILER [F1]  VSYNC:{(vsyncOn ? "ON" : "OFF")}  CAP:{pacer.TargetFps}  [{modeTag}]", out int n0))
                 WriteText(in world.RenderComponents, ov.HeaderText, span.Slice(0, n0));
         }
         else
         {
-            if (span.TryWrite($"PROFILER [F1]   VSYNC:{(vsyncOn ? "ON" : "OFF")}  CAP:MAX", out int n0))
+            if (span.TryWrite($"PROFILER [F1]  VSYNC:{(vsyncOn ? "ON" : "OFF")}  CAP:MAX  [{modeTag}]", out int n0))
                 WriteText(in world.RenderComponents, ov.HeaderText, span.Slice(0, n0));
         }
 
@@ -194,34 +247,48 @@ public static unsafe class ProfilerOverlaySystem
         if (span.TryWrite($"FPS: {fps:F1}   FRAME: {totMs:F2} ms", out int n1))
             WriteText(in world.RenderComponents, ov.FpsText, span.Slice(0, n1));
 
-        // Row 2: CPU ms & GPU ms
-        double cpuMs = profiler.ProfiledFrames > 0 ? profiler.SmoothedCpuMs : profiler.CpuFrameMs;
+        // Rows 2, 3, 4: Independent pipelined stage timings (Logic CPU, Render Thread, GPU)
+        double logicMs = profiler.ProfiledFrames > 0 ? profiler.SmoothedLogicMs : profiler.LogicCpuMs;
+        double renderMs = profiler.ProfiledFrames > 0 ? profiler.SmoothedRenderMs : profiler.RenderCpuMs;
         double gpuMs = profiler.ProfiledFrames > 0 ? profiler.SmoothedGpuMs : profiler.GpuFrameMs;
-        if (span.TryWrite($"CPU: {cpuMs:F2} ms  |  GPU: {gpuMs:F2} ms", out int n2))
-            WriteText(in world.RenderComponents, ov.TimingText, span.Slice(0, n2));
 
-        // Row 3: Draw calls, SetPass calls, Passes
+        if (span.TryWrite($"CPU: {logicMs,5:F2} ms", out int nl))
+            WriteText(in world.RenderComponents, ov.LogicRowText, span.Slice(0, nl));
+        if (span.TryWrite($"RND: {renderMs,5:F2} ms", out int nr))
+            WriteText(in world.RenderComponents, ov.RenderRowText, span.Slice(0, nr));
+        if (span.TryWrite($"GPU: {gpuMs,5:F2} ms", out int ng))
+            WriteText(in world.RenderComponents, ov.GpuRowText, span.Slice(0, ng));
+
+        // Each pipelined stage has its OWN independent fill bar against the full target frame budget (e.g. 16.67ms at 60 FPS)!
+        float budgetMs = pacer.TargetFps > 0 ? (1000f / pacer.TargetFps) : 16.6667f;
+        float trackW = ProfilerOverlay.BarTrackWidth;
+
+        UpdateStageBar(in world.RenderComponents, ov.LogicBarSprite, logicMs, budgetMs, trackW, new ColorF(0.16f, 0.94f, 1.0f, 1.0f));
+        UpdateStageBar(in world.RenderComponents, ov.RenderBarSprite, renderMs, budgetMs, trackW, new ColorF(0.22f, 0.96f, 0.50f, 1.0f));
+        UpdateStageBar(in world.RenderComponents, ov.GpuBarSprite, gpuMs, budgetMs, trackW, new ColorF(1.0f, 0.80f, 0.18f, 1.0f));
+
+        // Row 5: Draw calls, SetPass calls, Passes
         int totalPasses = stats.RenderPasses + stats.CopyPasses;
-        if (span.TryWrite($"DRAWS: {stats.DrawCalls}  |  SETPASS: {stats.SetPassCalls}  |  PASSES: {totalPasses}", out int n3))
-            WriteText(in world.RenderComponents, ov.DrawsText, span.Slice(0, n3));
+        if (span.TryWrite($"DRAWS: {stats.DrawCalls}  |  SETPASS: {stats.SetPassCalls}  |  PASSES: {totalPasses}", out int n5))
+            WriteText(in world.RenderComponents, ov.DrawsText, span.Slice(0, n5));
 
-        // Row 4: Objects, Triangles, Frame Arena KB
+        // Row 6: Objects, Triangles, Frame Arena KB
         int objs = stats.MeshInstances + stats.SpriteInstances + stats.GlyphInstances + stats.ParticleInstances;
         int kb = (int)(stats.FrameArenaUsedBytes / 1024);
-        if (span.TryWrite($"OBJS: {objs}  |  TRIS: {stats.Triangles}  |  ARENA: {kb}KB", out int n4))
-            WriteText(in world.RenderComponents, ov.ObjectsText, span.Slice(0, n4));
+        if (span.TryWrite($"OBJS: {objs}  |  TRIS: {stats.Triangles}  |  ARENA: {kb}KB", out int n6))
+            WriteText(in world.RenderComponents, ov.ObjectsText, span.Slice(0, n6));
 
-        // Row 5: Top CPU scopes summary (zero allocation!)
+        // Row 7: Top Logic/CPU scopes summary (zero allocation!)
         int pos = 0;
         if (profiler.LastFrameScopes != null && profiler.LastFrameScopeCount > 0)
         {
             int shown = 0;
-            for (int i = 0; i < profiler.LastFrameScopeCount && shown < 4 && pos < 115; i++)
+            for (int i = 0; i < profiler.LastFrameScopeCount && shown < 4 && pos < 118; i++)
             {
                 ProfileScopeSample* sc = profiler.LastFrameScopes + i;
                 if (sc->Completed == 0) continue;
-                if (shown > 0 && pos + 2 < 128) { span[pos++] = ' '; span[pos++] = ' '; }
-                int nameChars = CopyUtf8ToChars(sc->Name.Data, sc->Name.Length, span.Slice(pos, Math.Min(10, 128 - pos)));
+                if (shown > 0 && pos + 2 < 130) { span[pos++] = ' '; span[pos++] = ' '; }
+                int nameChars = CopyUtf8ToChars(sc->Name.Data, sc->Name.Length, span.Slice(pos, Math.Min(8, 130 - pos)));
                 pos += nameChars;
                 if (span.Slice(pos).TryWrite($":{sc->DurationMs:F2}", out int written))
                     pos += written;
@@ -230,30 +297,15 @@ public static unsafe class ProfilerOverlaySystem
         }
         if (pos > 0)
             WriteText(in world.RenderComponents, ov.ScopesText, span.Slice(0, pos));
+    }
 
-        // Update CPU (cyan) & GPU (gold) visual frame-budget bars against target budget (default 16.67ms)
-        float budgetMs = pacer.TargetFps > 0 ? (1000f / pacer.TargetFps) : 16.6667f;
-        float trackW = ProfilerOverlay.PanelWidth - 24f;
-        float cpuW = DetMath.Clamp((float)(cpuMs / budgetMs) * trackW, 2f, trackW);
-        float gpuW = DetMath.Clamp((float)(gpuMs / budgetMs) * trackW, 2f, DetMath.Max(2f, trackW - cpuW));
-
-        GetPanelOrigin(ov.Anchor, screenWidth, screenHeight, out float px, out float py);
-        float barY = py + 12f;
-
-        SpriteData* cpuSp = RenderComponentSystem.TryGetSprite(in world.RenderComponents, ov.CpuBarSprite);
-        if (cpuSp != null)
-        {
-            cpuSp->Size = new Vec2(cpuW, 8f);
-            cpuSp->Color = cpuMs > budgetMs * 0.85 ? ColorF.Red : new ColorF(0.15f, 0.92f, 1.0f, 1.0f);
-        }
-
-        SpriteData* gpuSp = RenderComponentSystem.TryGetSprite(in world.RenderComponents, ov.GpuBarSprite);
-        if (gpuSp != null)
-        {
-            gpuSp->Size = new Vec2(gpuW, 8f);
-            gpuSp->Color = (cpuMs + gpuMs) > budgetMs ? new ColorF(1f, 0.35f, 0.2f, 1f) : ColorF.Gold;
-        }
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.GpuBarEntity, new Vec3(px + 12f + cpuW, barY, 0f));
+    private static void UpdateStageBar(in RenderComponentTables rc, SpriteHandle barHandle, double stageMs, float budgetMs, float trackW, ColorF normalColor)
+    {
+        SpriteData* sp = RenderComponentSystem.TryGetSprite(in rc, barHandle);
+        if (sp == null) return;
+        float fillW = DetMath.Clamp((float)(stageMs / budgetMs) * trackW, 3f, trackW);
+        sp->Size = new Vec2(fillW, ProfilerOverlay.BarHeight);
+        sp->Color = stageMs > budgetMs * 0.85 ? new ColorF(1.0f, 0.24f, 0.24f, 1.0f) : normalColor;
     }
 
     public static void Destroy(ref ProfilerOverlay ov, ref EngineWorld world)
@@ -262,12 +314,20 @@ public static unsafe class ProfilerOverlaySystem
         CameraSystem.Destroy(ref world.Cameras, ov.Camera);
         EngineWorldSystem.DestroyEntity(ref world, ov.BgEntity);
         EngineWorldSystem.DestroyEntity(ref world, ov.AccentEntity);
-        EngineWorldSystem.DestroyEntity(ref world, ov.BarTrackEntity);
-        EngineWorldSystem.DestroyEntity(ref world, ov.CpuBarEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.BorderBottomEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.BorderLeftEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.BorderRightEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.LogicTrackEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.LogicBarEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.RenderTrackEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.RenderBarEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.GpuTrackEntity);
         EngineWorldSystem.DestroyEntity(ref world, ov.GpuBarEntity);
         EngineWorldSystem.DestroyEntity(ref world, ov.HeaderEntity);
         EngineWorldSystem.DestroyEntity(ref world, ov.FpsEntity);
-        EngineWorldSystem.DestroyEntity(ref world, ov.TimingEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.LogicRowEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.RenderRowEntity);
+        EngineWorldSystem.DestroyEntity(ref world, ov.GpuRowEntity);
         EngineWorldSystem.DestroyEntity(ref world, ov.DrawsEntity);
         EngineWorldSystem.DestroyEntity(ref world, ov.ObjectsEntity);
         EngineWorldSystem.DestroyEntity(ref world, ov.ScopesEntity);
@@ -279,52 +339,75 @@ public static unsafe class ProfilerOverlaySystem
         ov.LastScreenW = screenW;
         ov.LastScreenH = screenH;
 
+        float uiH = ProfilerOverlay.VirtualHeight;
+        float aspect = (screenHeightValid(screenH)) ? (screenW / screenH) : (16f / 9f);
+        float uiW = uiH * aspect;
+
         CameraData* cam = CameraSystem.TryGetPtr(in world.Cameras, ov.Camera);
         if (cam != null)
         {
-            cam->OrthoHeight = screenH;
-            cam->Position = new Vec3(screenW * 0.5f, screenH * 0.5f, 10f);
-            cam->LookTarget = new Vec3(screenW * 0.5f, screenH * 0.5f, 0f);
+            cam->OrthoHeight = uiH;
+            cam->Position = new Vec3(uiW * 0.5f, uiH * 0.5f, 10f);
+            cam->LookTarget = new Vec3(uiW * 0.5f, uiH * 0.5f, 0f);
         }
 
-        GetPanelOrigin(ov.Anchor, screenW, screenH, out float px, out float py);
+        GetPanelOrigin(ov.Anchor, uiW, uiH, out float px, out float py);
         float topY = py + ProfilerOverlay.PanelHeight;
 
         TransformSystem.SetLocalPosition(ref world.Transforms, ov.BgEntity, new Vec3(px, py, -2f));
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.AccentEntity, new Vec3(px, topY - 3f, -1f));
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.BarTrackEntity, new Vec3(px + 12f, py + 12f, -1f));
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.CpuBarEntity, new Vec3(px + 12f, py + 12f, 0f));
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.GpuBarEntity, new Vec3(px + 20f, py + 12f, 0f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.AccentEntity, new Vec3(px, topY - 4f, -1f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.BorderBottomEntity, new Vec3(px, py, -1f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.BorderLeftEntity, new Vec3(px, py, -1f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.BorderRightEntity, new Vec3(px + ProfilerOverlay.PanelWidth - 2f, py, -1f));
 
         float xText = px + 14f;
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.HeaderEntity, new Vec3(xText, topY - 10f, 1f));
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.FpsEntity, new Vec3(xText, topY - 32f, 1f));
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.TimingEntity, new Vec3(xText, topY - 56f, 1f));
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.DrawsEntity, new Vec3(xText, topY - 78f, 1f));
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.ObjectsEntity, new Vec3(xText, topY - 100f, 1f));
-        TransformSystem.SetLocalPosition(ref world.Transforms, ov.ScopesEntity, new Vec3(xText, topY - 122f, 1f));
+        float xBar = px + ProfilerOverlay.BarOffsetX;
+
+        // Top header + FPS
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.HeaderEntity, new Vec3(xText, topY - 12f, 1f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.FpsEntity, new Vec3(xText, topY - 36f, 1f));
+
+        // 3 separate pipelined stage rows (label on left, independent fill bar on right)
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.LogicRowEntity, new Vec3(xText, topY - 68f, 1f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.LogicTrackEntity, new Vec3(xBar, topY - 84f, -0.5f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.LogicBarEntity, new Vec3(xBar, topY - 84f, 0f));
+
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.RenderRowEntity, new Vec3(xText, topY - 94f, 1f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.RenderTrackEntity, new Vec3(xBar, topY - 110f, -0.5f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.RenderBarEntity, new Vec3(xBar, topY - 110f, 0f));
+
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.GpuRowEntity, new Vec3(xText, topY - 120f, 1f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.GpuTrackEntity, new Vec3(xBar, topY - 136f, -0.5f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.GpuBarEntity, new Vec3(xBar, topY - 136f, 0f));
+
+        // Draw / SetPass / Objects / Scopes
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.DrawsEntity, new Vec3(xText, topY - 152f, 1f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.ObjectsEntity, new Vec3(xText, topY - 178f, 1f));
+        TransformSystem.SetLocalPosition(ref world.Transforms, ov.ScopesEntity, new Vec3(xText, topY - 204f, 1f));
     }
 
-    private static void GetPanelOrigin(ProfilerAnchor anchor, float screenW, float screenH, out float x, out float y)
+    private static bool screenHeightValid(float h) => h > 1f;
+
+    private static void GetPanelOrigin(ProfilerAnchor anchor, float uiW, float uiH, out float x, out float y)
     {
         float m = ProfilerOverlay.Margin;
         switch (anchor)
         {
             case ProfilerAnchor.TopLeft:
                 x = m;
-                y = screenH - ProfilerOverlay.PanelHeight - m;
+                y = uiH - ProfilerOverlay.PanelHeight - m;
                 break;
             case ProfilerAnchor.BottomLeft:
                 x = m;
                 y = m;
                 break;
             case ProfilerAnchor.BottomRight:
-                x = screenW - ProfilerOverlay.PanelWidth - m;
+                x = uiW - ProfilerOverlay.PanelWidth - m;
                 y = m;
                 break;
             default: // TopRight
-                x = screenW - ProfilerOverlay.PanelWidth - m;
-                y = screenH - ProfilerOverlay.PanelHeight - m;
+                x = uiW - ProfilerOverlay.PanelWidth - m;
+                y = uiH - ProfilerOverlay.PanelHeight - m;
                 break;
         }
     }
@@ -356,11 +439,13 @@ public static unsafe class ProfilerOverlaySystem
         TransformSystem.Add(ref world.Transforms, e, Vec3.Zero);
         var td = RenderComponentSystem.DefaultHudText(e, font, initial, SceneId.Invalid);
         td.FontScale = scale;
-        td.Color = color;
-        td.SecondaryColor = color;
-        td.OutlineWidth = 0.12f;
-        td.OutlineColor = new ColorF(0.02f, 0.03f, 0.06f, 0.95f);
-        td.ShadowOffset = new Vec2(1.2f, -1.2f);
+        td.Color = new ColorF(color.R, color.G, color.B, 1.0f);
+        td.SecondaryColor = new ColorF(color.R, color.G, color.B, 1.0f);
+        td.OutlineWidth = 0.06f;
+        td.OutlineColor = new ColorF(0.0f, 0.0f, 0.0f, 1.0f);
+        td.Softness = 0.01f;
+        td.ShadowColor = ColorF.Transparent; // Clean razor-sharp opaque glyphs without fuzzy shadow blur
+        td.ShadowOffset = Vec2.Zero;
         td.LayerMask = ProfilerOverlay.OverlayLayerMask;
         td.DepthTest = 0;
         handle = RenderComponentSystem.AddText(ref world.RenderComponents, in td);

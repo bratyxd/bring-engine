@@ -84,12 +84,14 @@ float4 PSMain(PSInput input) : SV_Target0
     float softness = max(input.StyleParams.z, 0.005);
     float glowIntensity = input.StyleParams.w;
 
-    // Screen-space derivative AA keeps SDF crisp at any 3D distance or zoom
-    float aa = max(fwidth(sdf) * 0.75, softness);
+    // Bounded screen-space derivative AA keeps SDF razor-sharp and 100% opaque even at small HUD sizes
+    float fw = fwidth(sdf);
+    float aa = clamp(fw * 0.55, softness, 0.14);
 
-    float fillAlpha = smoothstep(edge - aa, edge + aa, sdf);
-    float outlineEdge = max(0.05, edge - outlineW);
-    float outlineAlpha = outlineW > 0.001 ? smoothstep(outlineEdge - aa, outlineEdge + aa, sdf) : fillAlpha;
+    // Slight inner tightening ensures thin strokes reach full 1.0 alpha instead of looking translucent
+    float fillAlpha = smoothstep(edge - aa, edge + aa * 0.50, sdf);
+    float outlineEdge = max(0.04, edge - outlineW);
+    float outlineAlpha = outlineW > 0.001 ? smoothstep(outlineEdge - aa, outlineEdge + aa * 0.65, sdf) : fillAlpha;
 
     // Optional animated shine band across glyph
     float3 fillRgb = input.FillColor.rgb;

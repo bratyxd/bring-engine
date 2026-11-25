@@ -72,7 +72,7 @@ public static unsafe class GameAssets
         ref var arena = ref *ctx.BundleArena;
         ref var assets = ref ctx.World->Assets;
 
-        SdfFontLoader.BakeSdfFromSystemOrFile(null, ref arena, ref assets, ctx.Bundle, StringId.Hash("main_font"), pixelSize: 52f, atlasSize: 512, sdfPadding: 6);
+        SdfFontLoader.BakeSdfFromSystemOrFile(null, ref arena, ref assets, ctx.Bundle, StringId.Hash("main_font"), pixelSize: 64f, atlasSize: 1024, sdfPadding: 8);
         TextureLoader.CreateSolidColor(Color32.White, ref arena, ref assets, ctx.Bundle, StringId.Hash("white"));
         TextureLoader.CreateRadialGlow(64, ref arena, ref assets, ctx.Bundle, StringId.Hash("radial_glow"));
         TextureLoader.CreateArcadeSpriteSheet(64, ref arena, ref assets, ctx.Bundle, StringId.Hash("arcade_sheet"));

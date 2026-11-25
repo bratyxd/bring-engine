@@ -33,11 +33,13 @@ src/<YourGame>/
 6. **Custom Shaders + Tweens**:
    - Compile custom HLSL shaders via `ShaderSystem.CompileFromFile(...)` and attach to `MaterialAssetData.CustomShader`, `SpriteData.CustomShader`, `TextData.CustomShader`, or `ParticleEmitterData.CustomShader`.
    - Animate `MaterialAssetData.CustomParams` directly with `TweenSystem.TweenFloatPtr(ref world.Tweens, &mat->CustomParams.X, ...)`.
-7. **VSync, FPS Cap & Common Profiler UI (Standard in Every Game)**:
-   - Default to **VSync ON** and **60 FPS cap** via `FramePacer.CreateDefault()` + `FramePacerSystem.ApplyVSync(ref pacer, ref *gpu, true)`.
-   - Wire `FrameProfiler` (`FrameProfiler.Create(ref engAlloc.Persistent)`) and `ProfilerOverlaySystem.Create(ref world, mainFont, whiteTex, w, h)` so every game automatically gets the drop-in CPU ms, GPU ms, FPS, Draw Calls, SetPass Calls, and CPU scope overlay (persisting across all scenes!).
-   - Standard debug hotkeys: **`F1`** toggle Profiler UI, **`F2`** toggle VSync, **`F3`** cycle FPS cap (60/120/144/Max/30).
-   - See [`docs/agents/11-vsync-fps-cap-and-profiling.md`](../../docs/agents/11-vsync-fps-cap-and-profiling.md) for the exact per-frame loop ordering (`BeginFrame` -> scopes -> `RenderFrame(..., profiler)` -> `EndCpuWork` -> `EndFrameAndPace` -> `EndFrame`).
+7. **Borderless Full Window, 2-Thread Pipeline, VSync/FPS Cap & Common Profiler UI (Standard in Every Game)**:
+   - **Borderless Full Window by Default**: Always create interactive windows with `PlatformSystem.InitWindow(title, 1280, 720, hidden: false, mode: WindowMode.BorderlessFullscreen)` (already the default!). Support `--windowed` CLI flag and `F11` runtime toggle (`PlatformSystem.ToggleBorderlessFullscreen(ref window)`).
+   - **2-Thread Pipelined Loop (`EnginePipelineSystem`)**: Run Simulation + ViewSync + `StepCoreSystems` + `BatchRenderer.ExtractRenderPacket` on the dedicated Logic Thread while the Main/Render Thread concurrently submits the previous frame's immutable `RenderPacket` (`EnginePipelineSystem.StepPipelinedFrame`). Execute `SceneSystem.LoadScene` + `BatchRenderer.UploadPendingAssets` cleanly at the frame barrier after `EnginePipelineSystem.FlushBeforeSceneTransition`.
+   - **VSync ON + 60 FPS Cap**: Default via `FramePacer.CreateDefault()` + `FramePacerSystem.ApplyVSync(ref *pacer, ref *gpu, true)`.
+   - **Common Opaque Profiler Overlay**: Wire `FrameProfiler` and `ProfilerOverlaySystem.Create(ref *world, mainFont, whiteTex, w, h)` for automatic independent **CPU (Logic)**, **RND (Render)**, and **GPU** fill bars, FPS, Draw Calls, SetPass Calls, and named scopes (persists across all scenes!).
+   - **Standard Hotkeys**: **`F1`** toggle Profiler UI, **`F2`** toggle VSync, **`F3`** cycle FPS cap (60/120/144/Max/30), **`F11`** toggle Borderless Full Window / Windowed.
+   - See [`docs/agents/11-vsync-fps-cap-and-profiling.md`](../../docs/agents/11-vsync-fps-cap-and-profiling.md) for the exact 2-thread loop blueprint.
 8. **Always Verify Both Headless & NativeAOT**:
    ```bash
    dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64

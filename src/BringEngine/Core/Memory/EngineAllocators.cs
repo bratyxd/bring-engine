@@ -31,9 +31,11 @@ public struct MemoryTelemetry
 public unsafe struct EngineAllocators
 {
     public LinearArena Persistent;
-    public LinearArena Frame;
+    public LinearArena Frame;      // Current Logic-thread write frame arena
+    public LinearArena FrameBack;  // Previous frame's immutable read arena (for 2-thread Render pipeline)
     public LinearArena Scratch;
     public FreeListAllocator Dynamic;
+    public int FrameSwapCount;
 
     public static EngineAllocators Create(
         nuint persistentBytes = 16 * 1024 * 1024,
@@ -44,9 +46,11 @@ public unsafe struct EngineAllocators
         return new EngineAllocators
         {
             Persistent = LinearArena.Create(persistentBytes, StringId.Hash("Persistent").Value),
-            Frame = LinearArena.Create(frameBytes, StringId.Hash("Frame").Value),
+            Frame = LinearArena.Create(frameBytes, StringId.Hash("FrameA").Value),
+            FrameBack = LinearArena.Create(frameBytes, StringId.Hash("FrameB").Value),
             Scratch = LinearArena.Create(scratchBytes, StringId.Hash("Scratch").Value),
             Dynamic = FreeListAllocator.Create(dynamicBytes),
+            FrameSwapCount = 0,
         };
     }
 
@@ -54,6 +58,20 @@ public unsafe struct EngineAllocators
     public void BeginFrame()
     {
         Frame.Reset();
+    }
+
+    /// <summary>
+    /// Swaps double-buffered Frame <-> FrameBack arenas at the 2-thread pipeline barrier and resets the new write arena in O(1).
+    /// Logic Thread writes into Frame while Render Thread reads immutable RenderPacket data from FrameBack with zero locks.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SwapFrameArenas()
+    {
+        LinearArena prevWrite = Frame;
+        Frame = FrameBack;
+        FrameBack = prevWrite;
+        Frame.Reset();
+        FrameSwapCount++;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -67,7 +85,7 @@ public unsafe struct EngineAllocators
         PersistentUsed = Persistent.Offset,
         PersistentCapacity = Persistent.Capacity,
         FrameUsed = Frame.Offset,
-        FramePeak = Frame.PeakOffset,
+        FramePeak = Frame.PeakOffset > FrameBack.PeakOffset ? Frame.PeakOffset : FrameBack.PeakOffset,
         FrameCapacity = Frame.Capacity,
         ScratchUsed = Scratch.Offset,
         ScratchPeak = Scratch.PeakOffset,
@@ -82,6 +100,7 @@ public unsafe struct EngineAllocators
     {
         Dynamic.Dispose();
         Scratch.Dispose();
+        FrameBack.Dispose();
         Frame.Dispose();
         Persistent.Dispose();
     }

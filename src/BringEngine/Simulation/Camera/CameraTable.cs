@@ -183,7 +183,7 @@ public static unsafe class CameraSystem
             Handle = handle,
             OwnerScene = ownerScene,
             Projection = CameraProjection.Orthographic,
-            ClearFlags = CameraClearFlags.DepthOnly,
+            ClearFlags = CameraClearFlags.None, // 2D UI overlays draw with DepthTest=0 and must not clear 3D depth mid-frame
             Mode = CameraMode.Manual,
             Enabled = 1,
             FovYDeg = 60f,

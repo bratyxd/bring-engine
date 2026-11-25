@@ -86,13 +86,13 @@ public static unsafe class GameViewSystems
         var titleEnt = EntitySystem.Spawn(ref w.Entities, sc);
         TransformSystem.Add(ref w.Transforms, titleEnt, new Vec3(0, 4.35f, 0));
         var titleTd = RenderComponentSystem.DefaultWorldText(titleEnt, font, "BRING ARENA", sc);
-        titleTd.FontScale = 0.032f;
+        titleTd.FontScale = 0.026f;
         titleTd.Color = ColorF.Cyan;
         titleTd.SecondaryColor = ColorF.Gold;
         titleTd.OutlineColor = new ColorF(0.05f, 0.04f, 0.14f, 1f);
-        titleTd.OutlineWidth = 0.15f;
+        titleTd.OutlineWidth = 0.14f;
         titleTd.GlowColor = ColorF.Cyan;
-        titleTd.GlowIntensity = 1.15f;
+        titleTd.GlowIntensity = 1.10f;
         titleTd.AnimFlags = TextAnimFlags.Wave | TextAnimFlags.Rainbow | TextAnimFlags.GlowPulse | TextAnimFlags.ShineSweep;
         titleTd.AnimAmplitude = 0.16f;
         RenderComponentSystem.AddText(ref w.RenderComponents, in titleTd);
@@ -101,10 +101,10 @@ public static unsafe class GameViewSystems
         var subEnt = EntitySystem.Spawn(ref w.Entities, sc);
         TransformSystem.Add(ref w.Transforms, subEnt, new Vec3(0, 3.05f, 1.2f));
         var subTd = RenderComponentSystem.DefaultWorldText(subEnt, font, "PRESS ENTER OR SPACE TO PLAY", sc);
-        subTd.FontScale = 0.015f;
+        subTd.FontScale = 0.0125f;
         subTd.Color = ColorF.Gold;
         subTd.SecondaryColor = ColorF.White;
-        subTd.OutlineWidth = 0.14f;
+        subTd.OutlineWidth = 0.13f;
         subTd.GlowColor = ColorF.Gold;
         subTd.GlowIntensity = 0.7f;
         subTd.AnimFlags = TextAnimFlags.Bounce | TextAnimFlags.Typewriter | TextAnimFlags.GlowPulse;
@@ -544,32 +544,48 @@ public static unsafe class GameViewSystems
         var scoreEnt = EntitySystem.Spawn(ref w.Entities, sc);
         TransformSystem.Add(ref w.Transforms, scoreEnt, new Vec3(24f, 696f, 0f));
         var scoreTd = RenderComponentSystem.DefaultHudText(scoreEnt, font, "SCORE: 0   WAVE: 1   COMBO x1", sc);
-        scoreTd.FontScale = 0.62f;
+        scoreTd.FontScale = 0.52f;
         scoreTd.Color = ColorF.Gold;
         scoreTd.SecondaryColor = ColorF.White;
-        scoreTd.OutlineWidth = 0.15f;
+        scoreTd.OutlineWidth = 0.12f;
+        scoreTd.OutlineColor = new ColorF(0f, 0f, 0f, 1f);
         scoreTd.GlowColor = ColorF.Gold;
-        scoreTd.GlowIntensity = 0.55f;
+        scoreTd.GlowIntensity = 0.45f;
         scoreTd.AnimFlags = TextAnimFlags.GlowPulse | TextAnimFlags.ShineSweep;
         v->HudScoreText = RenderComponentSystem.AddText(ref w.RenderComponents, in scoreTd);
 
-        // Bottom-left Controls hint (Top-Right is occupied by Bring Engine's common ProfilerOverlay!)
+        // Bottom-left Controls hint with opaque dark backing strip (Top-Right is Bring Engine's common ProfilerOverlay!)
+        var ctrlBgEnt = EntitySystem.Spawn(ref w.Entities, sc);
+        TransformSystem.Add(ref w.Transforms, ctrlBgEnt, new Vec3(14f, 10f, -1f));
+        RenderComponentSystem.AddSprite(ref w.RenderComponents, new SpriteData
+        {
+            Entity = ctrlBgEnt, OwnerScene = sc, Texture = white,
+            Size = new Vec2(820f, 34f), Pivot = Vec2.Zero,
+            Color = new ColorF(0.04f, 0.06f, 0.11f, 0.96f),
+            LayerMask = 1u << 31, SortingLayer = 0, OrderInLayer = 0, DepthTest = 0, Visible = 1,
+        });
+
         var ctrlEnt = EntitySystem.Spawn(ref w.Entities, sc);
-        TransformSystem.Add(ref w.Transforms, ctrlEnt, new Vec3(24f, 34f, 0f));
-        var ctrlTd = RenderComponentSystem.DefaultHudText(ctrlEnt, font, "WASD Move | SPACE Dash | F1 Profiler | F2 VSync | F3 FPS Cap | 1 Title | ESC Quit", sc);
-        ctrlTd.FontScale = 0.36f;
-        ctrlTd.Color = new ColorF(0.75f, 0.85f, 0.98f, 0.92f);
+        TransformSystem.Add(ref w.Transforms, ctrlEnt, new Vec3(24f, 36f, 0f));
+        var ctrlTd = RenderComponentSystem.DefaultHudText(ctrlEnt, font, "WASD Move | SPACE Dash | F1 Profiler | F2 VSync | F3 Cap | F11 Fullscreen | 1 Title | ESC Quit", sc);
+        ctrlTd.FontScale = 0.34f;
+        ctrlTd.Color = ColorF.White;
+        ctrlTd.SecondaryColor = ColorF.White;
+        ctrlTd.OutlineWidth = 0.07f;
+        ctrlTd.OutlineColor = new ColorF(0f, 0f, 0f, 1f);
+        ctrlTd.ShadowColor = ColorF.Transparent;
+        ctrlTd.ShadowOffset = Vec2.Zero;
         v->HudControlsText = RenderComponentSystem.AddText(ref w.RenderComponents, in ctrlTd);
 
-        // 2D HUD HP Bar background & fill sprites
+        // 2D HUD HP Bar background & fill sprites (distinct OrderInLayer!)
         var bgEnt = EntitySystem.Spawn(ref w.Entities, sc);
         TransformSystem.Add(ref w.Transforms, bgEnt, new Vec3(24f, 626f, -1f));
         RenderComponentSystem.AddSprite(ref w.RenderComponents, new SpriteData
         {
             Entity = bgEnt, OwnerScene = sc, Texture = white,
             Size = new Vec2(248f, 22f), Pivot = Vec2.Zero,
-            Color = new ColorF(0.08f, 0.10f, 0.18f, 0.85f),
-            LayerMask = 1u << 31, SortingLayer = 0, OrderInLayer = 0, DepthTest = 0, Visible = 1,
+            Color = new ColorF(0.05f, 0.07f, 0.13f, 1.0f),
+            LayerMask = 1u << 31, SortingLayer = 0, OrderInLayer = 1, DepthTest = 0, Visible = 1,
         });
 
         v->HudHpFillEntity = EntitySystem.Spawn(ref w.Entities, sc);
@@ -579,7 +595,7 @@ public static unsafe class GameViewSystems
             Entity = v->HudHpFillEntity, OwnerScene = sc, Texture = white,
             Size = new Vec2(240f, 14f), Pivot = Vec2.Zero,
             Color = ColorF.Cyan,
-            LayerMask = 1u << 31, SortingLayer = 0, OrderInLayer = 1, DepthTest = 0, Visible = 1,
+            LayerMask = 1u << 31, SortingLayer = 0, OrderInLayer = 2, DepthTest = 0, Visible = 1,
         });
     }
 
@@ -652,7 +668,7 @@ public static unsafe class GameViewSystems
         TransformSystem.Add(ref w.Transforms, e, pos);
 
         var td = RenderComponentSystem.DefaultWorldText(e, font, text, sc);
-        td.FontScale = 0.017f;
+        td.FontScale = 0.014f;
         td.Color = color;
         td.SecondaryColor = ColorF.White;
         td.OutlineWidth = 0.16f;

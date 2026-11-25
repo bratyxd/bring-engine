@@ -17,82 +17,25 @@ using SDL3;
 
 namespace BringEngine.Rendering;
 
-[StructLayout(LayoutKind.Sequential)]
-internal struct Instance3DGpu
-{
-    public Mat4 Model;
-    public ColorF BaseColor;
-    public Vec4 EmissiveRough; // xyz = emissive, w = roughness
-    public Vec4 Extra;         // x = metallic, y = alphaCutoff, z = jointOffset (<0 static), w = pad
-    public Vec4 CustomParams;
-}
-
-[StructLayout(LayoutKind.Sequential)]
-internal struct FrameUniformsGpu
-{
-    public Mat4 ViewProj;
-    public Vec4 CameraPosTime;
-    public Vec4 SunDirIntensity;
-    public ColorF SunColor;
-    public ColorF AmbientSky;
-    public ColorF AmbientGround;
-    public Vec4 FogColorDensity;
-    public Vec4 PointLightPos0, PointLightPos1, PointLightPos2, PointLightPos3;
-    public Vec4 PointLightColor0, PointLightColor1, PointLightColor2, PointLightColor3;
-}
-
-[StructLayout(LayoutKind.Sequential)]
-internal struct SpriteGpuInstance
-{
-    public Mat4 Model;
-    public Vec4 UvRect;
-    public ColorF Color;
-    public Vec4 CustomParams; // x = alphaCutoff, y = hitFlash, z = time, w = pad
-}
-
-[StructLayout(LayoutKind.Sequential)]
-internal struct ParticleGpuInstance
-{
-    public Vec4 PosSize;
-    public ColorF Color;
-    public Vec4 UvRect;
-    public Vec4 RotExtra;
-}
-
-[StructLayout(LayoutKind.Sequential)]
-internal struct SimpleCameraUniformsGpu
-{
-    public Mat4 ViewProj;
-    public Vec4 CameraPosTime;
-}
-
-[StructLayout(LayoutKind.Sequential)]
-internal struct ParticleCameraUniformsGpu
-{
-    public Mat4 ViewProj;
-    public Vec4 CameraRightTime;
-    public Vec4 CameraUpPad;
-}
-
-[StructLayout(LayoutKind.Sequential)]
-internal struct BatchUniformsGpu
-{
-    public uint BaseInstance;
-    public uint P1, P2, P3;
-}
-
 /// <summary>
 /// High-performance, cache-friendly SDL3_gpu Multi-Camera Instanced Batch Renderer.
-/// - Frustum-culls 3D meshes on CPU.
-/// - Sorts & batches 3D meshes (instanced + skeletal skinning), 2D sprites in 3D, SDF text glyphs, and SoA particles in FrameArena.
-/// - Issues ONE SDL_GPUCopyPass per frame before RenderPasses (zero pass interleaving).
-/// - Deduplicates GPU pipeline/mesh/texture binds across batches.
+/// Split cleanly into two pipelined phases for 2-thread execution:
+/// 1. ExtractRenderPacket (Logic Thread / pure CPU, ZERO SDL/GPU calls):
+///    Frustum-culls 3D meshes, deterministically sorts & batches 3D meshes, 2D sprites in 3D/HUD,
+///    SDF text glyphs, SoA particles, and skeletal joint palettes into an immutable RenderPacket in FrameArena.
+/// 2. SubmitRenderPacket (Main / Render Thread ONLY):
+///    Uploads all dynamic buffers in ONE SDL_GPUCopyPass (cycle: true), cycles depth target cleanly
+///    on first clear pass, binds pipelines BEFORE storage buffers/resources, deduplicates GPU state binds,
+///    and optionally measures real GPU execution time via SDL3_gpu fence.
 /// </summary>
 public static unsafe class BatchRenderer
 {
+    private static readonly double s_ticksToMs = 1000.0 / Stopwatch.Frequency;
+
     private struct Draw3DSortItem
     {
         public ulong SortKey;
+        public int OriginalIndex;
         public int MeshGpuSlot;
         public int TextureGpuSlot;
         public ShaderHandle Shader;
@@ -100,19 +43,10 @@ public static unsafe class BatchRenderer
         public Instance3DGpu Instance;
     }
 
-    private struct Batch3DCmd
-    {
-        public int MeshGpuSlot;
-        public int TextureGpuSlot;
-        public ShaderHandle Shader;
-        public MaterialAlphaMode AlphaMode;
-        public uint BaseInstance;
-        public uint InstanceCount;
-    }
-
     private struct SpriteSortItem
     {
         public ulong SortKey;
+        public int OriginalIndex;
         public int TextureGpuSlot;
         public ShaderHandle Shader;
         public SpriteBlendMode BlendMode;
@@ -120,69 +54,155 @@ public static unsafe class BatchRenderer
         public SpriteGpuInstance Instance;
     }
 
-    private struct SpriteBatchCmd
+    /// <summary>
+    /// Uploads any newly loaded meshes & textures to GPU VRAM.
+    /// Must be called on the Main / Render Thread (at startup, after SceneSystem.LoadScene, or in single-threaded RenderFrame).
+    /// </summary>
+    public static void UploadPendingAssets(ref GpuContext gpu, ref EngineWorld world)
     {
-        public int TextureGpuSlot;
-        public ShaderHandle Shader;
-        public SpriteBlendMode BlendMode;
-        public byte DepthTest;
-        public uint BaseInstance;
-        public uint InstanceCount;
-    }
-
-    private struct TextBatchCmd
-    {
-        public int AtlasTexGpuSlot;
-        public ShaderHandle Shader;
-        public byte DepthTest;
-        public uint BaseInstance;
-        public uint InstanceCount;
-    }
-
-    private struct ParticleBatchCmd
-    {
-        public int TextureGpuSlot;
-        public ShaderHandle Shader;
-        public ParticleBlendMode BlendMode;
-        public uint BaseInstance;
-        public uint InstanceCount;
-    }
-
-    private struct CameraRenderSlice
-    {
-        public CameraHandle Camera;
-        public int Batch3DStart, Batch3DCount;
-        public int SpriteBatchStart, SpriteBatchCount;
-        public int TextBatchStart, TextBatchCount;
-        public int ParticleBatchStart, ParticleBatchCount;
+        if (gpu.Initialized == 0) return;
+        for (int i = 0; i < world.Assets.MaxMeshes; i++)
+        {
+            if (world.Assets.MeshAlive[i] != 0 && world.Assets.Meshes[i].GpuSlot < 0)
+                GpuSystem.EnsureMeshUploaded(ref gpu, ref world.Assets.Meshes[i]);
+        }
+        for (int i = 0; i < world.Assets.MaxTextures; i++)
+        {
+            if (world.Assets.TextureAlive[i] != 0 && world.Assets.Textures[i].GpuSlot < 0)
+                GpuSystem.EnsureTextureUploaded(ref gpu, ref world.Assets.Textures[i]);
+        }
     }
 
     /// <summary>
-    /// Renders all active cameras in DepthOrder to the swapchain (and optionally to CaptureColorTexture for PNG export).
-    /// Pass a FrameProfiler* to measure RenderGather / GpuUpload / GpuEncode CPU scopes and real GPU fence execution time (ms).
+    /// Phase 1 (Logic Thread — pure CPU, ZERO SDL/GPU calls, ZERO GC allocations):
+    /// Frustum-culls, deterministically sorts, lays out SDF text, and packs all cameras into a
+    /// self-contained immutable RenderPacket backed by packetArena (EngineAllocators.Frame).
     /// </summary>
-    public static void RenderFrame(
-        ref GpuContext gpu,
-        ref EngineWorld world,
-        ref EngineAllocators alloc,
+    public static void ExtractRenderPacket(
+        in RenderShaderDefaults shaders,
+        in EngineWorld world,
         in SceneLighting lighting,
-        bool captureToOffscreen = false,
+        ref LinearArena packetArena,
+        ref LinearArena scratchArena,
+        out RenderPacket packet,
         FrameProfiler* profiler = null)
     {
-        if (gpu.Initialized == 0) return;
+        int extractScope = profiler != null ? ProfilerSystem.BeginScope(ref *profiler, "Extract") : -1;
 
-        int gatherScope = profiler != null ? ProfilerSystem.BeginScope(ref *profiler, "RenderGather") : -1;
-
-        // 1. Ensure newly loaded assets are uploaded to GPU
-        UploadPendingAssets(ref gpu, ref world);
-
-        // 2. Acquire command buffer and render target (swapchain or offscreen capture)
-        nint cmd = SDL.AcquireGPUCommandBuffer(gpu.Device);
-        if (cmd == nint.Zero)
+        packet = new RenderPacket
         {
-            if (gatherScope >= 0) ProfilerSystem.EndScope(ref *profiler, gatherScope);
+            WorldTotalTime = world.TotalTime,
+            Lighting = lighting,
+            Valid = 1,
+        };
+
+        RenderStats stats = default;
+        var sortedCameras = CameraSystem.GetSortedActiveCameras(in world.Cameras, ref packetArena);
+        int camCount = sortedCameras.Length;
+
+        if (camCount == 0)
+        {
+            packet.PacketArenaUsedBytes = packetArena.Offset;
+            packet.ExtractedStats = stats;
+            if (extractScope >= 0) ProfilerSystem.EndScope(ref *profiler, extractScope);
             return;
         }
+
+        int cap3D = Math.Clamp(world.RenderComponents.MeshRendererCount * camCount, 64, 16384);
+        int capSprites = Math.Clamp(world.RenderComponents.SpriteCount * camCount, 64, 8192);
+        int capGlyphs = Math.Clamp(world.RenderComponents.TextCount * 192 * camCount, 128, 16384);
+        int capParticles = Math.Clamp(world.Particles.ParticleCount * camCount, 64, 16384);
+
+        var camSnapshots = packetArena.AllocSlice<RenderCameraSnapshot>(camCount);
+        var allInstances3D = NativeList<Instance3DGpu>.CreateInArena(ref packetArena, cap3D, 64);
+        var allBatches3D = NativeList<Batch3DCmd>.CreateInArena(ref packetArena, Math.Min(cap3D, 4096), 16);
+        var allSprites = NativeList<SpriteGpuInstance>.CreateInArena(ref packetArena, capSprites, 64);
+        var allSpriteBatches = NativeList<SpriteBatchCmd>.CreateInArena(ref packetArena, Math.Min(capSprites, 2048), 16);
+        var allGlyphs = NativeList<GlyphGpuInstance>.CreateInArena(ref packetArena, capGlyphs, 64);
+        var allTextBatches = NativeList<TextBatchCmd>.CreateInArena(ref packetArena, Math.Max(64, world.RenderComponents.TextCount * camCount), 16);
+        var allParticles = NativeList<ParticleGpuInstance>.CreateInArena(ref packetArena, capParticles, 64);
+        var allParticleBatches = NativeList<ParticleBatchCmd>.CreateInArena(ref packetArena, Math.Max(64, world.Particles.ActiveEmitters * camCount), 16);
+
+        // Snapshot skeletal joint palette into packetArena so Render Thread never aliases Logic Thread's animation buffer
+        NativeSlice<Mat4> jointCopy = default;
+        int jointLen = world.Animations.FrameJointPalette.Length;
+        if (jointLen > 0 && world.Animations.FrameJointPalette.Ptr != null)
+        {
+            jointCopy = packetArena.AllocSlice<Mat4>(jointLen, 64, zeroed: false);
+            nuint jBytes = (nuint)(jointLen * sizeof(Mat4));
+            Buffer.MemoryCopy(world.Animations.FrameJointPalette.Ptr, jointCopy.Ptr, jBytes, jBytes);
+        }
+
+        for (int ci = 0; ci < camCount; ci++)
+        {
+            CameraData* camPtr = CameraSystem.TryGetPtr(in world.Cameras, sortedCameras[ci]);
+            if (camPtr == null) continue;
+            ref CameraData cam = ref *camPtr;
+
+            ref RenderCameraSnapshot snap = ref camSnapshots[ci];
+            snap.ViewportRect = cam.ViewportRect;
+            snap.ClearColor = cam.ClearColor;
+            snap.ClearFlags = cam.ClearFlags;
+            snap.ShakenPosition = cam.ShakenPosition;
+            snap.Right = cam.Right;
+            snap.CameraUp = cam.CameraUp;
+            snap.ViewProjMatrix = cam.ViewProjMatrix;
+
+            // 1A. Gather & Batch 3D Meshes
+            snap.Batch3DStart = allBatches3D.Count;
+            GatherAndBatch3D(in shaders, in world, in cam, ref scratchArena, ref allInstances3D, ref allBatches3D, ref stats);
+            snap.Batch3DCount = allBatches3D.Count - snap.Batch3DStart;
+
+            // 1B. Gather & Batch 2D Sprites in 3D/HUD
+            snap.SpriteBatchStart = allSpriteBatches.Count;
+            GatherAndBatchSprites(in shaders, in world, in cam, ref scratchArena, ref allSprites, ref allSpriteBatches, ref stats);
+            snap.SpriteBatchCount = allSpriteBatches.Count - snap.SpriteBatchStart;
+
+            // 1C. Gather, Layout & Batch Advanced SDF Text
+            snap.TextBatchStart = allTextBatches.Count;
+            GatherAndBatchText(in shaders, in world, in cam, ref scratchArena, ref allGlyphs, ref allTextBatches, ref stats);
+            snap.TextBatchCount = allTextBatches.Count - snap.TextBatchStart;
+
+            // 1D. Gather & Batch SoA Particles
+            snap.ParticleBatchStart = allParticleBatches.Count;
+            GatherAndBatchParticles(in shaders, in world, in cam, ref allParticles, ref allParticleBatches, ref stats);
+            snap.ParticleBatchCount = allParticleBatches.Count - snap.ParticleBatchStart;
+        }
+
+        packet.Cameras = camSnapshots;
+        packet.Instances3D = allInstances3D;
+        packet.Batches3D = allBatches3D;
+        packet.JointPalette = jointCopy;
+        packet.Sprites = allSprites;
+        packet.SpriteBatches = allSpriteBatches;
+        packet.Glyphs = allGlyphs;
+        packet.TextBatches = allTextBatches;
+        packet.Particles = allParticles;
+        packet.ParticleBatches = allParticleBatches;
+        packet.ExtractedStats = stats;
+        packet.PacketArenaUsedBytes = packetArena.Offset;
+
+        if (extractScope >= 0) ProfilerSystem.EndScope(ref *profiler, extractScope);
+    }
+
+    /// <summary>
+    /// Phase 2 (Main / Render Thread ONLY):
+    /// Consumes an immutable RenderPacket (zero reads from EngineWorld!), uploads dynamic buffers in ONE CopyPass,
+    /// records state-deduplicated multi-camera RenderPasses with proper depth target cycling & pipeline-first binds,
+    /// submits to SDL3_gpu, and returns exact Render Thread CPU & GPU timings.
+    /// </summary>
+    public static RenderSubmitTimings SubmitRenderPacket(
+        ref GpuContext gpu,
+        in RenderPacket packet,
+        bool captureToOffscreen = false,
+        bool measureGpuWithFence = true)
+    {
+        RenderSubmitTimings timings = default;
+        if (gpu.Initialized == 0 || packet.Valid == 0) return timings;
+
+        // 1. Acquire command buffer and render target (swapchain wait happens BEFORE Render CPU timer so VSync wait is excluded!)
+        nint cmd = SDL.AcquireGPUCommandBuffer(gpu.Device);
+        if (cmd == nint.Zero) return timings;
 
         nint colorTarget;
         uint targetW, targetH;
@@ -199,106 +219,58 @@ public static unsafe class BatchRenderer
             if (!SDL.WaitAndAcquireGPUSwapchainTexture(cmd, gpu.Window, out colorTarget, out targetW, out targetH) || colorTarget == nint.Zero)
             {
                 SDL.SubmitGPUCommandBuffer(cmd);
-                if (gatherScope >= 0) ProfilerSystem.EndScope(ref *profiler, gatherScope);
-                return;
+                return timings;
             }
         }
 
+        long renderCpuStart = Stopwatch.GetTimestamp();
         GpuSystem.EnsureDepthTexture(ref gpu, targetW, targetH);
 
-        // 3. Gather, frustum-cull, sort, and batch ALL cameras into FrameArena (ZERO GC allocations)
-        RenderStats stats = default;
-        var sortedCameras = CameraSystem.GetSortedActiveCameras(in world.Cameras, ref alloc.Frame);
-        if (sortedCameras.Length == 0)
+        RenderStats stats = packet.ExtractedStats;
+        stats.FrameArenaUsedBytes = packet.PacketArenaUsedBytes;
+
+        if (packet.Cameras.Length == 0)
         {
-            // Clear screen even if no camera exists
             var ct = new SDL.GPUColorTargetInfo
             {
                 Texture = colorTarget,
                 ClearColor = new SDL.FColor { R = 0.05f, G = 0.07f, B = 0.12f, A = 1f },
                 LoadOp = SDL.GPULoadOp.Clear,
                 StoreOp = SDL.GPUStoreOp.Store,
+                Cycle = captureToOffscreen,
             };
             nint rp = SDL.BeginGPURenderPass(cmd, (nint)(&ct), 1, nint.Zero);
             SDL.EndGPURenderPass(rp);
+            stats.RenderPasses = 1;
+            timings.TotalRenderCpuMs = (Stopwatch.GetTimestamp() - renderCpuStart) * s_ticksToMs;
             SDL.SubmitGPUCommandBuffer(cmd);
-            if (gatherScope >= 0) ProfilerSystem.EndScope(ref *profiler, gatherScope);
-            return;
+            gpu.LastFrameStats = stats;
+            return timings;
         }
 
-        int camCount = sortedCameras.Length;
-        int cap3D = Math.Clamp(world.RenderComponents.MeshRendererCount * camCount, 64, 16384);
-        int capSprites = Math.Clamp(world.RenderComponents.SpriteCount * camCount, 64, 8192);
-        int capGlyphs = Math.Clamp(world.RenderComponents.TextCount * 160 * camCount, 128, 16384);
-        int capParticles = Math.Clamp(world.Particles.ParticleCount * camCount, 64, 16384);
-
-        var camSlices = alloc.Frame.AllocSlice<CameraRenderSlice>(camCount);
-        var allInstances3D = NativeList<Instance3DGpu>.CreateInArena(ref alloc.Frame, cap3D, 64);
-        var allBatches3D = NativeList<Batch3DCmd>.CreateInArena(ref alloc.Frame, Math.Min(cap3D, 4096), 16);
-        var allSprites = NativeList<SpriteGpuInstance>.CreateInArena(ref alloc.Frame, capSprites, 64);
-        var allSpriteBatches = NativeList<SpriteBatchCmd>.CreateInArena(ref alloc.Frame, Math.Min(capSprites, 2048), 16);
-        var allGlyphs = NativeList<GlyphGpuInstance>.CreateInArena(ref alloc.Frame, capGlyphs, 64);
-        var allTextBatches = NativeList<TextBatchCmd>.CreateInArena(ref alloc.Frame, Math.Max(64, world.RenderComponents.TextCount * camCount), 16);
-        var allParticles = NativeList<ParticleGpuInstance>.CreateInArena(ref alloc.Frame, capParticles, 64);
-        var allParticleBatches = NativeList<ParticleBatchCmd>.CreateInArena(ref alloc.Frame, Math.Max(64, world.Particles.ActiveEmitters * camCount), 16);
-
-        for (int ci = 0; ci < sortedCameras.Length; ci++)
-        {
-            CameraData* camPtr = CameraSystem.TryGetPtr(in world.Cameras, sortedCameras[ci]);
-            if (camPtr == null) continue;
-            ref CameraData cam = ref *camPtr;
-
-            ref CameraRenderSlice slice = ref camSlices[ci];
-            slice.Camera = cam.Handle;
-
-            // --- 3A. Gather & Batch 3D Meshes ---
-            slice.Batch3DStart = allBatches3D.Count;
-            GatherAndBatch3D(in gpu, in world, in cam, ref alloc.Frame, ref allInstances3D, ref allBatches3D, ref stats);
-            slice.Batch3DCount = allBatches3D.Count - slice.Batch3DStart;
-
-            // --- 3B. Gather & Batch 2D Sprites in 3D/HUD ---
-            slice.SpriteBatchStart = allSpriteBatches.Count;
-            GatherAndBatchSprites(in gpu, in world, in cam, ref alloc.Frame, ref allSprites, ref allSpriteBatches, ref stats);
-            slice.SpriteBatchCount = allSpriteBatches.Count - slice.SpriteBatchStart;
-
-            // --- 3C. Gather, Layout & Batch Advanced SDF Text ---
-            slice.TextBatchStart = allTextBatches.Count;
-            GatherAndBatchText(in gpu, in world, in cam, ref alloc.Scratch, ref allGlyphs, ref allTextBatches, ref stats);
-            slice.TextBatchCount = allTextBatches.Count - slice.TextBatchStart;
-
-            // --- 3D. Gather & Batch SoA Particles ---
-            slice.ParticleBatchStart = allParticleBatches.Count;
-            GatherAndBatchParticles(in gpu, in world, in cam, ref allParticles, ref allParticleBatches, ref stats);
-            slice.ParticleBatchCount = allParticleBatches.Count - slice.ParticleBatchStart;
-        }
-
-        if (gatherScope >= 0) ProfilerSystem.EndScope(ref *profiler, gatherScope);
-
-        // 4. SINGLE SDL_GPUCopyPass uploading ALL dynamic buffers for the whole frame!
-        int uploadScope = profiler != null ? ProfilerSystem.BeginScope(ref *profiler, "GpuUpload") : -1;
+        // 2. SINGLE SDL_GPUCopyPass uploading ALL dynamic buffers for the whole frame (cycle: true)!
+        long uploadStart = Stopwatch.GetTimestamp();
         if (UploadFrameBuffersInSingleCopyPass(
             ref gpu, cmd,
-            in allInstances3D,
-            in world.Animations.FrameJointPalette,
-            in allSprites,
-            in allGlyphs,
-            in allParticles))
+            in packet.Instances3D,
+            in packet.JointPalette,
+            in packet.Sprites,
+            in packet.Glyphs,
+            in packet.Particles))
         {
             stats.CopyPasses++;
         }
-        if (uploadScope >= 0) ProfilerSystem.EndScope(ref *profiler, uploadScope);
+        long uploadEnd = Stopwatch.GetTimestamp();
+        timings.UploadMs = (uploadEnd - uploadStart) * s_ticksToMs;
 
-        // 5. Execute RenderPass per active camera in DepthOrder (with GPU state deduplication)
-        int encodeScope = profiler != null ? ProfilerSystem.BeginScope(ref *profiler, "GpuEncode") : -1;
-        nint* vStorage = stackalloc nint[2] { gpu.Instance3DBuffer, gpu.JointPaletteBuffer };
+        // 3. Execute RenderPass per camera in DepthOrder (pipeline bound BEFORE storage/texture resources!)
+        long encodeStart = uploadEnd;
+        nint* vStorage3D = stackalloc nint[2] { gpu.Instance3DBuffer, gpu.JointPaletteBuffer };
         nint quadIndexBuf = gpu.QuadIndexBuffer;
 
-        for (int ci = 0; ci < sortedCameras.Length; ci++)
+        for (int ci = 0; ci < packet.Cameras.Length; ci++)
         {
-            CameraData* camPtr = CameraSystem.TryGetPtr(in world.Cameras, camSlices[ci].Camera);
-            if (camPtr == null) continue;
-            ref CameraData cam = ref *camPtr;
-            ref CameraRenderSlice slice = ref camSlices[ci];
+            ref readonly RenderCameraSnapshot cam = ref packet.Cameras[ci];
 
             SDL.GPULoadOp colorLoad = (ci == 0 || cam.ClearFlags == CameraClearFlags.SolidColor)
                 ? SDL.GPULoadOp.Clear : SDL.GPULoadOp.Load;
@@ -311,6 +283,7 @@ public static unsafe class BatchRenderer
                 ClearColor = new SDL.FColor { R = cam.ClearColor.R, G = cam.ClearColor.G, B = cam.ClearColor.B, A = cam.ClearColor.A },
                 LoadOp = colorLoad,
                 StoreOp = SDL.GPUStoreOp.Store,
+                Cycle = captureToOffscreen && (ci == 0) && (colorLoad == SDL.GPULoadOp.Clear),
             };
             var depthInfo = new SDL.GPUDepthStencilTargetInfo
             {
@@ -320,6 +293,8 @@ public static unsafe class BatchRenderer
                 StoreOp = SDL.GPUStoreOp.Store,
                 StencilLoadOp = SDL.GPULoadOp.DontCare,
                 StencilStoreOp = SDL.GPUStoreOp.DontCare,
+                // Cycle depth texture on the initial frame clear so pipelined frames never hazard on prior depth reads!
+                Cycle = (byte)(((ci == 0) && (depthLoad == SDL.GPULoadOp.Clear)) ? 1 : 0),
             };
 
             nint pass = SDL.BeginGPURenderPass(cmd, (nint)(&colorInfo), 1, in depthInfo);
@@ -337,21 +312,32 @@ public static unsafe class BatchRenderer
             SDL.SetGPUViewport(pass, in vp);
 
             nint boundPipeline = nint.Zero;
+            nint boundStorage0 = nint.Zero;
             int boundMeshSlot = -1;
             int boundTexSlot = int.MinValue;
+            bool quadIndexBound = false;
+
+            void EnsureQuadIndexBound()
+            {
+                if (quadIndexBound) return;
+                var qib = new SDL.GPUBufferBinding { Buffer = quadIndexBuf, Offset = 0 };
+                SDL.BindGPUIndexBuffer(pass, in qib, SDL.GPUIndexElementSize.IndexElementSize32Bit);
+                quadIndexBound = true;
+                boundMeshSlot = -1;
+            }
 
             // --- Draw 3D Instanced Batches ---
-            if (slice.Batch3DCount > 0)
+            if (cam.Batch3DCount > 0)
             {
-                var fu = BuildFrameUniforms(in cam, in lighting, world.TotalTime);
+                var fu = BuildFrameUniforms(in cam, in packet.Lighting, packet.WorldTotalTime);
                 SDL.PushGPUVertexUniformData(cmd, 0, (nint)(&fu), (uint)sizeof(FrameUniformsGpu));
                 SDL.PushGPUFragmentUniformData(cmd, 0, (nint)(&fu), (uint)sizeof(FrameUniformsGpu));
 
-                SDL.BindGPUVertexStorageBuffers(pass, 0, new ReadOnlySpan<nint>(vStorage, 2), 2);
-
-                for (int bi = 0; bi < slice.Batch3DCount; bi++)
+                for (int bi = 0; bi < cam.Batch3DCount; bi++)
                 {
-                    Batch3DCmd b = allBatches3D[slice.Batch3DStart + bi];
+                    Batch3DCmd b = packet.Batches3D[cam.Batch3DStart + bi];
+                    if ((uint)b.MeshGpuSlot >= (uint)gpu.MaxMeshes || gpu.Meshes[b.MeshGpuSlot].Alive == 0) continue;
+
                     ShaderHandle sh = b.Shader.IsValid ? b.Shader : gpu.BuiltinPbrShader;
                     GpuShaderSlot* sSlot = ShaderSystem.TryGetShader(in gpu, sh);
                     if (sSlot == null) continue;
@@ -366,6 +352,12 @@ public static unsafe class BatchRenderer
                         passChanged = true;
                     }
 
+                    if (boundStorage0 != gpu.Instance3DBuffer || passChanged)
+                    {
+                        SDL.BindGPUVertexStorageBuffers(pass, 0, new ReadOnlySpan<nint>(vStorage3D, 2), 2);
+                        boundStorage0 = gpu.Instance3DBuffer;
+                    }
+
                     if (b.MeshGpuSlot != boundMeshSlot)
                     {
                         ref GpuMeshSlot gm = ref gpu.Meshes[b.MeshGpuSlot];
@@ -374,6 +366,7 @@ public static unsafe class BatchRenderer
                         SDL.BindGPUVertexBuffers(pass, 0, (nint)(&vbBind), 1);
                         SDL.BindGPUIndexBuffer(pass, in ibBind, SDL.GPUIndexElementSize.IndexElementSize32Bit);
                         boundMeshSlot = b.MeshGpuSlot;
+                        quadIndexBound = false;
                     }
 
                     if (b.TextureGpuSlot != boundTexSlot || passChanged)
@@ -394,29 +387,17 @@ public static unsafe class BatchRenderer
                 }
             }
 
-            // Shared index buffer for instanced quads (Sprites, Text, Particles)
-            bool quadIndexBound = false;
-            void EnsureQuadIndexBound()
-            {
-                if (quadIndexBound) return;
-                var qib = new SDL.GPUBufferBinding { Buffer = quadIndexBuf, Offset = 0 };
-                SDL.BindGPUIndexBuffer(pass, in qib, SDL.GPUIndexElementSize.IndexElementSize32Bit);
-                quadIndexBound = true;
-                boundMeshSlot = -1;
-            }
-
             // --- Draw 2D Sprites (in 3D World or Screen HUD) ---
-            if (slice.SpriteBatchCount > 0)
+            if (cam.SpriteBatchCount > 0)
             {
                 EnsureQuadIndexBound();
-                var cu = new SimpleCameraUniformsGpu { ViewProj = cam.ViewProjMatrix, CameraPosTime = new Vec4(cam.ShakenPosition, world.TotalTime) };
+                var cu = new SimpleCameraUniformsGpu { ViewProj = cam.ViewProjMatrix, CameraPosTime = new Vec4(cam.ShakenPosition, packet.WorldTotalTime) };
                 SDL.PushGPUVertexUniformData(cmd, 0, (nint)(&cu), (uint)sizeof(SimpleCameraUniformsGpu));
                 nint sb = gpu.SpriteInstanceBuffer;
-                SDL.BindGPUVertexStorageBuffers(pass, 0, new ReadOnlySpan<nint>(&sb, 1), 1);
 
-                for (int bi = 0; bi < slice.SpriteBatchCount; bi++)
+                for (int bi = 0; bi < cam.SpriteBatchCount; bi++)
                 {
-                    SpriteBatchCmd b = allSpriteBatches[slice.SpriteBatchStart + bi];
+                    SpriteBatchCmd b = packet.SpriteBatches[cam.SpriteBatchStart + bi];
                     ShaderHandle sh = b.Shader.IsValid ? b.Shader : gpu.BuiltinSpriteShader;
                     GpuShaderSlot* sSlot = ShaderSystem.TryGetShader(in gpu, sh);
                     if (sSlot == null) continue;
@@ -429,6 +410,12 @@ public static unsafe class BatchRenderer
                         boundPipeline = pipe;
                         stats.PipelineBinds++;
                         passChanged = true;
+                    }
+
+                    if (boundStorage0 != sb || passChanged)
+                    {
+                        SDL.BindGPUVertexStorageBuffers(pass, 0, new ReadOnlySpan<nint>(&sb, 1), 1);
+                        boundStorage0 = sb;
                     }
 
                     if (b.TextureGpuSlot != boundTexSlot || passChanged)
@@ -449,22 +436,21 @@ public static unsafe class BatchRenderer
             }
 
             // --- Draw Batched Particles ---
-            if (slice.ParticleBatchCount > 0)
+            if (cam.ParticleBatchCount > 0)
             {
                 EnsureQuadIndexBound();
                 var pu = new ParticleCameraUniformsGpu
                 {
                     ViewProj = cam.ViewProjMatrix,
-                    CameraRightTime = new Vec4(cam.Right, world.TotalTime),
+                    CameraRightTime = new Vec4(cam.Right, packet.WorldTotalTime),
                     CameraUpPad = new Vec4(cam.CameraUp, 0f),
                 };
                 SDL.PushGPUVertexUniformData(cmd, 0, (nint)(&pu), (uint)sizeof(ParticleCameraUniformsGpu));
                 nint pb = gpu.ParticleInstanceBuffer;
-                SDL.BindGPUVertexStorageBuffers(pass, 0, new ReadOnlySpan<nint>(&pb, 1), 1);
 
-                for (int bi = 0; bi < slice.ParticleBatchCount; bi++)
+                for (int bi = 0; bi < cam.ParticleBatchCount; bi++)
                 {
-                    ParticleBatchCmd b = allParticleBatches[slice.ParticleBatchStart + bi];
+                    ParticleBatchCmd b = packet.ParticleBatches[cam.ParticleBatchStart + bi];
                     ShaderHandle sh = b.Shader.IsValid ? b.Shader : gpu.BuiltinParticleShader;
                     GpuShaderSlot* sSlot = ShaderSystem.TryGetShader(in gpu, sh);
                     if (sSlot == null) continue;
@@ -477,6 +463,12 @@ public static unsafe class BatchRenderer
                         boundPipeline = pipe;
                         stats.PipelineBinds++;
                         passChanged = true;
+                    }
+
+                    if (boundStorage0 != pb || passChanged)
+                    {
+                        SDL.BindGPUVertexStorageBuffers(pass, 0, new ReadOnlySpan<nint>(&pb, 1), 1);
+                        boundStorage0 = pb;
                     }
 
                     if (b.TextureGpuSlot != boundTexSlot || passChanged)
@@ -497,17 +489,16 @@ public static unsafe class BatchRenderer
             }
 
             // --- Draw Advanced Animated/Shadered SDF Text ---
-            if (slice.TextBatchCount > 0)
+            if (cam.TextBatchCount > 0)
             {
                 EnsureQuadIndexBound();
-                var cu = new SimpleCameraUniformsGpu { ViewProj = cam.ViewProjMatrix, CameraPosTime = new Vec4(cam.ShakenPosition, world.TotalTime) };
+                var cu = new SimpleCameraUniformsGpu { ViewProj = cam.ViewProjMatrix, CameraPosTime = new Vec4(cam.ShakenPosition, packet.WorldTotalTime) };
                 SDL.PushGPUVertexUniformData(cmd, 0, (nint)(&cu), (uint)sizeof(SimpleCameraUniformsGpu));
                 nint tb = gpu.TextGlyphBuffer;
-                SDL.BindGPUVertexStorageBuffers(pass, 0, new ReadOnlySpan<nint>(&tb, 1), 1);
 
-                for (int bi = 0; bi < slice.TextBatchCount; bi++)
+                for (int bi = 0; bi < cam.TextBatchCount; bi++)
                 {
-                    TextBatchCmd b = allTextBatches[slice.TextBatchStart + bi];
+                    TextBatchCmd b = packet.TextBatches[cam.TextBatchStart + bi];
                     ShaderHandle sh = b.Shader.IsValid ? b.Shader : gpu.BuiltinSdfTextShader;
                     GpuShaderSlot* sSlot = ShaderSystem.TryGetShader(in gpu, sh);
                     if (sSlot == null) continue;
@@ -520,6 +511,12 @@ public static unsafe class BatchRenderer
                         boundPipeline = pipe;
                         stats.PipelineBinds++;
                         passChanged = true;
+                    }
+
+                    if (boundStorage0 != tb || passChanged)
+                    {
+                        SDL.BindGPUVertexStorageBuffers(pass, 0, new ReadOnlySpan<nint>(&tb, 1), 1);
+                        boundStorage0 = tb;
                     }
 
                     if (b.AtlasTexGpuSlot != boundTexSlot || passChanged)
@@ -542,10 +539,12 @@ public static unsafe class BatchRenderer
             SDL.EndGPURenderPass(pass);
         }
 
-        if (encodeScope >= 0) ProfilerSystem.EndScope(ref *profiler, encodeScope);
+        long encodeEnd = Stopwatch.GetTimestamp();
+        timings.EncodeMs = (encodeEnd - encodeStart) * s_ticksToMs;
+        timings.TotalRenderCpuMs = (encodeEnd - renderCpuStart) * s_ticksToMs;
 
-        // 6. Submit command buffer (with fence GPU time measurement when profiler is enabled)
-        if (profiler != null && profiler->Enabled != 0 && profiler->MeasureGpuWithFence != 0)
+        // 4. Submit command buffer (in 2-thread mode, Logic Thread is concurrently executing Frame N while GPU finishes Frame N-1!)
+        if (measureGpuWithFence)
         {
             long gpuStart = Stopwatch.GetTimestamp();
             nint fence = SDL.SubmitGPUCommandBufferAndAcquireFence(cmd);
@@ -557,29 +556,44 @@ public static unsafe class BatchRenderer
             }
             long gpuEnd = Stopwatch.GetTimestamp();
             long gpuTicks = gpuEnd - gpuStart;
-            double gpuMs = gpuTicks * (1000.0 / Stopwatch.Frequency);
-            ProfilerSystem.RecordGpuTime(ref *profiler, gpuMs, gpuTicks);
+            timings.GpuWaitTicks = gpuTicks;
+            timings.GpuMs = gpuTicks * s_ticksToMs;
         }
         else
         {
             SDL.SubmitGPUCommandBuffer(cmd);
         }
 
-        stats.FrameArenaUsedBytes = alloc.Frame.Offset;
         gpu.LastFrameStats = stats;
+        return timings;
     }
 
-    private static void UploadPendingAssets(ref GpuContext gpu, ref EngineWorld world)
+    /// <summary>
+    /// Single-threaded convenience entry point combining UploadPendingAssets + ExtractRenderPacket + SubmitRenderPacket.
+    /// Useful for offscreen verification (--verify-render) and unit tests; interactive games should use EnginePipelineSystem.
+    /// </summary>
+    public static void RenderFrame(
+        ref GpuContext gpu,
+        ref EngineWorld world,
+        ref EngineAllocators alloc,
+        in SceneLighting lighting,
+        bool captureToOffscreen = false,
+        FrameProfiler* profiler = null)
     {
-        for (int i = 0; i < world.Assets.MaxMeshes; i++)
+        if (gpu.Initialized == 0) return;
+
+        UploadPendingAssets(ref gpu, ref world);
+        var shaders = GpuSystem.GetBuiltinShaders(in gpu);
+        ExtractRenderPacket(in shaders, in world, in lighting, ref alloc.Frame, ref alloc.Scratch, out RenderPacket packet, profiler);
+
+        bool measureGpu = profiler != null && profiler->Enabled != 0 && profiler->MeasureGpuWithFence != 0;
+        RenderSubmitTimings t = SubmitRenderPacket(ref gpu, in packet, captureToOffscreen, measureGpu);
+
+        if (profiler != null && profiler->Enabled != 0)
         {
-            if (world.Assets.MeshAlive[i] != 0 && world.Assets.Meshes[i].GpuSlot < 0)
-                GpuSystem.EnsureMeshUploaded(ref gpu, ref world.Assets.Meshes[i]);
-        }
-        for (int i = 0; i < world.Assets.MaxTextures; i++)
-        {
-            if (world.Assets.TextureAlive[i] != 0 && world.Assets.Textures[i].GpuSlot < 0)
-                GpuSystem.EnsureTextureUploaded(ref gpu, ref world.Assets.Textures[i]);
+            ProfilerSystem.RecordRenderTime(ref *profiler, t.TotalRenderCpuMs);
+            if (measureGpu)
+                ProfilerSystem.RecordGpuTime(ref *profiler, t.GpuMs, t.GpuWaitTicks);
         }
     }
 
@@ -598,7 +612,6 @@ public static unsafe class BatchRenderer
         uint bytesGlyphs = (uint)(glyphs.Count * sizeof(GlyphGpuInstance));
         uint bytesParticles = (uint)(particles.Count * sizeof(ParticleGpuInstance));
 
-        // Clamp safely against GPU buffer capacities
         if (bytes3D > gpu.Instance3DBufferBytes) bytes3D = gpu.Instance3DBufferBytes;
         if (bytesJoints > gpu.JointPaletteBufferBytes) bytesJoints = gpu.JointPaletteBufferBytes;
         if (bytesSprites > gpu.SpriteInstanceBufferBytes) bytesSprites = gpu.SpriteInstanceBufferBytes;
@@ -641,10 +654,10 @@ public static unsafe class BatchRenderer
     }
 
     private static void GatherAndBatch3D(
-        in GpuContext gpu,
+        in RenderShaderDefaults shaders,
         in EngineWorld world,
         in CameraData cam,
-        ref LinearArena frameArena,
+        ref LinearArena scratchArena,
         ref NativeList<Instance3DGpu> outInstances,
         ref NativeList<Batch3DCmd> outBatches,
         ref RenderStats stats)
@@ -652,112 +665,118 @@ public static unsafe class BatchRenderer
         int count = world.RenderComponents.MeshRendererCount;
         if (count == 0) return;
 
-        var items = NativeList<Draw3DSortItem>.CreateInArena(ref frameArena, count, 64);
-
-        for (int i = 0; i < count; i++)
+        ArenaMarker mark = scratchArena.SaveMarker();
+        try
         {
-            ref MeshRendererData mr = ref world.RenderComponents.MeshRenderers[i];
-            if (mr.Visible == 0 || (mr.LayerMask & cam.LayerMask) == 0) continue;
+            var items = NativeList<Draw3DSortItem>.CreateInArena(ref scratchArena, count, 64);
 
-            MeshAssetData* mesh = AssetSystem.TryGetMesh(in world.Assets, mr.Mesh);
-            if (mesh == null || mesh->GpuSlot < 0) continue;
-
-            int td = TransformSystem.GetDenseIndex(in world.Transforms, mr.Entity);
-            if (td < 0) continue;
-            Mat4 worldMat = world.Transforms.WorldMatrix[td];
-
-            // CPU Frustum Culling
-            Bounds3 worldBounds = mesh->LocalBounds.Transform(in worldMat);
-            if (!cam.Frustum.IntersectsBounds(in worldBounds))
+            for (int i = 0; i < count; i++)
             {
-                stats.CulledMeshes++;
-                continue;
-            }
+                ref MeshRendererData mr = ref world.RenderComponents.MeshRenderers[i];
+                if (mr.Visible == 0 || (mr.LayerMask & cam.LayerMask) == 0) continue;
 
-            MaterialAssetData* mat = AssetSystem.TryGetMaterial(in world.Assets, mr.Material);
-            ColorF baseCol = mat != null
-                ? new ColorF(mat->BaseColorFactor.R * mr.Tint.R, mat->BaseColorFactor.G * mr.Tint.G, mat->BaseColorFactor.B * mr.Tint.B, mat->BaseColorFactor.A * mr.Tint.A)
-                : mr.Tint;
+                MeshAssetData* mesh = AssetSystem.TryGetMesh(in world.Assets, mr.Mesh);
+                if (mesh == null || mesh->GpuSlot < 0) continue;
 
-            int texSlot = -1;
-            if (mat != null && mat->BaseColorTexture.IsValid)
-            {
-                TextureAssetData* tex = AssetSystem.TryGetTexture(in world.Assets, mat->BaseColorTexture);
-                if (tex != null) texSlot = tex->GpuSlot;
-            }
+                int td = TransformSystem.GetDenseIndex(in world.Transforms, mr.Entity);
+                if (td < 0) continue;
+                Mat4 worldMat = world.Transforms.WorldMatrix[td];
 
-            int jointOff = -1;
-            if (mesh->HasSkinning != 0 && (uint)mr.AnimPlayerIndex < (uint)world.Animations.PlayerCount)
-                jointOff = world.Animations.Players[mr.AnimPlayerIndex].FrameJointOffset;
-
-            MaterialAlphaMode alphaMode = mat != null ? mat->AlphaMode : MaterialAlphaMode.Opaque;
-            ShaderHandle shader = (mat != null && mat->CustomShader.IsValid) ? mat->CustomShader : gpu.BuiltinPbrShader;
-
-            ulong key = ((ulong)alphaMode << 58)
-                      | ((ulong)(shader.Raw & 0xFFFFu) << 40)
-                      | ((ulong)((uint)(texSlot + 1) & 0xFFFFu) << 20)
-                      | ((ulong)((uint)mesh->GpuSlot & 0xFFFFFu));
-
-            items.Add(new Draw3DSortItem
-            {
-                SortKey = key,
-                MeshGpuSlot = mesh->GpuSlot,
-                TextureGpuSlot = texSlot,
-                Shader = shader,
-                AlphaMode = alphaMode,
-                Instance = new Instance3DGpu
+                Bounds3 worldBounds = mesh->LocalBounds.Transform(in worldMat);
+                if (!cam.Frustum.IntersectsBounds(in worldBounds))
                 {
-                    Model = worldMat,
-                    BaseColor = baseCol,
-                    EmissiveRough = new Vec4(mat != null ? mat->EmissiveFactor : Vec3.Zero, mat != null ? mat->RoughnessFactor : 0.6f),
-                    Extra = new Vec4(mat != null ? mat->MetallicFactor : 0.1f, alphaMode == MaterialAlphaMode.Mask && mat != null ? mat->AlphaCutoff : 0f, jointOff, 0f),
-                    CustomParams = mat != null ? mat->CustomParams : Vec4.Zero,
-                },
-            });
-        }
+                    stats.CulledMeshes++;
+                    continue;
+                }
 
-        if (items.Count == 0) return;
+                MaterialAssetData* mat = AssetSystem.TryGetMaterial(in world.Assets, mr.Material);
+                ColorF baseCol = mat != null
+                    ? new ColorF(mat->BaseColorFactor.R * mr.Tint.R, mat->BaseColorFactor.G * mr.Tint.G, mat->BaseColorFactor.B * mr.Tint.B, mat->BaseColorFactor.A * mr.Tint.A)
+                    : mr.Tint;
 
-        // Sort items by SortKey (cache-friendly in-place quicksort)
-        Sort3DItems(items.Data, 0, items.Count - 1);
-
-        // Merge consecutive identical (AlphaMode, Shader, Texture, Mesh) into single instanced draw calls!
-        int idx = 0;
-        while (idx < items.Count)
-        {
-            ulong batchKey = items[idx].SortKey;
-            uint baseInst = (uint)outInstances.Count;
-            uint instCount = 0;
-
-            while (idx < items.Count && items[idx].SortKey == batchKey && outInstances.Count < outInstances.Capacity)
-            {
-                outInstances.Add(items[idx].Instance);
-                instCount++;
-                idx++;
-            }
-
-            if (instCount > 0 && outBatches.Count < outBatches.Capacity)
-            {
-                ref Draw3DSortItem rep = ref items[idx - 1];
-                outBatches.Add(new Batch3DCmd
+                int texSlot = -1;
+                if (mat != null && mat->BaseColorTexture.IsValid)
                 {
-                    MeshGpuSlot = rep.MeshGpuSlot,
-                    TextureGpuSlot = rep.TextureGpuSlot,
-                    Shader = rep.Shader,
-                    AlphaMode = rep.AlphaMode,
-                    BaseInstance = baseInst,
-                    InstanceCount = instCount,
+                    TextureAssetData* tex = AssetSystem.TryGetTexture(in world.Assets, mat->BaseColorTexture);
+                    if (tex != null) texSlot = tex->GpuSlot;
+                }
+
+                int jointOff = -1;
+                if (mesh->HasSkinning != 0 && (uint)mr.AnimPlayerIndex < (uint)world.Animations.PlayerCount)
+                    jointOff = world.Animations.Players[mr.AnimPlayerIndex].FrameJointOffset;
+
+                MaterialAlphaMode alphaMode = mat != null ? mat->AlphaMode : MaterialAlphaMode.Opaque;
+                ShaderHandle shader = (mat != null && mat->CustomShader.IsValid) ? mat->CustomShader : shaders.Pbr;
+
+                ulong key = ((ulong)alphaMode << 58)
+                          | ((ulong)(shader.Raw & 0xFFFFu) << 40)
+                          | ((ulong)((uint)(texSlot + 1) & 0xFFFFu) << 20)
+                          | ((ulong)((uint)mesh->GpuSlot & 0xFFFFFu));
+
+                items.Add(new Draw3DSortItem
+                {
+                    SortKey = key,
+                    OriginalIndex = i,
+                    MeshGpuSlot = mesh->GpuSlot,
+                    TextureGpuSlot = texSlot,
+                    Shader = shader,
+                    AlphaMode = alphaMode,
+                    Instance = new Instance3DGpu
+                    {
+                        Model = worldMat,
+                        BaseColor = baseCol,
+                        EmissiveRough = new Vec4(mat != null ? mat->EmissiveFactor : Vec3.Zero, mat != null ? mat->RoughnessFactor : 0.6f),
+                        Extra = new Vec4(mat != null ? mat->MetallicFactor : 0.1f, alphaMode == MaterialAlphaMode.Mask && mat != null ? mat->AlphaCutoff : 0f, jointOff, 0f),
+                        CustomParams = mat != null ? mat->CustomParams : Vec4.Zero,
+                    },
                 });
-                stats.MeshInstances += (int)instCount;
             }
+
+            if (items.Count == 0) return;
+
+            Sort3DItems(items.Data, 0, items.Count - 1);
+
+            int idx = 0;
+            while (idx < items.Count)
+            {
+                ulong batchKey = items[idx].SortKey;
+                uint baseInst = (uint)outInstances.Count;
+                uint instCount = 0;
+
+                while (idx < items.Count && items[idx].SortKey == batchKey && outInstances.Count < outInstances.Capacity)
+                {
+                    outInstances.Add(items[idx].Instance);
+                    instCount++;
+                    idx++;
+                }
+
+                if (instCount > 0 && outBatches.Count < outBatches.Capacity)
+                {
+                    ref Draw3DSortItem rep = ref items[idx - 1];
+                    outBatches.Add(new Batch3DCmd
+                    {
+                        MeshGpuSlot = rep.MeshGpuSlot,
+                        TextureGpuSlot = rep.TextureGpuSlot,
+                        Shader = rep.Shader,
+                        AlphaMode = rep.AlphaMode,
+                        BaseInstance = baseInst,
+                        InstanceCount = instCount,
+                    });
+                    stats.MeshInstances += (int)instCount;
+                }
+            }
+        }
+        finally
+        {
+            scratchArena.Rollback(mark);
         }
     }
 
     private static void GatherAndBatchSprites(
-        in GpuContext gpu,
+        in RenderShaderDefaults shaders,
         in EngineWorld world,
         in CameraData cam,
-        ref LinearArena frameArena,
+        ref LinearArena scratchArena,
         ref NativeList<SpriteGpuInstance> outSprites,
         ref NativeList<SpriteBatchCmd> outBatches,
         ref RenderStats stats)
@@ -765,133 +784,142 @@ public static unsafe class BatchRenderer
         int count = world.RenderComponents.SpriteCount;
         if (count == 0) return;
 
-        var items = NativeList<SpriteSortItem>.CreateInArena(ref frameArena, count, 64);
-
-        for (int i = 0; i < count; i++)
+        ArenaMarker mark = scratchArena.SaveMarker();
+        try
         {
-            ref SpriteData sp = ref world.RenderComponents.Sprites[i];
-            if (sp.Visible == 0 || (sp.LayerMask & cam.LayerMask) == 0) continue;
+            var items = NativeList<SpriteSortItem>.CreateInArena(ref scratchArena, count, 64);
 
-            int td = TransformSystem.GetDenseIndex(in world.Transforms, sp.Entity);
-            if (td < 0) continue;
-
-            Mat4 worldMat = world.Transforms.WorldMatrix[td];
-            Vec3 pos = world.Transforms.WorldPosition[td];
-            Vec3 right, up, fwd;
-
-            if (sp.Billboard == SpriteBillboardMode.Spherical)
+            for (int i = 0; i < count; i++)
             {
-                Vec3 scl = world.Transforms.LocalScale[td];
-                right = cam.Right * (sp.Size.X * scl.X);
-                up = cam.CameraUp * (sp.Size.Y * scl.Y);
-                fwd = -cam.Forward;
-            }
-            else if (sp.Billboard == SpriteBillboardMode.CylindricalY)
-            {
-                Vec3 scl = world.Transforms.LocalScale[td];
-                Vec3 toCam = cam.ShakenPosition - pos;
-                toCam.Y = 0f;
-                fwd = toCam.LengthSq() > 1e-6f ? toCam.Normalized() : Vec3.UnitZ;
-                right = Vec3.Cross(Vec3.Up, fwd).Normalized() * (sp.Size.X * scl.X);
-                up = Vec3.Up * (sp.Size.Y * scl.Y);
-            }
-            else
-            {
-                right = new Vec3(worldMat.C0.X, worldMat.C0.Y, worldMat.C0.Z) * sp.Size.X;
-                up = new Vec3(worldMat.C1.X, worldMat.C1.Y, worldMat.C1.Z) * sp.Size.Y;
-                fwd = new Vec3(worldMat.C2.X, worldMat.C2.Y, worldMat.C2.Z);
-            }
+                ref SpriteData sp = ref world.RenderComponents.Sprites[i];
+                if (sp.Visible == 0 || (sp.LayerMask & cam.LayerMask) == 0) continue;
 
-            Vec3 origin = pos - right * sp.Pivot.X - up * sp.Pivot.Y;
-            Mat4 quadMat = new Mat4
-            {
-                C0 = new Vec4(right, 0f),
-                C1 = new Vec4(up, 0f),
-                C2 = new Vec4(fwd, 0f),
-                C3 = new Vec4(origin, 1f),
-            };
+                int td = TransformSystem.GetDenseIndex(in world.Transforms, sp.Entity);
+                if (td < 0) continue;
 
-            Vec4 uv = sp.UvRect;
-            if (sp.FlipX != 0) { uv.X += uv.Z; uv.Z = -uv.Z; }
-            if (sp.FlipY != 0) { uv.Y += uv.W; uv.W = -uv.W; }
+                Mat4 worldMat = world.Transforms.WorldMatrix[td];
+                Vec3 pos = world.Transforms.WorldPosition[td];
+                Vec3 right, up, fwd;
 
-            int texSlot = -1;
-            if (sp.Texture.IsValid)
-            {
-                TextureAssetData* tex = AssetSystem.TryGetTexture(in world.Assets, sp.Texture);
-                if (tex != null) texSlot = tex->GpuSlot;
-            }
-
-            ShaderHandle sh = sp.CustomShader.IsValid ? sp.CustomShader : gpu.BuiltinSpriteShader;
-            uint sortLayerU = (uint)(sp.SortingLayer + 32768);
-            uint orderU = (uint)(sp.OrderInLayer + 32768);
-            ulong key = ((ulong)sortLayerU << 48)
-                      | ((ulong)orderU << 32)
-                      | ((ulong)sp.DepthTest << 30)
-                      | ((ulong)sp.BlendMode << 28)
-                      | ((ulong)(sh.Raw & 0xFFFu) << 16)
-                      | ((ulong)((uint)(texSlot + 1) & 0xFFFFu));
-
-            Vec4 cp = sp.CustomParams;
-            if (sp.BlendMode == SpriteBlendMode.AlphaCutout && cp.X <= 0f) cp.X = 0.5f;
-
-            items.Add(new SpriteSortItem
-            {
-                SortKey = key,
-                TextureGpuSlot = texSlot,
-                Shader = sh,
-                BlendMode = sp.BlendMode,
-                DepthTest = sp.DepthTest,
-                Instance = new SpriteGpuInstance
+                if (sp.Billboard == SpriteBillboardMode.Spherical)
                 {
-                    Model = quadMat,
-                    UvRect = uv,
-                    Color = sp.Color,
-                    CustomParams = cp,
-                },
-            });
-        }
-
-        if (items.Count == 0) return;
-        SortSpriteItems(items.Data, 0, items.Count - 1);
-
-        int idx = 0;
-        while (idx < items.Count)
-        {
-            ref SpriteSortItem first = ref items[idx];
-            uint baseInst = (uint)outSprites.Count;
-            uint instCount = 0;
-
-            while (idx < items.Count &&
-                   items[idx].TextureGpuSlot == first.TextureGpuSlot &&
-                   items[idx].Shader == first.Shader &&
-                   items[idx].BlendMode == first.BlendMode &&
-                   items[idx].DepthTest == first.DepthTest &&
-                   outSprites.Count < outSprites.Capacity)
-            {
-                outSprites.Add(items[idx].Instance);
-                instCount++;
-                idx++;
-            }
-
-            if (instCount > 0 && outBatches.Count < outBatches.Capacity)
-            {
-                outBatches.Add(new SpriteBatchCmd
+                    Vec3 scl = world.Transforms.LocalScale[td];
+                    right = cam.Right * (sp.Size.X * scl.X);
+                    up = cam.CameraUp * (sp.Size.Y * scl.Y);
+                    fwd = -cam.Forward;
+                }
+                else if (sp.Billboard == SpriteBillboardMode.CylindricalY)
                 {
-                    TextureGpuSlot = first.TextureGpuSlot,
-                    Shader = first.Shader,
-                    BlendMode = first.BlendMode,
-                    DepthTest = first.DepthTest,
-                    BaseInstance = baseInst,
-                    InstanceCount = instCount,
+                    Vec3 scl = world.Transforms.LocalScale[td];
+                    Vec3 toCam = cam.ShakenPosition - pos;
+                    toCam.Y = 0f;
+                    fwd = toCam.LengthSq() > 1e-6f ? toCam.Normalized() : Vec3.UnitZ;
+                    right = Vec3.Cross(Vec3.Up, fwd).Normalized() * (sp.Size.X * scl.X);
+                    up = Vec3.Up * (sp.Size.Y * scl.Y);
+                }
+                else
+                {
+                    right = new Vec3(worldMat.C0.X, worldMat.C0.Y, worldMat.C0.Z) * sp.Size.X;
+                    up = new Vec3(worldMat.C1.X, worldMat.C1.Y, worldMat.C1.Z) * sp.Size.Y;
+                    fwd = new Vec3(worldMat.C2.X, worldMat.C2.Y, worldMat.C2.Z);
+                }
+
+                Vec3 origin = pos - right * sp.Pivot.X - up * sp.Pivot.Y;
+                Mat4 quadMat = new Mat4
+                {
+                    C0 = new Vec4(right, 0f),
+                    C1 = new Vec4(up, 0f),
+                    C2 = new Vec4(fwd, 0f),
+                    C3 = new Vec4(origin, 1f),
+                };
+
+                Vec4 uv = sp.UvRect;
+                if (sp.FlipX != 0) { uv.X += uv.Z; uv.Z = -uv.Z; }
+                if (sp.FlipY != 0) { uv.Y += uv.W; uv.W = -uv.W; }
+
+                int texSlot = -1;
+                if (sp.Texture.IsValid)
+                {
+                    TextureAssetData* tex = AssetSystem.TryGetTexture(in world.Assets, sp.Texture);
+                    if (tex != null) texSlot = tex->GpuSlot;
+                }
+
+                ShaderHandle sh = sp.CustomShader.IsValid ? sp.CustomShader : shaders.Sprite;
+                uint sortLayerU = (uint)(sp.SortingLayer + 32768);
+                uint orderU = (uint)(sp.OrderInLayer + 32768);
+                ulong key = ((ulong)sortLayerU << 48)
+                          | ((ulong)orderU << 32)
+                          | ((ulong)sp.DepthTest << 30)
+                          | ((ulong)sp.BlendMode << 28)
+                          | ((ulong)(sh.Raw & 0xFFFu) << 16)
+                          | ((ulong)((uint)(texSlot + 1) & 0xFFFFu));
+
+                Vec4 cp = sp.CustomParams;
+                if (sp.BlendMode == SpriteBlendMode.AlphaCutout && cp.X <= 0f) cp.X = 0.5f;
+
+                items.Add(new SpriteSortItem
+                {
+                    SortKey = key,
+                    OriginalIndex = i,
+                    TextureGpuSlot = texSlot,
+                    Shader = sh,
+                    BlendMode = sp.BlendMode,
+                    DepthTest = sp.DepthTest,
+                    Instance = new SpriteGpuInstance
+                    {
+                        Model = quadMat,
+                        UvRect = uv,
+                        Color = sp.Color,
+                        CustomParams = cp,
+                    },
                 });
-                stats.SpriteInstances += (int)instCount;
             }
+
+            if (items.Count == 0) return;
+            SortSpriteItems(items.Data, 0, items.Count - 1);
+
+            int idx = 0;
+            while (idx < items.Count)
+            {
+                ref SpriteSortItem first = ref items[idx];
+                uint baseInst = (uint)outSprites.Count;
+                uint instCount = 0;
+
+                while (idx < items.Count &&
+                       items[idx].TextureGpuSlot == first.TextureGpuSlot &&
+                       items[idx].Shader == first.Shader &&
+                       items[idx].BlendMode == first.BlendMode &&
+                       items[idx].DepthTest == first.DepthTest &&
+                       outSprites.Count < outSprites.Capacity)
+                {
+                    outSprites.Add(items[idx].Instance);
+                    instCount++;
+                    idx++;
+                }
+
+                if (instCount > 0 && outBatches.Count < outBatches.Capacity)
+                {
+                    outBatches.Add(new SpriteBatchCmd
+                    {
+                        TextureGpuSlot = first.TextureGpuSlot,
+                        Shader = first.Shader,
+                        BlendMode = first.BlendMode,
+                        DepthTest = first.DepthTest,
+                        BaseInstance = baseInst,
+                        InstanceCount = instCount,
+                    });
+                    stats.SpriteInstances += (int)instCount;
+                }
+            }
+        }
+        finally
+        {
+            scratchArena.Rollback(mark);
         }
     }
 
     private static void GatherAndBatchText(
-        in GpuContext gpu,
+        in RenderShaderDefaults shaders,
         in EngineWorld world,
         in CameraData cam,
         ref LinearArena scratchArena,
@@ -917,9 +945,8 @@ public static unsafe class BatchRenderer
             int emitted = TextLayoutSystem.LayoutTextIntoGlyphs(in td, in *font, in world.Transforms, in cam, ref scratchArena, ref outGlyphs);
             if (emitted <= 0) continue;
 
-            ShaderHandle sh = td.CustomShader.IsValid ? td.CustomShader : gpu.BuiltinSdfTextShader;
+            ShaderHandle sh = td.CustomShader.IsValid ? td.CustomShader : shaders.SdfText;
 
-            // Merge with previous batch within THIS camera if identical font atlas + shader + depthTest
             if (outBatches.Count > batchStart)
             {
                 ref TextBatchCmd prev = ref outBatches[outBatches.Count - 1];
@@ -947,7 +974,7 @@ public static unsafe class BatchRenderer
     }
 
     private static void GatherAndBatchParticles(
-        in GpuContext gpu,
+        in RenderShaderDefaults shaders,
         in EngineWorld world,
         in CameraData cam,
         ref NativeList<ParticleGpuInstance> outParticles,
@@ -958,7 +985,6 @@ public static unsafe class BatchRenderer
         if (pt.ParticleCount == 0) return;
         int batchStart = outBatches.Count;
 
-        // Emit grouped per active emitter matching camera LayerMask (guarantees 1 draw call per emitter or merged group!)
         for (int es = 0; es < pt.EmitterCapacity; es++)
         {
             if (pt.EmitterAlive[es] == 0) continue;
@@ -996,7 +1022,7 @@ public static unsafe class BatchRenderer
             }
 
             if (count == 0) continue;
-            ShaderHandle sh = em.CustomShader.IsValid ? em.CustomShader : gpu.BuiltinParticleShader;
+            ShaderHandle sh = em.CustomShader.IsValid ? em.CustomShader : shaders.Particle;
 
             if (outBatches.Count > batchStart)
             {
@@ -1052,7 +1078,7 @@ public static unsafe class BatchRenderer
         };
     }
 
-    private static FrameUniformsGpu BuildFrameUniforms(in CameraData cam, in SceneLighting l, float time) => new FrameUniformsGpu
+    private static FrameUniformsGpu BuildFrameUniforms(in RenderCameraSnapshot cam, in SceneLighting l, float time) => new FrameUniformsGpu
     {
         ViewProj = cam.ViewProjMatrix,
         CameraPosTime = new Vec4(cam.ShakenPosition, time),
@@ -1071,15 +1097,25 @@ public static unsafe class BatchRenderer
         PointLightColor3 = l.PointLightColor3,
     };
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool Less3D(in Draw3DSortItem a, ulong pivotKey, int pivotIdx)
+        => a.SortKey < pivotKey || (a.SortKey == pivotKey && a.OriginalIndex < pivotIdx);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool Greater3D(in Draw3DSortItem a, ulong pivotKey, int pivotIdx)
+        => a.SortKey > pivotKey || (a.SortKey == pivotKey && a.OriginalIndex > pivotIdx);
+
     private static void Sort3DItems(Draw3DSortItem* arr, int lo, int hi)
     {
         if (lo >= hi) return;
-        ulong pivot = arr[(lo + hi) >> 1].SortKey;
+        int mid = (lo + hi) >> 1;
+        ulong pKey = arr[mid].SortKey;
+        int pIdx = arr[mid].OriginalIndex;
         int i = lo, j = hi;
         while (i <= j)
         {
-            while (arr[i].SortKey < pivot) i++;
-            while (arr[j].SortKey > pivot) j--;
+            while (Less3D(in arr[i], pKey, pIdx)) i++;
+            while (Greater3D(in arr[j], pKey, pIdx)) j--;
             if (i <= j)
             {
                 Draw3DSortItem tmp = arr[i];
@@ -1092,15 +1128,25 @@ public static unsafe class BatchRenderer
         if (i < hi) Sort3DItems(arr, i, hi);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool LessSprite(in SpriteSortItem a, ulong pivotKey, int pivotIdx)
+        => a.SortKey < pivotKey || (a.SortKey == pivotKey && a.OriginalIndex < pivotIdx);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool GreaterSprite(in SpriteSortItem a, ulong pivotKey, int pivotIdx)
+        => a.SortKey > pivotKey || (a.SortKey == pivotKey && a.OriginalIndex > pivotIdx);
+
     private static void SortSpriteItems(SpriteSortItem* arr, int lo, int hi)
     {
         if (lo >= hi) return;
-        ulong pivot = arr[(lo + hi) >> 1].SortKey;
+        int mid = (lo + hi) >> 1;
+        ulong pKey = arr[mid].SortKey;
+        int pIdx = arr[mid].OriginalIndex;
         int i = lo, j = hi;
         while (i <= j)
         {
-            while (arr[i].SortKey < pivot) i++;
-            while (arr[j].SortKey > pivot) j--;
+            while (LessSprite(in arr[i], pKey, pIdx)) i++;
+            while (GreaterSprite(in arr[j], pKey, pIdx)) j--;
             if (i <= j)
             {
                 SpriteSortItem tmp = arr[i];

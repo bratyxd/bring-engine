@@ -26,7 +26,7 @@ public static unsafe class SdfFontLoader
         StringId name,
         float pixelSize = 48f,
         int atlasSize = 512,
-        int sdfPadding = 6)
+        int sdfPadding = 8)
     {
         string? resolved = ResolveTtfPath(preferredTtfPath);
         if (resolved != null && File.Exists(resolved))
@@ -71,9 +71,10 @@ public static unsafe class SdfFontLoader
         StringId name,
         float pixelSize = 48f,
         int atlasSize = 512,
-        int sdfPadding = 6)
+        int sdfPadding = 8)
     {
-        const byte onEdgeValue = 180;
+        // Symmetric SDF edge (128 = 0.502) gives full [128..255] interior range so small UI glyphs stay 100% opaque
+        const byte onEdgeValue = 128;
         float pixelDistScale = onEdgeValue / (float)sdfPadding;
 
         byte* atlasPixels = bundleArena.Alloc<byte>(atlasSize * atlasSize, 64);
@@ -229,7 +230,7 @@ public static unsafe class SdfFontLoader
                     {
                         float nx = ((x + 0.5f) / cell) * 2f - 1f;
                         float box = DetMath.Max(DetMath.Abs(nx) - 0.55f, DetMath.Abs(ny) - 0.7f);
-                        float val = DetMath.Clamp01(0.7f - box * 1.5f);
+                        float val = DetMath.Clamp01(0.502f - box * 1.5f);
                         atlasPixels[(cy + y) * atlasSize + (cx + x)] = (byte)(val * 255f);
                     }
                 }
@@ -259,8 +260,8 @@ public static unsafe class SdfFontLoader
             LineGap = pixelSize * 0.1f,
             LineHeight = pixelSize * 1.1f,
             SdfPadding = sdfPadding,
-            SdfOnEdgeValue = 180,
-            SdfPixelDistScale = 180f / sdfPadding,
+            SdfOnEdgeValue = 128,
+            SdfPixelDistScale = 128f / sdfPadding,
             AsciiGlyphs = glyphs,
             AsciiKerning = kernTable,
         });

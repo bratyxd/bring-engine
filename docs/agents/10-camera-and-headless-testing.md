@@ -3,7 +3,7 @@
 ## Multi-Camera Setup (`CameraTable` + `CameraSystem`)
 Bring Engine supports up to 32 simultaneous cameras sorted by `DepthOrder`:
 - **3D Perspective Main Camera**: `CameraSystem.CreatePerspective(ref cameras, pos, lookTarget, fovYDeg: 60f, depthOrder: 0)`
-- **2D Orthographic UI Overlay Camera**: `CameraSystem.CreateOrthographicUI(ref cameras, width, height, depthOrder: 100, layerMask: 1u << 31)`
+- **2D Orthographic UI Overlay Camera**: `CameraSystem.CreateOrthographicUI(ref cameras, width, height, depthOrder: 100, layerMask: 1u << 31)` (defaults to `ClearFlags = CameraClearFlags.None` so 2D overlays never clear 3D depth mid-frame).
 - **Split-Screen / Minimap**: Set `cam->ViewportRect = new Vec4(0.75f, 0.75f, 0.23f, 0.23f)` and `cam->DepthOrder = 10`.
 
 ## Built-in Camera Controllers & Trauma Shake

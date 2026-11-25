@@ -189,9 +189,18 @@ public static unsafe class GpuSystem
         };
 
         CreateDefaultSamplersAndBuffers(ref ctx);
-        SetVSync(ref ctx, enabled: true); // VSync ON by default
+        SDL.SetGPUAllowedFramesInFlight(ctx.Device, 2); // Pipelined double-buffered GPU execution
+        SetVSync(ref ctx, enabled: true);               // VSync ON by default
         return ctx;
     }
+
+    public static RenderShaderDefaults GetBuiltinShaders(in GpuContext ctx) => new RenderShaderDefaults
+    {
+        Pbr = ctx.BuiltinPbrShader,
+        Sprite = ctx.BuiltinSpriteShader,
+        SdfText = ctx.BuiltinSdfTextShader,
+        Particle = ctx.BuiltinParticleShader,
+    };
 
     /// <summary>
     /// Configures swapchain VSync mode on SDL3_gpu.

@@ -17,11 +17,14 @@ public struct ProfileScopeSample
 }
 
 /// <summary>
-/// Zero-GC, headless-safe Frame Profiler tracking:
-/// - Exact & smoothed CPU frame time (ms, excluding VSync/FPS-cap sleep and GPU fence wait)
-/// - Exact & smoothed GPU frame time (ms, measured via SDL3_gpu fence completion)
-/// - Wall-to-wall total frame time (ms) and Current/Instant FPS
+/// Zero-GC, headless-safe Pipelined Frame Profiler tracking each concurrent stage independently:
+/// - LogicCpuMs  / SmoothedLogicMs  (Logic/Update Thread: Sim + ViewSync + Core + Packet Extract, Frame N)
+/// - RenderCpuMs / SmoothedRenderMs (Render Thread: GPU Upload + Command Encoding, Frame N-1)
+/// - GpuFrameMs  / SmoothedGpuMs    (GPU Hardware execution via SDL3_gpu fence, Frame N-1)
+/// - Wall-to-wall total frame time (ms) and smoothed / instant FPS
 /// - Hierarchical named CPU scopes per frame (for both engine & game code)
+/// Because Logic, Render, and GPU run pipelined 1 frame apart, each stage is measured independently
+/// against the full target frame budget (e.g. 16.67ms at 60 FPS).
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct FrameProfiler
@@ -31,9 +34,11 @@ public unsafe struct FrameProfiler
 
     public byte Enabled;
     public byte MeasureGpuWithFence;
+    public byte PipelinedTwoThread; // 1 when running on EnginePipeline (dedicated Logic + Render threads)
 
-    // Rolling 60-frame history rings
-    public fixed double CpuHistoryMs[HistoryLength];
+    // Rolling 60-frame history rings (independent per pipelined stage!)
+    public fixed double LogicHistoryMs[HistoryLength];
+    public fixed double RenderHistoryMs[HistoryLength];
     public fixed double GpuHistoryMs[HistoryLength];
     public fixed double TotalHistoryMs[HistoryLength];
     public int HistoryCursor;
@@ -45,11 +50,18 @@ public unsafe struct FrameProfiler
     public long CpuEndTick;
     public long GpuWaitTicks;
 
-    public double CpuFrameMs;
-    public double GpuFrameMs;
+    public double LogicCpuMs;    // Logic / Update thread time (Frame N)
+    public double RenderCpuMs;   // Render thread CPU encoding/upload time (Frame N-1)
+    public double CpuFrameMs;    // Backward-compatible alias for LogicCpuMs (or total non-GPU CPU in single-thread)
+    public double GpuFrameMs;    // GPU hardware execution time (Frame N-1)
     public double FrameTotalMs;
 
+    private byte _hasExplicitLogicMs;
+    private byte _hasExplicitRenderMs;
+
     // Smoothed display timings (rolling average over up to 30 frames)
+    public double SmoothedLogicMs;
+    public double SmoothedRenderMs;
     public double SmoothedCpuMs;
     public double SmoothedGpuMs;
     public double SmoothedTotalMs;
@@ -76,6 +88,9 @@ public unsafe struct FrameProfiler
             LastFrameEndTick = Stopwatch.GetTimestamp(),
         };
     }
+
+    internal byte HasExplicitLogicMs { readonly get => _hasExplicitLogicMs; set => _hasExplicitLogicMs = value; }
+    internal byte HasExplicitRenderMs { readonly get => _hasExplicitRenderMs; set => _hasExplicitRenderMs = value; }
 }
 
 public static unsafe class ProfilerSystem
@@ -99,6 +114,11 @@ public static unsafe class ProfilerSystem
         p.CurrentDepth = 0;
         p.GpuWaitTicks = 0;
         p.GpuFrameMs = 0.0;
+        p.LogicCpuMs = 0.0;
+        p.RenderCpuMs = 0.0;
+        p.CpuFrameMs = 0.0;
+        p.HasExplicitLogicMs = 0;
+        p.HasExplicitRenderMs = 0;
         p.CpuEndTick = 0;
         p.FrameStartTick = Stopwatch.GetTimestamp();
     }
@@ -135,19 +155,42 @@ public static unsafe class ProfilerSystem
     }
 
     /// <summary>
+    /// Records the Logic/Update thread duration for Frame N (called by EnginePipeline or single-threaded caller).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void RecordLogicTime(ref FrameProfiler p, double logicMs)
+    {
+        if (p.Enabled == 0) return;
+        p.LogicCpuMs = logicMs < 0.0 ? 0.0 : logicMs;
+        p.CpuFrameMs = p.LogicCpuMs;
+        p.HasExplicitLogicMs = 1;
+    }
+
+    /// <summary>
+    /// Records the Render thread CPU duration (upload + command recording, excluding GPU wait/pacing).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void RecordRenderTime(ref FrameProfiler p, double renderMs)
+    {
+        if (p.Enabled == 0) return;
+        p.RenderCpuMs = renderMs < 0.0 ? 0.0 : renderMs;
+        p.HasExplicitRenderMs = 1;
+    }
+
+    /// <summary>
     /// Called by BatchRenderer when GPU fence completion is measured.
-    /// Subtracts waitTicks from CPU time so CpuFrameMs measures pure CPU work cleanly.
+    /// Subtracts waitTicks from CPU time so CPU timings exclude GPU waits cleanly.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void RecordGpuTime(ref FrameProfiler p, double gpuMs, long waitTicks)
     {
         if (p.Enabled == 0) return;
-        p.GpuFrameMs += gpuMs;
+        p.GpuFrameMs = gpuMs < 0.0 ? 0.0 : gpuMs;
         p.GpuWaitTicks += waitTicks;
     }
 
     /// <summary>
-    /// Marks end of CPU work BEFORE frame pacing / VSync sleep.
+    /// Marks end of CPU work BEFORE frame pacing / VSync sleep (single-threaded fallback when Logic/Render aren't explicitly timed).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void EndCpuWork(ref FrameProfiler p)
@@ -156,18 +199,30 @@ public static unsafe class ProfilerSystem
         p.CpuEndTick = Stopwatch.GetTimestamp();
         long pureCpuTicks = (p.CpuEndTick - p.FrameStartTick) - p.GpuWaitTicks;
         if (pureCpuTicks < 0) pureCpuTicks = 0;
-        p.CpuFrameMs = pureCpuTicks * s_ticksToMs;
+        double totalCpuMs = pureCpuTicks * s_ticksToMs;
+
+        if (p.HasExplicitLogicMs == 0)
+        {
+            // Separate pure Logic time from Render thread time when running single-threaded
+            double logicMs = p.HasExplicitRenderMs != 0 ? totalCpuMs - p.RenderCpuMs : totalCpuMs;
+            p.LogicCpuMs = logicMs < 0.0 ? 0.0 : logicMs;
+            p.CpuFrameMs = p.LogicCpuMs;
+        }
+        else
+        {
+            p.CpuFrameMs = p.LogicCpuMs;
+        }
     }
 
     /// <summary>
-    /// Marks end of full wall-to-wall frame (AFTER frame pacing / VSync) and updates rolling FPS & averages.
+    /// Marks end of full wall-to-wall frame (AFTER frame pacing / VSync) and updates rolling FPS & per-stage averages.
     /// </summary>
     public static void EndFrame(ref FrameProfiler p)
     {
         if (p.Enabled == 0) return;
 
         long now = Stopwatch.GetTimestamp();
-        if (p.CpuEndTick == 0)
+        if (p.CpuEndTick == 0 && p.HasExplicitLogicMs == 0)
             EndCpuWork(ref p);
 
         long wallTicks = p.ProfiledFrames > 0 ? (now - p.LastFrameEndTick) : (now - p.FrameStartTick);
@@ -178,7 +233,8 @@ public static unsafe class ProfilerSystem
         p.InstantFps = p.FrameTotalMs > 1e-6 ? 1000.0 / p.FrameTotalMs : 0.0;
 
         int cursor = p.HistoryCursor;
-        p.CpuHistoryMs[cursor] = p.CpuFrameMs;
+        p.LogicHistoryMs[cursor] = p.LogicCpuMs;
+        p.RenderHistoryMs[cursor] = p.RenderCpuMs;
         p.GpuHistoryMs[cursor] = p.GpuFrameMs;
         p.TotalHistoryMs[cursor] = p.FrameTotalMs;
         p.HistoryCursor = (cursor + 1) % FrameProfiler.HistoryLength;
@@ -187,17 +243,20 @@ public static unsafe class ProfilerSystem
 
         // Compute smoothed rolling window (last min(30, HistoryCount) frames)
         int window = p.HistoryCount < 30 ? p.HistoryCount : 30;
-        double sumCpu = 0.0, sumGpu = 0.0, sumTot = 0.0;
+        double sumLogic = 0.0, sumRender = 0.0, sumGpu = 0.0, sumTot = 0.0;
         for (int i = 0; i < window; i++)
         {
             int idx = (p.HistoryCursor - 1 - i + FrameProfiler.HistoryLength) % FrameProfiler.HistoryLength;
-            sumCpu += p.CpuHistoryMs[idx];
+            sumLogic += p.LogicHistoryMs[idx];
+            sumRender += p.RenderHistoryMs[idx];
             sumGpu += p.GpuHistoryMs[idx];
             sumTot += p.TotalHistoryMs[idx];
         }
 
         double inv = 1.0 / window;
-        p.SmoothedCpuMs = sumCpu * inv;
+        p.SmoothedLogicMs = sumLogic * inv;
+        p.SmoothedRenderMs = sumRender * inv;
+        p.SmoothedCpuMs = p.SmoothedLogicMs;
         p.SmoothedGpuMs = sumGpu * inv;
         p.SmoothedTotalMs = sumTot * inv;
         p.CurrentFps = p.SmoothedTotalMs > 1e-6 ? 1000.0 / p.SmoothedTotalMs : 0.0;

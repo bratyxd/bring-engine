@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using BringEngine;
 using BringEngine.Assets;
 using BringEngine.Assets.Bundles;
@@ -7,6 +8,7 @@ using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
 using BringEngine.Core.Profiling;
+using BringEngine.Core.Threading;
 using BringEngine.Rendering;
 using BringEngine.Rendering.Gpu;
 using BringEngine.Rendering.Platform;
@@ -22,13 +24,38 @@ using ShowcaseGame.View;
 namespace ShowcaseGame;
 
 /// <summary>
+/// Unmanaged context struct passed to Bring Engine's dedicated Logic/Update Thread callback.
+/// Zero-OOP, zero managed references.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct GameLogicContext
+{
+    public EngineAllocators* EngAlloc;
+    public GameAllocators* GameAlloc;
+    public EngineWorld* World;
+    public BundleManager* Bundles;
+    public SceneManager* Scenes;
+    public FrameProfiler* Profiler;
+    public FramePacer* Pacer;
+    public ProfilerOverlay* ProfOverlay;
+    public GameSimState* Sim;
+    public GameViewState* View;
+    public float FixedAccumulator;
+    public byte FixedSingleStepMode; // 1 in deterministic verify-render mode (1 exact 1/60s sim tick per frame)
+    public byte ProfileScopesActive;
+}
+
+/// <summary>
 /// Bring Arena — Complete playable reference game built with Bring Engine (NativeAOT, Zero-OOP, Data + Systems).
 ///
-/// Defaults:
-///   VSync ON + FPS Cap 60 (runtime toggleable via F2 = VSync, F3 = Cycle FPS Cap, F1 = Profiler UI Overlay).
+/// Engine Defaults:
+///   - Borderless Full Window by default (WindowMode.BorderlessFullscreen; toggle with F11 or pass --windowed)
+///   - 2-Thread Pipelined Execution (Dedicated Logic Thread Frame N + Main/Render Thread Frame N-1)
+///   - VSync ON + FPS Cap 60 (runtime toggleable: F1 Profiler, F2 VSync, F3 Cycle FPS Cap, F11 Borderless/Windowed)
 ///
 /// Modes:
-///   (default)                  : Interactive windowed SDL3_gpu playable game
+///   (default)                  : Interactive Borderless Full Window SDL3_gpu playable game (2-Thread Pipelined)
+///   --windowed                 : Launch in resizable 1280x720 window instead of borderless full window
 ///   --headless [--ticks N]     : 100% headless deterministic simulation & zero-GC audit (ZERO SDL/GPU calls)
 ///   --verify-render [--out dir]: Renders Title scene + live Arena + Additive HUD + Common Profiler Overlay to PNGs
 ///   --fps N                    : Override initial FPS cap (0 = uncapped, default = 60)
@@ -43,6 +70,7 @@ public static unsafe class Program
         int ticks = 600;
         int targetFps = FramePacer.DefaultTargetFps; // 60 by default
         bool vsync = true;                           // ON by default
+        WindowMode windowMode = WindowMode.BorderlessFullscreen; // Borderless Full Window by default!
         string outDir = AppContext.BaseDirectory;
 
         for (int i = 0; i < args.Length; i++)
@@ -50,6 +78,7 @@ public static unsafe class Program
             if (args[i] == "--headless") headless = true;
             else if (args[i] == "--verify-render") verifyRender = true;
             else if (args[i] == "--no-vsync") vsync = false;
+            else if (args[i] == "--windowed") windowMode = WindowMode.Windowed;
             else if (args[i] == "--fps" && i + 1 < args.Length) int.TryParse(args[++i], out targetFps);
             else if (args[i] == "--ticks" && i + 1 < args.Length) int.TryParse(args[++i], out ticks);
             else if (args[i] == "--out" && i + 1 < args.Length) outDir = args[++i];
@@ -58,7 +87,7 @@ public static unsafe class Program
         if (headless)
             return RunHeadlessVerification(ticks);
 
-        return RunWindowed(verifyRender, outDir, targetFps, vsync);
+        return RunPipelinedGame(verifyRender, outDir, targetFps, vsync, windowMode);
     }
 
     private static int RunHeadlessVerification(int ticks)
@@ -89,7 +118,6 @@ public static unsafe class Program
         InputState input = default;
         Fix32 dt = Fix32.FromRatio(1, 60);
 
-        // Warmup 1 tick before GC measurement
         GameSimSystems.StepFixed(ref sim, in input, dt);
 
         long gcBefore = checkZeroGc ? GC.GetAllocatedBytesForCurrentThread() : 0;
@@ -121,9 +149,63 @@ public static unsafe class Program
         input.SetKey(KeyCode.Space, tick % 70 == 15);
     }
 
-    private static int RunWindowed(bool verifyRender, string outDir, int targetFps, bool vsync)
+    /// <summary>
+    /// Logic/Update Thread entry point (runs Frame N concurrently with Main/Render Thread submitting Frame N-1!).
+    /// ZERO SDL3 or GPU calls allowed here.
+    /// </summary>
+    private static void RunLogicFrame(void* userCtx, ref PipelineFrameInput frameIn, ref RenderPacket outPacket)
     {
-        Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - Bring Arena ({(verifyRender ? "Verify Render Mode" : "Interactive")}, VSync={(vsync ? "ON" : "OFF")}, FPS Cap={(targetFps > 0 ? targetFps.ToString() : "Uncapped")})");
+        GameLogicContext* ctx = (GameLogicContext*)userCtx;
+        ref var engAlloc = ref *ctx->EngAlloc;
+        ref var gameAlloc = ref *ctx->GameAlloc;
+        ref var world = ref *ctx->World;
+        ref var bundles = ref *ctx->Bundles;
+        ref var scenes = ref *ctx->Scenes;
+        FrameProfiler* prof = ctx->ProfileScopesActive != 0 ? ctx->Profiler : null;
+
+        gameAlloc.BeginFrame();
+        world.Input = frameIn.Input;
+
+        const float fixedStep = 1f / 60f;
+        Fix32 fixedDt = Fix32.FromRatio(1, 60);
+
+        int simScope = prof != null ? ProfilerSystem.BeginScope(ref *prof, "Sim") : -1;
+        if (ctx->FixedSingleStepMode != 0)
+        {
+            if (ctx->View->Mode == 1)
+                GameSimSystems.StepFixed(ref *ctx->Sim, in world.Input, fixedDt);
+        }
+        else
+        {
+            ctx->FixedAccumulator += frameIn.DeltaTime;
+            while (ctx->FixedAccumulator >= fixedStep)
+            {
+                if (ctx->View->Mode == 1)
+                    GameSimSystems.StepFixed(ref *ctx->Sim, in world.Input, fixedDt);
+                ctx->FixedAccumulator -= fixedStep;
+            }
+        }
+        if (simScope >= 0) ProfilerSystem.EndScope(ref *prof, simScope);
+
+        int viewScope = prof != null ? ProfilerSystem.BeginScope(ref *prof, "View") : -1;
+        ctx->View->CachedRenderStats = frameIn.PrevRenderStats;
+        SceneSystem.ViewSyncActiveScenes(ref scenes, ref world, ref engAlloc, ref bundles, frameIn.DeltaTime);
+        ProfilerOverlaySystem.Update(ref *ctx->ProfOverlay, ref world, in *ctx->Profiler, in frameIn.PrevRenderStats, in *ctx->Pacer, frameIn.ViewportWidth, frameIn.ViewportHeight);
+        if (viewScope >= 0) ProfilerSystem.EndScope(ref *prof, viewScope);
+
+        int coreScope = prof != null ? ProfilerSystem.BeginScope(ref *prof, "Core") : -1;
+        EngineWorldSystem.StepCoreSystems(ref world, ref engAlloc, frameIn.DeltaTime, frameIn.ViewportWidth, frameIn.ViewportHeight);
+        if (coreScope >= 0) ProfilerSystem.EndScope(ref *prof, coreScope);
+
+        // Extract immutable Frame N RenderPacket into engAlloc.Frame (pure CPU, zero GPU calls!)
+        BatchRenderer.ExtractRenderPacket(
+            in frameIn.BuiltinShaders, in world, in ctx->View->Lighting,
+            ref engAlloc.Frame, ref engAlloc.Scratch, out outPacket, prof);
+    }
+
+    private static int RunPipelinedGame(bool verifyRender, string outDir, int targetFps, bool vsync, WindowMode windowMode)
+    {
+        Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - Bring Arena ({(verifyRender ? "Verify Render Mode" : windowMode.ToString())}, 2-Thread Pipelined, VSync={(vsync ? "ON" : "OFF")}, FPS Cap={(targetFps > 0 ? targetFps.ToString() : "Uncapped")})");
         GameAssets.EnsureGlbFilesOnDisk();
         NativeMemoryTracker.ResetStatsForTest();
 
@@ -134,15 +216,24 @@ public static unsafe class Program
             dynamicBytes: 4 * 1024 * 1024);
         var gameAlloc = GameAllocators.Create();
 
-        var world = EngineWorld.Create(ref engAlloc.Persistent, maxEntities: 8192, maxParticles: 8192);
-        var bundles = BundleManager.Create(ref engAlloc.Persistent, maxBundles: 16);
-        var scenes = SceneManager.Create(ref engAlloc.Persistent, maxDefinitions: 16, maxActiveScenes: 8);
+        // Keep top-level structs in native Persistent memory so pointers passed to Logic Thread stay 100% pinned & stable!
+        EngineWorld* world = engAlloc.Persistent.Alloc<EngineWorld>(1, 64);
+        *world = EngineWorld.Create(ref engAlloc.Persistent, maxEntities: 8192, maxParticles: 8192);
 
-        // Engine Frame Profiler + Frame Pacer (defaults: VSync ON, FPS Cap 60)
+        BundleManager* bundles = engAlloc.Persistent.Alloc<BundleManager>(1, 64);
+        *bundles = BundleManager.Create(ref engAlloc.Persistent, maxBundles: 16);
+
+        SceneManager* scenes = engAlloc.Persistent.Alloc<SceneManager>(1, 64);
+        *scenes = SceneManager.Create(ref engAlloc.Persistent, maxDefinitions: 16, maxActiveScenes: 8);
+
         FrameProfiler* profiler = engAlloc.Persistent.Alloc<FrameProfiler>(1, 64);
         *profiler = FrameProfiler.Create(ref engAlloc.Persistent, enabled: true, measureGpuWithFence: true);
-        FramePacer pacer = FramePacer.Create(targetFps, vsync);
-        ProfilerOverlay profOverlay = default;
+
+        FramePacer* pacer = engAlloc.Persistent.Alloc<FramePacer>(1, 64);
+        *pacer = FramePacer.Create(targetFps, vsync);
+
+        ProfilerOverlay* profOverlay = engAlloc.Persistent.Alloc<ProfilerOverlay>(1, 64);
+        *profOverlay = default;
 
         GameSimState* sim = gameAlloc.Persistent.Alloc<GameSimState>(1, 64);
         *sim = GameSimState.Create(ref gameAlloc.Persistent, seed: 20260417UL);
@@ -150,77 +241,101 @@ public static unsafe class Program
         GameViewState* view = gameAlloc.Persistent.Alloc<GameViewState>(1, 64);
         *view = GameViewState.Create(ref gameAlloc.Persistent, sim);
 
-        var window = PlatformSystem.InitWindow("Bring Engine — Bring Arena", 1280, 720, hidden: verifyRender);
+        EnginePipelineState* pipeline = engAlloc.Persistent.Alloc<EnginePipelineState>(1, 64);
+        *pipeline = default;
+
+        GameLogicContext* logicCtx = engAlloc.Persistent.Alloc<GameLogicContext>(1, 64);
+
+        var window = PlatformSystem.InitWindow("Bring Engine — Bring Arena", 1280, 720, hidden: verifyRender, mode: windowMode);
         GpuContext* gpu = engAlloc.Persistent.Alloc<GpuContext>(1, 64);
-        *gpu = GpuSystem.Create(window.Window, ref engAlloc.Persistent, ref world.Assets, debugMode: false);
-        GpuSystem.BindAssetCleanupHooks(gpu, ref world.Assets);
-        FramePacerSystem.ApplyVSync(ref pacer, ref *gpu, vsync);
+        *gpu = GpuSystem.Create(window.Window, ref engAlloc.Persistent, ref world->Assets, debugMode: false);
+        GpuSystem.BindAssetCleanupHooks(gpu, ref world->Assets);
+        FramePacerSystem.ApplyVSync(ref *pacer, ref *gpu, vsync);
 
         try
         {
-            // Compile engine built-in HLSL shaders + ShowcaseGame's custom hologram shader via SDL_shadercross
             ShaderSystem.CompileBuiltinShaders(ref *gpu);
             string holoPath = Path.Combine(GameAssets.ShadersDir, "hologram_energy.hlsl");
             view->HologramShader = ShaderSystem.CompileFromFile(ref *gpu, holoPath, "hologram_energy", ShaderVertexLayout.Mesh3D, SDL.GPUCullMode.None);
 
-            // Register Ref-Counted Asset Bundles
-            var bCommon = BundleSystem.Register(ref bundles, "common", 4 * 1024 * 1024, &GameAssets.LoadCommonBundle);
-            var bTitle = BundleSystem.Register(ref bundles, "title", 4 * 1024 * 1024, &GameAssets.LoadTitleBundle);
-            var bArena = BundleSystem.Register(ref bundles, "arena", 6 * 1024 * 1024, &GameAssets.LoadArenaBundle);
+            var bCommon = BundleSystem.Register(ref *bundles, "common", 4 * 1024 * 1024, &GameAssets.LoadCommonBundle);
+            var bTitle = BundleSystem.Register(ref *bundles, "title", 4 * 1024 * 1024, &GameAssets.LoadTitleBundle);
+            var bArena = BundleSystem.Register(ref *bundles, "arena", 6 * 1024 * 1024, &GameAssets.LoadArenaBundle);
 
-            // Register Unity-Like Scenes
             Span<BundleId> titleDeps = stackalloc BundleId[] { bCommon, bTitle };
             Span<BundleId> arenaDeps = stackalloc BundleId[] { bCommon, bArena };
             Span<BundleId> hudDeps = stackalloc BundleId[] { bCommon };
 
-            SceneSystem.RegisterScene(ref scenes, ref engAlloc.Persistent, "Title", titleDeps, 512 * 1024,
+            SceneSystem.RegisterScene(ref *scenes, ref engAlloc.Persistent, "Title", titleDeps, 512 * 1024,
                 onLoad: &GameViewSystems.OnTitleLoad, onViewSync: &GameViewSystems.OnTitleViewSync, userData: view);
-            SceneSystem.RegisterScene(ref scenes, ref engAlloc.Persistent, "Arena", arenaDeps, 1024 * 1024,
+            SceneSystem.RegisterScene(ref *scenes, ref engAlloc.Persistent, "Arena", arenaDeps, 1024 * 1024,
                 onLoad: &GameViewSystems.OnArenaLoad, onViewSync: &GameViewSystems.OnArenaViewSync, userData: view);
-            SceneSystem.RegisterScene(ref scenes, ref engAlloc.Persistent, "HUD", hudDeps, 256 * 1024,
+            SceneSystem.RegisterScene(ref *scenes, ref engAlloc.Persistent, "HUD", hudDeps, 256 * 1024,
                 onLoad: &GameViewSystems.OnHudLoad, onViewSync: &GameViewSystems.OnHudViewSync, userData: view);
 
-            // Load Title Scene (Single) — acquires shared 'common' bundle
-            SceneSystem.LoadScene(ref scenes, ref world, ref engAlloc, ref bundles, StringId.Hash("Title"), SceneLoadMode.Single);
+            // Load Title Scene & immediately upload scene assets on Main Thread before starting 2-thread pipeline!
+            SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("Title"), SceneLoadMode.Single);
+            BatchRenderer.UploadPendingAssets(ref *gpu, ref *world);
 
-            // Create persistent Common Profiler UI Overlay (survives all Single/Additive scene switches!)
-            FontHandle mainFont = AssetSystem.FindFont(in world.Assets, StringId.Hash("main_font"));
-            TextureHandle whiteTex = AssetSystem.FindTexture(in world.Assets, StringId.Hash("white"));
-            profOverlay = ProfilerOverlaySystem.Create(ref world, mainFont, whiteTex, window.PixelWidth, window.PixelHeight, ProfilerAnchor.TopRight, startVisible: true);
+            FontHandle mainFont = AssetSystem.FindFont(in world->Assets, StringId.Hash("main_font"));
+            TextureHandle whiteTex = AssetSystem.FindTexture(in world->Assets, StringId.Hash("white"));
+            *profOverlay = ProfilerOverlaySystem.Create(ref *world, mainFont, whiteTex, window.PixelWidth, window.PixelHeight, ProfilerAnchor.TopRight, startVisible: true);
+
+            *logicCtx = new GameLogicContext
+            {
+                EngAlloc = &engAlloc,
+                GameAlloc = &gameAlloc,
+                World = world,
+                Bundles = bundles,
+                Scenes = scenes,
+                Profiler = profiler,
+                Pacer = pacer,
+                ProfOverlay = profOverlay,
+                Sim = sim,
+                View = view,
+                FixedSingleStepMode = (byte)(verifyRender ? 1 : 0),
+                ProfileScopesActive = 1,
+            };
+
+            RenderShaderDefaults builtinShaders = GpuSystem.GetBuiltinShaders(in *gpu);
+            EnginePipelineSystem.Start(pipeline, logicCtx, &RunLogicFrame, in builtinShaders);
 
             if (verifyRender)
             {
                 Directory.CreateDirectory(outDir);
                 GpuSystem.EnsureCaptureTarget(ref *gpu, 1280, 720);
 
-                // 1. Render Title scene (40 fast-forward sim ticks, then 8 real 60 FPS paced & profiled GPU frames!)
+                // 1. Title Scene: 36 fast-forward ticks + 12 real 2-thread pipelined 60 FPS profiled frames!
+                InputState scriptedInput = default;
                 for (int f = 0; f < 48; f++)
                 {
-                    bool renderNow = f >= 40;
-                    if (f == 40) ProfilerSystem.ResetHistory(ref *profiler);
+                    bool paced = f >= 36;
+                    if (f == 36) ProfilerSystem.ResetHistory(ref *profiler);
+                    logicCtx->ProfileScopesActive = (byte)(paced ? 1 : 0);
 
-                    if (renderNow)
+                    if (paced)
                     {
-                        FramePacerSystem.BeginFrame(ref pacer);
+                        FramePacerSystem.BeginFrame(ref *pacer);
                         ProfilerSystem.BeginFrame(ref *profiler);
                     }
-                    engAlloc.BeginFrame();
-                    gameAlloc.BeginFrame();
 
-                    int vsScope = renderNow ? ProfilerSystem.BeginScope(ref *profiler, "View") : -1;
-                    SceneSystem.ViewSyncActiveScenes(ref scenes, ref world, ref engAlloc, ref bundles, 1f / 60f);
-                    if (vsScope >= 0) ProfilerSystem.EndScope(ref *profiler, vsScope);
-
-                    int csScope = renderNow ? ProfilerSystem.BeginScope(ref *profiler, "Core") : -1;
-                    ProfilerOverlaySystem.Update(ref profOverlay, ref world, in *profiler, in gpu->LastFrameStats, in pacer, 1280f, 720f);
-                    EngineWorldSystem.StepCoreSystems(ref world, ref engAlloc, 1f / 60f, 1280f, 720f);
-                    if (csScope >= 0) ProfilerSystem.EndScope(ref *profiler, csScope);
-
-                    if (renderNow)
+                    var fin = new PipelineFrameInput
                     {
-                        BatchRenderer.RenderFrame(ref *gpu, ref world, ref engAlloc, in view->Lighting, captureToOffscreen: true, profiler: profiler);
-                        ProfilerSystem.EndCpuWork(ref *profiler);
-                        FramePacerSystem.EndFrameAndPace(ref pacer, useSdlPreciseDelay: true);
+                        Input = scriptedInput,
+                        DeltaTime = 1f / 60f,
+                        ViewportWidth = 1280f,
+                        ViewportHeight = 720f,
+                        PrevRenderStats = gpu->LastFrameStats,
+                        PrevRenderCpuMs = pipeline->LastRenderCpuMs,
+                        PrevGpuMs = pipeline->LastGpuMs,
+                        BuiltinShaders = builtinShaders,
+                    };
+
+                    EnginePipelineSystem.StepPipelinedFrame(pipeline, ref *gpu, ref engAlloc, in fin, captureToOffscreen: true, profiler: paced ? profiler : null);
+
+                    if (paced)
+                    {
+                        FramePacerSystem.EndFrameAndPace(ref *pacer, useSdlPreciseDelay: true);
                         ProfilerSystem.EndFrame(ref *profiler);
                     }
                 }
@@ -228,51 +343,48 @@ public static unsafe class Program
                 string titlePng = Path.Combine(outDir, "verify_title.png");
                 GpuSystem.SaveCaptureTextureToPng(ref *gpu, titlePng);
                 var ts = gpu->LastFrameStats;
-                Console.WriteLine($"  [Title] Captured {titlePng} | FPS={profiler->CurrentFps:F1}, CPU={profiler->SmoothedCpuMs:F2}ms, GPU={profiler->SmoothedGpuMs:F2}ms, Draws={ts.DrawCalls}, SetPass={ts.SetPassCalls}, Passes={ts.RenderPasses + ts.CopyPasses}");
-                Console.WriteLine($"  [Bundles] Loaded={bundles.LoadedBundleCount} (title={BundleSystem.IsLoaded(in bundles, bTitle)}, arena={BundleSystem.IsLoaded(in bundles, bArena)})");
+                Console.WriteLine($"  [Title 2T] Captured {titlePng} | FPS={profiler->CurrentFps:F1}, CPU={profiler->SmoothedLogicMs:F2}ms, RND={profiler->SmoothedRenderMs:F2}ms, GPU={profiler->SmoothedGpuMs:F2}ms, Draws={ts.DrawCalls}, SetPass={ts.SetPassCalls}, Passes={ts.RenderPasses + ts.CopyPasses}");
+                Console.WriteLine($"  [Bundles] Loaded={bundles->LoadedBundleCount} (title={BundleSystem.IsLoaded(in *bundles, bTitle)}, arena={BundleSystem.IsLoaded(in *bundles, bArena)})");
 
-                // 2. Transition Single -> Arena + Additive -> HUD (title bundle unloads, Profiler Overlay stays alive!)
+                // 2. Scene Transition at clean quiescent barrier -> Arena (Single) + HUD (Additive)
+                EnginePipelineSystem.FlushBeforeSceneTransition(pipeline, ref *gpu);
                 GameSimSystems.ResetMatch(ref *sim, 20260417UL);
-                SceneSystem.LoadScene(ref scenes, ref world, ref engAlloc, ref bundles, StringId.Hash("Arena"), SceneLoadMode.Single);
-                SceneSystem.LoadScene(ref scenes, ref world, ref engAlloc, ref bundles, StringId.Hash("HUD"), SceneLoadMode.Additive);
-                Console.WriteLine($"  [Transition -> Arena+HUD] Loaded={bundles.LoadedBundleCount} (common={BundleSystem.GetRefCount(in bundles, bCommon)}, title={BundleSystem.IsLoaded(in bundles, bTitle)}, arena={BundleSystem.IsLoaded(in bundles, bArena)})");
+                SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("Arena"), SceneLoadMode.Single);
+                SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("HUD"), SceneLoadMode.Additive);
+                BatchRenderer.UploadPendingAssets(ref *gpu, ref *world);
+                Console.WriteLine($"  [Transition -> Arena+HUD] Loaded={bundles->LoadedBundleCount} (common={BundleSystem.GetRefCount(in *bundles, bCommon)}, title={BundleSystem.IsLoaded(in *bundles, bTitle)}, arena={BundleSystem.IsLoaded(in *bundles, bArena)})");
 
-                // 3. Step 88 scripted gameplay ticks (last 8 frames rendered & paced at 60 FPS for live profiler readings!)
-                Fix32 fixedDt = Fix32.FromRatio(1, 60);
-                for (int f = 0; f < 88; f++)
+                // 3. Step 92 scripted gameplay frames on the 2-thread pipeline (last 12 frames paced at 60 FPS!)
+                for (int f = 0; f < 92; f++)
                 {
-                    bool renderNow = f >= 80;
+                    bool paced = f >= 80;
                     if (f == 80) ProfilerSystem.ResetHistory(ref *profiler);
+                    logicCtx->ProfileScopesActive = (byte)(paced ? 1 : 0);
 
-                    if (renderNow)
+                    if (paced)
                     {
-                        FramePacerSystem.BeginFrame(ref pacer);
+                        FramePacerSystem.BeginFrame(ref *pacer);
                         ProfilerSystem.BeginFrame(ref *profiler);
                     }
-                    engAlloc.BeginFrame();
-                    gameAlloc.BeginFrame();
 
-                    FeedScriptedGameplayInput(ref world.Input, f);
-
-                    int simScope = renderNow ? ProfilerSystem.BeginScope(ref *profiler, "Sim") : -1;
-                    GameSimSystems.StepFixed(ref *sim, in world.Input, fixedDt);
-                    if (simScope >= 0) ProfilerSystem.EndScope(ref *profiler, simScope);
-
-                    int viewScope = renderNow ? ProfilerSystem.BeginScope(ref *profiler, "View") : -1;
-                    view->CachedRenderStats = gpu->LastFrameStats;
-                    SceneSystem.ViewSyncActiveScenes(ref scenes, ref world, ref engAlloc, ref bundles, 1f / 60f);
-                    ProfilerOverlaySystem.Update(ref profOverlay, ref world, in *profiler, in gpu->LastFrameStats, in pacer, 1280f, 720f);
-                    if (viewScope >= 0) ProfilerSystem.EndScope(ref *profiler, viewScope);
-
-                    int coreScope = renderNow ? ProfilerSystem.BeginScope(ref *profiler, "Core") : -1;
-                    EngineWorldSystem.StepCoreSystems(ref world, ref engAlloc, 1f / 60f, 1280f, 720f);
-                    if (coreScope >= 0) ProfilerSystem.EndScope(ref *profiler, coreScope);
-
-                    if (renderNow)
+                    FeedScriptedGameplayInput(ref scriptedInput, f);
+                    var fin = new PipelineFrameInput
                     {
-                        BatchRenderer.RenderFrame(ref *gpu, ref world, ref engAlloc, in view->Lighting, captureToOffscreen: true, profiler: profiler);
-                        ProfilerSystem.EndCpuWork(ref *profiler);
-                        FramePacerSystem.EndFrameAndPace(ref pacer, useSdlPreciseDelay: true);
+                        Input = scriptedInput,
+                        DeltaTime = 1f / 60f,
+                        ViewportWidth = 1280f,
+                        ViewportHeight = 720f,
+                        PrevRenderStats = gpu->LastFrameStats,
+                        PrevRenderCpuMs = pipeline->LastRenderCpuMs,
+                        PrevGpuMs = pipeline->LastGpuMs,
+                        BuiltinShaders = builtinShaders,
+                    };
+
+                    EnginePipelineSystem.StepPipelinedFrame(pipeline, ref *gpu, ref engAlloc, in fin, captureToOffscreen: true, profiler: paced ? profiler : null);
+
+                    if (paced)
+                    {
+                        FramePacerSystem.EndFrameAndPace(ref *pacer, useSdlPreciseDelay: true);
                         ProfilerSystem.EndFrame(ref *profiler);
                     }
                 }
@@ -280,82 +392,75 @@ public static unsafe class Program
                 string arenaPng = Path.Combine(outDir, "verify_arena.png");
                 GpuSystem.SaveCaptureTextureToPng(ref *gpu, arenaPng);
                 var st = gpu->LastFrameStats;
-                Console.WriteLine($"  [Arena+HUD] Captured {arenaPng} | Score={sim->Score} | FPS={profiler->CurrentFps:F1}, CPU={profiler->SmoothedCpuMs:F2}ms, GPU={profiler->SmoothedGpuMs:F2}ms, Draws={st.DrawCalls}, SetPass={st.SetPassCalls}, Passes={st.RenderPasses + st.CopyPasses}, FrameArena={st.FrameArenaUsedBytes / 1024}KB");
+                Console.WriteLine($"  [Arena+HUD 2T] Captured {arenaPng} | Score={sim->Score} | FPS={profiler->CurrentFps:F1}, CPU={profiler->SmoothedLogicMs:F2}ms, RND={profiler->SmoothedRenderMs:F2}ms, GPU={profiler->SmoothedGpuMs:F2}ms, Draws={st.DrawCalls}, SetPass={st.SetPassCalls}, Passes={st.RenderPasses + st.CopyPasses}, FrameArena={st.FrameArenaUsedBytes / 1024}KB");
             }
             else
             {
-                // Interactive Playable Loop (Fixed 60Hz Simulation + Profiled Render + VSync & FPS Cap Pacing)
-                const float fixedStep = 1f / 60f;
-                Fix32 fixedDt = Fix32.FromRatio(1, 60);
-                float accumulator = 0f;
-
-                while (window.Closed == 0 && world.Input.QuitRequested == 0)
+                // Interactive 2-Thread Pipelined Loop (Main/Render Thread + Dedicated Logic Thread)
+                InputState mainInput = default;
+                while (window.Closed == 0 && mainInput.QuitRequested == 0)
                 {
-                    FramePacerSystem.BeginFrame(ref pacer);
+                    FramePacerSystem.BeginFrame(ref *pacer);
                     ProfilerSystem.BeginFrame(ref *profiler);
 
                     float frameDt = PlatformSystem.PollDeltaSeconds(ref window);
-                    PlatformSystem.PollEvents(ref window, ref world.Input);
-                    if (world.Input.IsKeyPressed(KeyCode.Escape)) break;
+                    PlatformSystem.PollEvents(ref window, ref mainInput);
+                    if (mainInput.IsKeyPressed(KeyCode.Escape)) break;
 
-                    // Profiler / VSync / FPS Cap Debug Hotkeys
-                    if (world.Input.IsKeyPressed(KeyCode.F1))
-                        ProfilerOverlaySystem.Toggle(ref profOverlay, ref world);
-                    if (world.Input.IsKeyPressed(KeyCode.F2))
-                        FramePacerSystem.ToggleVSync(ref pacer, ref *gpu);
-                    if (world.Input.IsKeyPressed(KeyCode.F3))
-                        FramePacerSystem.CycleFpsCapPreset(ref pacer);
+                    // Standard Engine Hotkeys (safe here at the quiescent frame barrier!)
+                    if (mainInput.IsKeyPressed(KeyCode.F1))
+                        ProfilerOverlaySystem.Toggle(ref *profOverlay, ref *world);
+                    if (mainInput.IsKeyPressed(KeyCode.F2))
+                        FramePacerSystem.ToggleVSync(ref *pacer, ref *gpu);
+                    if (mainInput.IsKeyPressed(KeyCode.F3))
+                        FramePacerSystem.CycleFpsCapPreset(ref *pacer);
+                    if (mainInput.IsKeyPressed(KeyCode.F11))
+                        PlatformSystem.ToggleBorderlessFullscreen(ref window);
 
-                    // Handle scene transitions requested by view/input
+                    // Scene transitions executed cleanly at the frame barrier (zero race conditions!)
                     if (view->RequestStartArena != 0)
                     {
                         view->RequestStartArena = 0;
-                        GameSimSystems.ResetMatch(ref *sim, (ulong)(world.TickCount + 20260417UL));
-                        SceneSystem.LoadScene(ref scenes, ref world, ref engAlloc, ref bundles, StringId.Hash("Arena"), SceneLoadMode.Single);
-                        SceneSystem.LoadScene(ref scenes, ref world, ref engAlloc, ref bundles, StringId.Hash("HUD"), SceneLoadMode.Additive);
+                        EnginePipelineSystem.FlushBeforeSceneTransition(pipeline, ref *gpu);
+                        GameSimSystems.ResetMatch(ref *sim, (ulong)(world->TickCount + 20260417UL));
+                        SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("Arena"), SceneLoadMode.Single);
+                        SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("HUD"), SceneLoadMode.Additive);
+                        BatchRenderer.UploadPendingAssets(ref *gpu, ref *world);
                     }
                     else if (view->RequestReturnTitle != 0)
                     {
                         view->RequestReturnTitle = 0;
-                        SceneSystem.LoadScene(ref scenes, ref world, ref engAlloc, ref bundles, StringId.Hash("Title"), SceneLoadMode.Single);
+                        EnginePipelineSystem.FlushBeforeSceneTransition(pipeline, ref *gpu);
+                        SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("Title"), SceneLoadMode.Single);
+                        BatchRenderer.UploadPendingAssets(ref *gpu, ref *world);
                     }
 
-                    engAlloc.BeginFrame();
-                    gameAlloc.BeginFrame();
-
-                    int simScope = ProfilerSystem.BeginScope(ref *profiler, "Sim");
-                    accumulator += frameDt;
-                    while (accumulator >= fixedStep)
+                    var fin = new PipelineFrameInput
                     {
-                        if (view->Mode == 1)
-                            GameSimSystems.StepFixed(ref *sim, in world.Input, fixedDt);
-                        accumulator -= fixedStep;
-                    }
-                    ProfilerSystem.EndScope(ref *profiler, simScope);
+                        Input = mainInput,
+                        DeltaTime = frameDt,
+                        ViewportWidth = window.PixelWidth,
+                        ViewportHeight = window.PixelHeight,
+                        PrevRenderStats = gpu->LastFrameStats,
+                        PrevRenderCpuMs = pipeline->LastRenderCpuMs,
+                        PrevGpuMs = pipeline->LastGpuMs,
+                        BuiltinShaders = builtinShaders,
+                    };
 
-                    int viewScope = ProfilerSystem.BeginScope(ref *profiler, "View");
-                    view->CachedRenderStats = gpu->LastFrameStats;
-                    SceneSystem.ViewSyncActiveScenes(ref scenes, ref world, ref engAlloc, ref bundles, frameDt);
-                    ProfilerOverlaySystem.Update(ref profOverlay, ref world, in *profiler, in gpu->LastFrameStats, in pacer, window.PixelWidth, window.PixelHeight);
-                    ProfilerSystem.EndScope(ref *profiler, viewScope);
+                    // Runs Logic Thread (Frame N) concurrently with Main/Render Thread (Frame N-1) and swaps double-buffered arenas!
+                    EnginePipelineSystem.StepPipelinedFrame(pipeline, ref *gpu, ref engAlloc, in fin, captureToOffscreen: false, profiler: profiler);
 
-                    int coreScope = ProfilerSystem.BeginScope(ref *profiler, "Core");
-                    EngineWorldSystem.StepCoreSystems(ref world, ref engAlloc, frameDt, window.PixelWidth, window.PixelHeight);
-                    ProfilerSystem.EndScope(ref *profiler, coreScope);
-
-                    BatchRenderer.RenderFrame(ref *gpu, ref world, ref engAlloc, in view->Lighting, captureToOffscreen: false, profiler: profiler);
-
-                    ProfilerSystem.EndCpuWork(ref *profiler);
-                    FramePacerSystem.EndFrameAndPace(ref pacer, useSdlPreciseDelay: true);
+                    FramePacerSystem.EndFrameAndPace(ref *pacer, useSdlPreciseDelay: true);
                     ProfilerSystem.EndFrame(ref *profiler);
                 }
             }
         }
         finally
         {
-            ProfilerOverlaySystem.Destroy(ref profOverlay, ref world);
-            SceneSystem.UnloadAllScenes(ref scenes, ref world, ref engAlloc, ref bundles);
-            BundleSystem.UnloadAll(ref bundles, ref world);
+            EnginePipelineSystem.Stop(pipeline);
+            ProfilerOverlaySystem.Destroy(ref *profOverlay, ref *world);
+            SceneSystem.UnloadAllScenes(ref *scenes, ref *world, ref engAlloc, ref *bundles);
+            BundleSystem.UnloadAll(ref *bundles, ref *world);
             GpuSystem.Dispose(ref *gpu);
             PlatformSystem.Shutdown(ref window);
             gameAlloc.Dispose();

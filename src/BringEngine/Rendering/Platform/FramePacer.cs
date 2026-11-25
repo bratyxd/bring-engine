@@ -94,6 +94,11 @@ public static unsafe class FramePacerSystem
         }
 
         double targetNs = 1_000_000_000.0 / pacer.TargetFps;
+        // When VSync is active in windowed/fullscreen presentation, leave a small 0.4ms margin so CPU delay never
+        // overshoots the monitor's VBlank deadline (prevents 60<->30 FPS beat judder & presentation flicker).
+        if (useSdlPreciseDelay && pacer.EffectiveVSync != 0 && targetNs > 2_000_000.0)
+            targetNs -= 400_000.0;
+
         long now = Stopwatch.GetTimestamp();
         double elapsedNs = (now - pacer.FrameStartTick) * s_ticksToNs;
         double remainingNs = targetNs - elapsedNs;
