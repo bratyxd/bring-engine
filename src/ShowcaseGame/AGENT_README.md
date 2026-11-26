@@ -1,6 +1,7 @@
 # AI Agent Game Blueprint — Building Games on Bring Engine (`ShowcaseGame`)
 
 > Use `src/ShowcaseGame/` as your **canonical template** whenever creating a new game with Bring Engine.
+> For the full subsystem index see [`AGENTS.md`](../../AGENTS.md); for cross-OS publishing, packaging, macOS signing without a Mac, and shipped build sizes see [`docs/agents/14-publishing-and-distribution.md`](../../docs/agents/14-publishing-and-distribution.md).
 
 ## 1. Folder Structure (Strict Simulation vs. View Separation)
 ```text
@@ -23,7 +24,7 @@ src/<YourGame>/
 ## 2. Golden Rules Checklist for Game Agents
 1. **Desktop CoreCLR (.NET 10) + Self-Contained ReadyToRun (Windows, Linux / Steam Deck, macOS)**:
    - Games run on **CoreCLR JIT** for fast 1–2s `dotnet build` / `dotnet run` iteration, Dynamic PGO SIMD throughput, and full .NET NuGet package compatibility (physics, audio, networking, modding, serializers, etc.).
-   - Publishing with `-r <rid>` (`win-x64`, `linux-x64`, `osx-arm64`) automatically produces a standalone **self-contained single-file ReadyToRun** executable (no .NET install required on the player's PC or Steam Deck).
+   - Publishing with `-r <rid>` (`win-x64`, `linux-x64`, `osx-arm64`, `osx-x64`) produces a standalone **self-contained single-file ReadyToRun** executable (no `.NET` install required on the player's PC or Steam Deck, and all targets can be cross-published from Windows `x64` — see [`docs/agents/14-publishing-and-distribution.md`](../../docs/agents/14-publishing-and-distribution.md)).
    - Keep hot loops (`StepFixed`, `OnViewSync`, `ExtractRenderPacket`) strictly zero-OOP and zero-GC so CoreCLR never pauses mid-frame.
 2. **Allocate once at startup**: Create `EngineAllocators` and `GameAllocators` in `Program.Main`. Call `BeginFrame()` every frame; NEVER allocate managed objects in `StepFixed` or `OnViewSync`.
 3. **Pure Data + Static Systems**: No classes for entities, enemies, bullets, or UI widgets. Put arrays in `GameSimState` (`FixVec3* EnemyPos`, `byte* EnemyAlive`, ...) and iterate linearly in `static unsafe class GameSimSystems`.
@@ -49,9 +50,15 @@ src/<YourGame>/
    - Use `JobScheduler` + `JobSystem` (`ParallelFor`, async `ScheduleParallelFor` + `IsComplete`, `CombineDependencies`, `RequestCancel`, per-worker `GetWorkerScratch`) when profiling shows a genuinely heavy SoA loop (hundreds/thousands of independent entities, particles, transforms, spatial/flow grids) or multi-frame background generation (maps, nav grids, chunk meshes).
    - **Do NOT multithread tiny loops** (< ~500–1000 items or < 0.5 ms) — pass a sensible `minParallelCount` so small workloads stay single-threaded inline with zero sync overhead.
    - Keep parallel kernels deterministic (disjoint writes, per-item seeded `DetRng`, zero SDL3/GPU calls, always `RequestCancel` + `Complete` before resetting/disposing arenas). See [`docs/agents/12-multithreading-and-jobs.md`](../../docs/agents/12-multithreading-and-jobs.md).
-10. **Verify Desktop Publish, Headless Determinism & GPU Render**:
-   ```bash
-   dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64
-   ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --headless --ticks 600
-   ./src/ShowcaseGame/bin/Release/net10.0/win-x64/publish/ShowcaseGame.exe --verify-render
-   ```
+10. **Verify Desktop Publish, Cross-OS Targets, Headless Determinism & GPU Render**:
+    ```bash
+    # Windows (default local verification)
+    dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64 -o dist/win-x64
+    ./dist/win-x64/ShowcaseGame.exe --headless --ticks 600
+    ./dist/win-x64/ShowcaseGame.exe --verify-render
+
+    # Cross-OS desktop targets (all publishable directly from Windows x64 — no Mac required)
+    dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r linux-x64 -o dist/linux-x64
+    dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r osx-arm64 -o dist/osx-arm64
+    ```
+    See [`docs/agents/14-publishing-and-distribution.md`](../../docs/agents/14-publishing-and-distribution.md) for Linux executable/symlink packaging, macOS `.app` bundling, Gatekeeper/notarization (`rcodesign` / macOS CI), and baseline release sizes.
