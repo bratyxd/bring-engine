@@ -9,7 +9,7 @@
 
 1. **NO OOP — Pure Data + Static Systems**
    - NEVER use class inheritance, `virtual`, `override`, `abstract`, or interface dispatch in engine or game code.
-   - Store all state in `[StructLayout(LayoutKind.Sequential)]` `unmanaged struct` tables (SoA / dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`, `HttpRequestHandle`, `WebSocketHandle`).
+   - Store all state in `[StructLayout(LayoutKind.Sequential)]` `unmanaged struct` tables (SoA / dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`, `HttpRequestHandle`, `WebSocketHandle`, `LogFileHandle`).
    - Put behavior in `public static unsafe class <Feature>System` methods and use unmanaged function pointers (`delegate*<...>`) for callbacks.
 
 2. **Desktop CoreCLR (.NET 10) + Self-Contained ReadyToRun — Windows, Linux (Steam Deck), macOS**
@@ -30,6 +30,7 @@
      - **Zone 2 — Game-level heavy cold-path orchestration** (multi-step live-ops, auth/JWT refresh, retries, IAP, CDN patching, backend SDKs like PlayFab/Nakama/EOS): Quarantine standard C# `async`/`await` + `Task` (`.NET 10` `HttpClient` or NuGet SDKs) inside an isolated background `Services/` layer with a shutdown `CancellationToken`. Background `async` code MUST NEVER touch `GameSimState`, `EngineWorld`, `EngineAllocators`, or SDL3/GPU directly — publish plain unmanaged results/snapshots into a thread-safe mailbox polled synchronously once per frame on the Logic Thread (0 GC). See [`docs/agents/16-networking-and-multiplayer.md`](docs/agents/16-networking-and-multiplayer.md).
    - **Multithreading (`JobSystem`)**: Use only when profiling justifies it (heavy SoA loops or multi-frame background jobs — never tiny loops). See [`docs/agents/12-multithreading-and-jobs.md`](docs/agents/12-multithreading-and-jobs.md).
    - **Defaults**: Launch in **Borderless Full Window** (`WindowMode.BorderlessFullscreen`), **VSync ON**, **60 FPS cap**, and wire `ProfilerOverlay` (`F1` overlay, `F2` VSync, `F3` FPS cap, `F11` borderless/windowed). See [`docs/agents/11-vsync-fps-cap-and-profiling.md`](docs/agents/11-vsync-fps-cap-and-profiling.md).
+   - **Selective, High-Signal Logging (`LogSystem`)**: Both core engine and game code MUST log selectively — **never spam** per-frame/per-entity hot loops at `Info`+, and **never stay silent** on key milestones. Log important lifecycle/state transitions and failures with detailed context (IDs, counts, timings, codes, paths) so logs clearly explain what happened. See [`docs/agents/17-logging.md`](docs/agents/17-logging.md).
 
 5. **GPU Batching, Default Compressed Atlases, `.bpack` Bundles & 9-Slice UI**
    - Pack all raw `.png`/`.jpg`/`.glb`/`.ttf` source assets into **BC1/BC3 GPU-compressed atlased `.bpack` bundles** (Brotli/LZ4) via `BringPacker`, and ship **ZERO loose PNG/JPG textures** in `dist/` (`BringPacker --verify-no-loose-textures dist`).
@@ -41,7 +42,7 @@
 
 - `BringEngine.sln` & `Directory.Build.props` — Solution and Desktop CoreCLR (`.NET 10`) build settings.
 - `src/BringEngine/` — Core Engine Library (`net10.0`):
-  - `Core/` — `Memory/` (`LinearArena`, `PoolAllocator<T>`, `FreeListAllocator`, `EngineAllocators`, native containers, `FixedString*`, `StringId`), `Profiling/` (`FrameProfiler`, `ProfilerSystem`), `Threading/` (`EnginePipelineSystem`, `JobSystem`), `Handles/`, `Math/` (`Fix32/64`, `FixVec2/3`, `DetMath`, `DetRng`, `Vec/Quat/Mat4`).
+  - `Core/` — `Memory/` (`LinearArena`, `PoolAllocator<T>`, `FreeListAllocator`, `EngineAllocators`, native containers, `FixedString*`, `StringId`), `Logging/` (`LogSystem`, zero-GC UTF-8 `[InterpolatedStringHandler]`, OS-standard rolling files), `Profiling/` (`FrameProfiler`, `ProfilerSystem`), `Threading/` (`EnginePipelineSystem`, `JobSystem`), `Handles/`, `Math/` (`Fix32/64`, `FixVec2/3`, `DetMath`, `DetRng`, `Vec/Quat/Mat4`).
   - `Networking/` — Zero-dependency `.NET 10` BCL networking (`HttpSystem`, `WebSocketSystem`), zero-GC binary `NetWriter`/`NetReader`/`NetHash.Crc32`, pluggable `NetTransportVTable`, and deterministic `LoopbackTransportSystem`.
   - `Simulation/` — `EntityTable`, `TransformTable`, `EngineWorld`, `CameraTable`, `InputState`, `TweenTable`, `AnimationTable`, `ParticleTable`, `RenderComponentTables`, `SceneManager`.
   - `Assets/` — `AssetRegistry`, `BundleManager`, `Compression/` (BC1/BC3 `BRTX`, LZ4/Brotli, `BGLB`), `Atlases/` (`AtlasPacker`), `Packing/` (`AssetPackBuilder` / `AssetPackLoader`), `TextureLoader`, `SdfFontLoader`, `GltfLoader`, `GlbBuilder`.
@@ -79,6 +80,7 @@
 | 12 | [`12-multithreading-and-jobs.md`](docs/agents/12-multithreading-and-jobs.md) | Data-oriented `JobSystem` (`ParallelFor`, async DAGs, cancel, worker scratch, when NOT to parallelize) |
 | 13 | [`13-asset-compression-atlases-and-9slice.md`](docs/agents/13-asset-compression-atlases-and-9slice.md) | BC1/BC3 texture compression, LZ4/Brotli `.bpack` & GLB compression, default atlasing, `BringPacker`, 9-slice UI |
 | 16 | [`16-networking-and-multiplayer.md`](docs/agents/16-networking-and-multiplayer.md) | Lean core `HttpSystem`, `WebSocketSystem`, zero-GC `NetWriter`/`NetReader`, `NetTransportVTable`, `LoopbackTransport`, and game-level multiplayer (`LiteNetLib`, `Backdash`, `Facepunch.Steamworks`) |
+| 17 | [`17-logging.md`](docs/agents/17-logging.md) | Zero-GC core `LogSystem`, OS-standard log paths (`%LOCALAPPDATA%` / `~/Library/Logs` / `$XDG_STATE_HOME`), `LogFileHandle`, and 10k-line FIFO trimming |
 
 ---
 

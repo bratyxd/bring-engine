@@ -384,3 +384,25 @@ public readonly struct WebSocketHandle : IEquatable<WebSocketHandle>
     public static bool operator !=(WebSocketHandle a, WebSocketHandle b) => a.Raw != b.Raw;
     public override string ToString() => IsValid ? $"WebSocket({Index}:g{Generation})" : "WebSocket(Invalid)";
 }
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct LogFileHandle : IEquatable<LogFileHandle>
+{
+    public readonly uint Raw;
+    public static readonly LogFileHandle Default = default;
+    public static readonly LogFileHandle Invalid = default;
+    public bool IsValid => Raw != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public LogFileHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LogFileHandle Create(uint index, uint generation) => new LogFileHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(LogFileHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is LogFileHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(LogFileHandle a, LogFileHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(LogFileHandle a, LogFileHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"LogFile({Index}:g{Generation})" : "LogFile(Default)";
+}

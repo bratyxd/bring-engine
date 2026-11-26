@@ -15,6 +15,7 @@ public static class Program
 
         Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - CoreCLR Test Suite{(headlessOnly ? " (Headless Only)" : "")}");
         CoreTests.RunAll();
+        LoggingTests.RunAll();
         JobSystemTests.RunAll();
         NetworkingTests.RunAll();
         SimulationTests.RunAll();
