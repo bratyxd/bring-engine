@@ -80,11 +80,10 @@ public unsafe struct SaveChunkWriter
 
     public bool WriteChunk(StringId id, ushort chunkVersion, ReadOnlySpan<byte> payload, ushort flags = 0)
     {
-        if (Overflow != 0 || !id.IsValid || payload.Length < 0)
-        {
-            Overflow = 1;
+        if (Overflow != 0)
             return false;
-        }
+        if (!id.IsValid || payload.Length < 0)
+            return false;
 
         long neededLong = (long)Buffer.Count + ChunkHeaderSize + payload.Length;
         if (neededLong > int.MaxValue)

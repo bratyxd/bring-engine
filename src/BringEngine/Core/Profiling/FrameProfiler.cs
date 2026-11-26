@@ -77,17 +77,27 @@ public unsafe struct FrameProfiler
 
     public ProfileScopeSample* LastFrameScopes;
     public int LastFrameScopeCount;
+    public int PublishSeq;
 
     public static FrameProfiler Create(ref LinearArena persistentArena, bool enabled = true, bool measureGpuWithFence = true)
     {
-        return new FrameProfiler
+        ArenaMarker mark = persistentArena.SaveMarker();
+        try
         {
-            Enabled = (byte)(enabled ? 1 : 0),
-            MeasureGpuWithFence = (byte)(measureGpuWithFence ? 1 : 0),
-            ActiveScopes = persistentArena.Alloc<ProfileScopeSample>(MaxScopesPerFrame, 64),
-            LastFrameScopes = persistentArena.Alloc<ProfileScopeSample>(MaxScopesPerFrame, 64),
-            LastFrameEndTick = Stopwatch.GetTimestamp(),
-        };
+            return new FrameProfiler
+            {
+                Enabled = (byte)(enabled ? 1 : 0),
+                MeasureGpuWithFence = (byte)(measureGpuWithFence ? 1 : 0),
+                ActiveScopes = persistentArena.Alloc<ProfileScopeSample>(MaxScopesPerFrame, 64),
+                LastFrameScopes = persistentArena.Alloc<ProfileScopeSample>(MaxScopesPerFrame, 64),
+                LastFrameEndTick = Stopwatch.GetTimestamp(),
+            };
+        }
+        catch
+        {
+            persistentArena.Rollback(mark);
+            throw;
+        }
     }
 
     internal byte HasExplicitLogicMs { readonly get => _hasExplicitLogicMs; set => _hasExplicitLogicMs = value; }
@@ -103,16 +113,25 @@ public static unsafe class ProfilerSystem
     {
         if (p.Enabled == 0) return;
 
-        // Copy scopes BEFORE publishing LastFrameScopeCount so concurrent readers never see tearing
+        // Seqlock-guarded publish so concurrent readers never observe torn LastFrameScopes snapshots
         int prevCount = Volatile.Read(ref p.ActiveScopeCount);
         if (prevCount < 0) prevCount = 0;
         if (prevCount > FrameProfiler.MaxScopesPerFrame) prevCount = FrameProfiler.MaxScopesPerFrame;
+
+        int seq = Volatile.Read(ref p.PublishSeq);
+        Volatile.Write(ref p.PublishSeq, seq + 1);
+        Thread.MemoryBarrier();
+
+        Volatile.Write(ref p.LastFrameScopeCount, 0);
         if (prevCount > 0 && p.ActiveScopes != null && p.LastFrameScopes != null)
         {
             nuint bytes = (nuint)(prevCount * sizeof(ProfileScopeSample));
             Buffer.MemoryCopy(p.ActiveScopes, p.LastFrameScopes, bytes, bytes);
         }
         Volatile.Write(ref p.LastFrameScopeCount, prevCount);
+
+        Thread.MemoryBarrier();
+        Volatile.Write(ref p.PublishSeq, seq + 2);
 
         Volatile.Write(ref p.ActiveScopeCount, 0);
         Volatile.Write(ref p.CurrentDepth, 0);
@@ -297,15 +316,43 @@ public static unsafe class ProfilerSystem
     {
         if (p.LastFrameScopes != null)
         {
-            int count = Volatile.Read(ref Unsafe.AsRef(in p.LastFrameScopeCount));
-            if (count > FrameProfiler.MaxScopesPerFrame) count = FrameProfiler.MaxScopesPerFrame;
             FixedString64 target = FixedString64.From(scopeName);
-            for (int i = 0; i < count; i++)
+            ref int seqRef = ref Unsafe.AsRef(in p.PublishSeq);
+            ref int countRef = ref Unsafe.AsRef(in p.LastFrameScopeCount);
+
+            for (int attempt = 0; attempt < 16; attempt++)
             {
-                if (p.LastFrameScopes[i].Name.Equals(target))
+                int seq1 = Volatile.Read(ref seqRef);
+                if ((seq1 & 1) != 0)
                 {
-                    durationMs = p.LastFrameScopes[i].DurationMs;
-                    return true;
+                    Thread.SpinWait(8);
+                    continue;
+                }
+                Thread.MemoryBarrier();
+
+                int count = Volatile.Read(ref countRef);
+                if (count < 0) count = 0;
+                if (count > FrameProfiler.MaxScopesPerFrame) count = FrameProfiler.MaxScopesPerFrame;
+
+                bool found = false;
+                double foundMs = 0.0;
+                for (int i = 0; i < count; i++)
+                {
+                    ProfileScopeSample sample = p.LastFrameScopes[i];
+                    if (sample.Name.Equals(target))
+                    {
+                        found = true;
+                        foundMs = sample.DurationMs;
+                        break;
+                    }
+                }
+
+                Thread.MemoryBarrier();
+                int seq2 = Volatile.Read(ref seqRef);
+                if (seq1 == seq2)
+                {
+                    durationMs = found ? foundMs : 0.0;
+                    return found;
                 }
             }
         }

@@ -427,21 +427,30 @@ public unsafe struct NativeSparseSet<T> where T : unmanaged
         if (denseCapacity <= 0)
             throw new ArgumentOutOfRangeException(nameof(denseCapacity), "denseCapacity must be positive.");
 
-        int* sparse = arena.AllocUninitialized<int>(maxEntityId, 64);
-        for (int i = 0; i < maxEntityId; i++) sparse[i] = -1;
-
-        uint* denseIds = arena.AllocUninitialized<uint>(denseCapacity, 64);
-        T* denseValues = arena.Alloc<T>(denseCapacity, 64);
-
-        return new NativeSparseSet<T>
+        ArenaMarker mark = arena.SaveMarker();
+        try
         {
-            Sparse = sparse,
-            DenseIds = denseIds,
-            DenseValues = denseValues,
-            MaxEntityId = maxEntityId,
-            DenseCapacity = denseCapacity,
-            Count = 0,
-        };
+            int* sparse = arena.AllocUninitialized<int>(maxEntityId, 64);
+            for (int i = 0; i < maxEntityId; i++) sparse[i] = -1;
+
+            uint* denseIds = arena.AllocUninitialized<uint>(denseCapacity, 64);
+            T* denseValues = arena.Alloc<T>(denseCapacity, 64);
+
+            return new NativeSparseSet<T>
+            {
+                Sparse = sparse,
+                DenseIds = denseIds,
+                DenseValues = denseValues,
+                MaxEntityId = maxEntityId,
+                DenseCapacity = denseCapacity,
+                Count = 0,
+            };
+        }
+        catch
+        {
+            arena.Rollback(mark);
+            throw;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -552,19 +561,28 @@ public unsafe struct NativeHashMap<TValue> where TValue : unmanaged
         int cap = 16;
         while (cap < target) cap <<= 1;
 
-        ulong* keys = arena.Alloc<ulong>(cap, 64);
-        TValue* values = arena.Alloc<TValue>(cap, 64);
-        byte* states = arena.Alloc<byte>(cap, 64);
-
-        return new NativeHashMap<TValue>
+        ArenaMarker mark = arena.SaveMarker();
+        try
         {
-            Keys = keys,
-            Values = values,
-            States = states,
-            Capacity = cap,
-            Mask = cap - 1,
-            Count = 0,
-        };
+            ulong* keys = arena.Alloc<ulong>(cap, 64);
+            TValue* values = arena.Alloc<TValue>(cap, 64);
+            byte* states = arena.Alloc<byte>(cap, 64);
+
+            return new NativeHashMap<TValue>
+            {
+                Keys = keys,
+                Values = values,
+                States = states,
+                Capacity = cap,
+                Mask = cap - 1,
+                Count = 0,
+            };
+        }
+        catch
+        {
+            arena.Rollback(mark);
+            throw;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

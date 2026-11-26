@@ -54,9 +54,18 @@ public unsafe ref struct LogUtf8Builder
             return;
         }
         int copy = utf8.Length <= rem ? utf8.Length : rem;
-        utf8.Slice(0, copy).CopyTo(new Span<byte>(_dst + Length, copy));
-        Length += copy;
-        if (copy < utf8.Length) Truncated = 1;
+        if (copy < utf8.Length)
+        {
+            int minCopy = copy > 3 ? copy - 3 : 0;
+            while (copy > minCopy && (utf8[copy] & 0xC0) == 0x80)
+                copy--;
+            Truncated = 1;
+        }
+        if (copy > 0)
+        {
+            utf8.Slice(0, copy).CopyTo(new Span<byte>(_dst + Length, copy));
+            Length += copy;
+        }
     }
 
     public void AppendChars(ReadOnlySpan<char> chars)
@@ -258,6 +267,7 @@ public unsafe ref struct LogUtf8Builder
         if (typeof(T) == typeof(SkeletonHandle)) { AppendHandle("Skeleton"u8, Unsafe.As<T, SkeletonHandle>(ref value).Raw); return; }
         if (typeof(T) == typeof(AnimPlayerHandle)) { AppendHandle("AnimPlayer"u8, Unsafe.As<T, AnimPlayerHandle>(ref value).Raw); return; }
         if (typeof(T) == typeof(SpriteAnimPlayerHandle)) { AppendHandle("SpriteAnimPlayer"u8, Unsafe.As<T, SpriteAnimPlayerHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(SpriteAnimClipHandle)) { AppendHandle("SpriteAnimClip"u8, Unsafe.As<T, SpriteAnimClipHandle>(ref value).Raw); return; }
         if (typeof(T) == typeof(TweenHandle)) { AppendHandle("Tween"u8, Unsafe.As<T, TweenHandle>(ref value).Raw); return; }
         if (typeof(T) == typeof(EmitterHandle)) { AppendHandle("Emitter"u8, Unsafe.As<T, EmitterHandle>(ref value).Raw); return; }
         if (typeof(T) == typeof(CameraHandle)) { AppendHandle("Camera"u8, Unsafe.As<T, CameraHandle>(ref value).Raw); return; }

@@ -24,6 +24,7 @@ public static unsafe class CoreTests
         Assert.Run("Containers_TombstonesOverflowBoundsAndUtf8Strings", &TestContainersAndStringsEdgeCases);
         Assert.Run("Math_Fix64LargeVectorsDetMathAcosPowExpBounds3", &TestMathComprehensiveEdgeCases);
         Assert.Run("FrameProfiler_MaxScopesDisabledZeroTicksAndReset", &TestFrameProfilerEdgeCases);
+        Assert.Run("Core_AllocatorOomRollbackAlignmentAndMathEdgeCases", &TestAllocatorOomRollbackAlignmentAndMathEdgeCases);
     }
 
     private static void TestLinearArena()
@@ -251,6 +252,7 @@ public static unsafe class CoreTests
         Assert.True(SkeletonHandle.Create(3, 2).IsValid && !SkeletonHandle.Invalid.IsValid, "SkeletonHandle");
         Assert.True(AnimPlayerHandle.Create(7, 9).IsValid && AnimPlayerHandle.Create(7, 9).Index == 7 && AnimPlayerHandle.Create(7, 9).Generation == 9 && !AnimPlayerHandle.Invalid.IsValid, "AnimPlayerHandle");
         Assert.True(SpriteAnimPlayerHandle.Create(11, 4).IsValid && SpriteAnimPlayerHandle.Create(11, 4).Index == 11 && SpriteAnimPlayerHandle.Create(11, 4).Generation == 4 && !SpriteAnimPlayerHandle.Invalid.IsValid, "SpriteAnimPlayerHandle");
+        Assert.True(SpriteAnimClipHandle.Create(13, 6).IsValid && SpriteAnimClipHandle.Create(13, 6).Index == 13 && SpriteAnimClipHandle.Create(13, 6).Generation == 6 && !SpriteAnimClipHandle.Invalid.IsValid, "SpriteAnimClipHandle");
         Assert.True(TweenHandle.Create(3, 2).IsValid && !TweenHandle.Invalid.IsValid, "TweenHandle");
         Assert.True(EmitterHandle.Create(3, 2).IsValid && !EmitterHandle.Invalid.IsValid, "EmitterHandle");
         Assert.True(CameraHandle.Create(3, 2).IsValid && !CameraHandle.Invalid.IsValid, "CameraHandle");
@@ -568,5 +570,94 @@ public static unsafe class CoreTests
 
         arena.Dispose();
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after FrameProfiler test");
+    }
+
+    private static void TestAllocatorOomRollbackAlignmentAndMathEdgeCases()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+
+        // CORE-06: EngineAllocators.Create rolls back earlier native allocations on OOM
+        long liveBefore = NativeMemoryTracker.LiveBytes;
+        long blocksBefore = NativeMemoryTracker.LiveBlocks;
+        bool threwEngOom = false;
+        try { _ = EngineAllocators.Create(4096, 4096, 4096, nuint.MaxValue); }
+        catch (OutOfMemoryException) { threwEngOom = true; }
+        Assert.True(threwEngOom, "EngineAllocators.Create throws OOM on overflowing dynamicBytes");
+        Assert.Equal(liveBefore, NativeMemoryTracker.LiveBytes, "EngineAllocators.Create OOM restores exact LiveBytes");
+        Assert.Equal(blocksBefore, NativeMemoryTracker.LiveBlocks, "EngineAllocators.Create OOM restores exact LiveBlocks");
+
+        // CORE-14: LinearArena absolute address alignment for alignment > 64 (256 and 4096)
+        var arenas = new LinearArena[8];
+        try
+        {
+            for (int i = 0; i < arenas.Length; i++)
+            {
+                arenas[i] = LinearArena.Create(16384, (ulong)(i + 1));
+                _ = arenas[i].AllocBytes((nuint)((i + 1) * 13), 1);
+                void* p256 = arenas[i].AllocBytes(64, 256);
+                Assert.True(((nuint)p256 & 255u) == 0, $"Arena {i} 256-byte aligned pointer");
+                void* p4096 = arenas[i].AllocBytes(64, 4096);
+                Assert.True(((nuint)p4096 & 4095u) == 0, $"Arena {i} 4096-byte aligned pointer");
+            }
+        }
+        finally
+        {
+            for (int i = 0; i < arenas.Length; i++)
+                arenas[i].Dispose();
+        }
+
+        // CORE-18: Multi-allocation Create helpers roll back LinearArena.Offset on mid-way OOM
+        var tight = LinearArena.Create(1024);
+        try
+        {
+            _ = tight.AllocBytes(64, 64);
+            nuint markOffset = tight.Offset;
+
+            bool threwPool = false;
+            try { _ = PoolAllocator<int>.Create(ref tight, 128); } // slots(512) ok, freeStack(512) OOM
+            catch (OutOfMemoryException) { threwPool = true; }
+            Assert.True(threwPool && tight.Offset == markOffset, "PoolAllocator.Create mid-way OOM restores arena.Offset");
+
+            bool threwSparse = false;
+            try { _ = NativeSparseSet<int>.Create(ref tight, maxEntityId: 128, denseCapacity: 128); } // sparse(512) ok, denseIds(512) OOM
+            catch (OutOfMemoryException) { threwSparse = true; }
+            Assert.True(threwSparse && tight.Offset == markOffset, "NativeSparseSet.Create mid-way OOM restores arena.Offset");
+
+            bool threwMap = false;
+            try { _ = NativeHashMap<Vec4>.Create(ref tight, minCapacity: 32); } // cap=64: keys(512) ok, values(1024) OOM
+            catch (OutOfMemoryException) { threwMap = true; }
+            Assert.True(threwMap && tight.Offset == markOffset, "NativeHashMap.Create mid-way OOM restores arena.Offset");
+        }
+        finally
+        {
+            tight.Dispose();
+        }
+
+        // CORE-13: DetMath.Sin/Cos large-angle range reduction
+        float[] largeAngles = { 1e6f, 1e7f, 1e9f, 1e20f, float.MaxValue, -float.MaxValue };
+        for (int i = 0; i < largeAngles.Length; i++)
+        {
+            float a = largeAngles[i];
+            float s = DetMath.Sin(a);
+            float c = DetMath.Cos(a);
+            Assert.True(float.IsFinite(s) && DetMath.Abs(s) <= 1.0001f, $"DetMath.Sin({a}) finite and bounded: {s}");
+            Assert.True(float.IsFinite(c) && DetMath.Abs(c) <= 1.0001f, $"DetMath.Cos({a}) finite and bounded: {c}");
+        }
+
+        // CORE-19: Quat.FromAxisAngle zero-axis returns Identity
+        Quat qZero = Quat.FromAxisAngle(Vec3.Zero, DetMath.Pi);
+        Assert.True(qZero.Equals(Quat.Identity), "Quat.FromAxisAngle(Vec3.Zero, Pi) == Quat.Identity");
+
+        // CORE-21: DetMath.Atan2(±Inf, ±Inf) and Fix64.FromRatio with large numerator
+        Assert.Near(DetMath.Pi * 0.25f, DetMath.Atan2(float.PositiveInfinity, float.PositiveInfinity), 1e-5f, "Atan2(+Inf,+Inf)");
+        Assert.Near(-DetMath.Pi * 0.25f, DetMath.Atan2(float.NegativeInfinity, float.PositiveInfinity), 1e-5f, "Atan2(-Inf,+Inf)");
+        Assert.Near(DetMath.Pi * 0.75f, DetMath.Atan2(float.PositiveInfinity, float.NegativeInfinity), 1e-5f, "Atan2(+Inf,-Inf)");
+        Assert.Near(-DetMath.Pi * 0.75f, DetMath.Atan2(float.NegativeInfinity, float.NegativeInfinity), 1e-5f, "Atan2(-Inf,-Inf)");
+
+        Fix64 bigRatio = Fix64.FromRatio(1_000_000_000_000L, 1_000_000_000L);
+        Assert.True(System.Math.Abs(bigRatio.ToDouble() - 1000.0) < 1e-6, $"Fix64.FromRatio large numerator exact: {bigRatio.ToDouble()}");
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after core audit regression tests");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after core audit regression tests");
     }
 }

@@ -274,7 +274,7 @@ public readonly struct Fix64 : IEquatable<Fix64>, IComparable<Fix64>
     public static Fix64 FromFix32(Fix32 v) => new Fix64((long)v.Raw << 16);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Fix64 FromRatio(long num, long den) => new Fix64((num << Shift) / den);
+    public static Fix64 FromRatio(long num, long den) => new Fix64((long)(((Int128)num << Shift) / den));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public double ToDouble() => Raw * (1.0 / OneRaw);

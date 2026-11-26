@@ -25,22 +25,31 @@ public unsafe struct PoolAllocator<T> where T : unmanaged
         if (capacity <= 0)
             throw new ArgumentOutOfRangeException(nameof(capacity), "PoolAllocator capacity must be positive.");
 
-        T* slots = arena.Alloc<T>(capacity, 64);
-        int* freeStack = arena.AllocUninitialized<int>(capacity, 16);
-        byte* inUse = arena.Alloc<byte>(capacity, 16);
-        for (int i = 0; i < capacity; i++)
-            freeStack[i] = capacity - 1 - i;
-
-        return new PoolAllocator<T>
+        ArenaMarker mark = arena.SaveMarker();
+        try
         {
-            Slots = slots,
-            FreeStack = freeStack,
-            InUse = inUse,
-            Capacity = capacity,
-            FreeCount = capacity,
-            ActiveCount = 0,
-            _ownsMemory = 0,
-        };
+            T* slots = arena.Alloc<T>(capacity, 64);
+            int* freeStack = arena.AllocUninitialized<int>(capacity, 16);
+            byte* inUse = arena.Alloc<byte>(capacity, 16);
+            for (int i = 0; i < capacity; i++)
+                freeStack[i] = capacity - 1 - i;
+
+            return new PoolAllocator<T>
+            {
+                Slots = slots,
+                FreeStack = freeStack,
+                InUse = inUse,
+                Capacity = capacity,
+                FreeCount = capacity,
+                ActiveCount = 0,
+                _ownsMemory = 0,
+            };
+        }
+        catch
+        {
+            arena.Rollback(mark);
+            throw;
+        }
     }
 
     public static PoolAllocator<T> CreateStandalone(int capacity)

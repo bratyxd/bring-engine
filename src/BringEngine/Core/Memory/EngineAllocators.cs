@@ -43,15 +43,22 @@ public unsafe struct EngineAllocators
         nuint scratchBytes = 16 * 1024 * 1024,
         nuint dynamicBytes = 16 * 1024 * 1024)
     {
-        return new EngineAllocators
+        EngineAllocators alloc = default;
+        try
         {
-            Persistent = LinearArena.Create(persistentBytes, StringId.Hash("Persistent").Value),
-            Frame = LinearArena.Create(frameBytes, StringId.Hash("FrameA").Value),
-            FrameBack = LinearArena.Create(frameBytes, StringId.Hash("FrameB").Value),
-            Scratch = LinearArena.Create(scratchBytes, StringId.Hash("Scratch").Value),
-            Dynamic = FreeListAllocator.Create(dynamicBytes),
-            FrameSwapCount = 0,
-        };
+            alloc.Persistent = LinearArena.Create(persistentBytes, StringId.Hash("Persistent").Value);
+            alloc.Frame = LinearArena.Create(frameBytes, StringId.Hash("FrameA").Value);
+            alloc.FrameBack = LinearArena.Create(frameBytes, StringId.Hash("FrameB").Value);
+            alloc.Scratch = LinearArena.Create(scratchBytes, StringId.Hash("Scratch").Value);
+            alloc.Dynamic = FreeListAllocator.Create(dynamicBytes);
+            alloc.FrameSwapCount = 0;
+            return alloc;
+        }
+        catch
+        {
+            alloc.Dispose();
+            throw;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

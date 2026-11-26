@@ -71,10 +71,12 @@ public unsafe struct LinearArena
             throw new ArgumentException("Alignment must be a power of 2.", nameof(alignment));
 
         nuint mask = alignment - 1;
-        if (Offset > nuint.MaxValue - mask)
+        nuint baseAddr = (nuint)BasePtr;
+        nuint curAddr = baseAddr + Offset;
+        if (curAddr > nuint.MaxValue - mask)
             throw new OutOfMemoryException($"LinearArena overflow: requested {byteCount} bytes (align {alignment}), used {Offset}/{Capacity}.");
 
-        nuint alignedOffset = (Offset + mask) & ~mask;
+        nuint alignedOffset = ((curAddr + mask) & ~mask) - baseAddr;
         if (alignedOffset > Capacity || byteCount > Capacity - alignedOffset)
             throw new OutOfMemoryException($"LinearArena overflow: requested {byteCount} bytes (align {alignment}), used {Offset}/{Capacity}.");
 

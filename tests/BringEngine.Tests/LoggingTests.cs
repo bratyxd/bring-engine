@@ -24,6 +24,7 @@ public static unsafe class LoggingTests
         Assert.Run("LogSystem_OverflowDropNewest_SlotExhaustionAndGenerationReuse", &TestOverflowDropNewestSlotExhaustionAndGenReuse);
         Assert.Run("LogSystem_TruncationNonAsciiZeroGcAllHandlesAndRuntimeMinLevel", &TestTruncationNonAsciiAllHandlesAndMinLevel);
         Assert.Run("LogSystem_UnobservedCancellationSkipAndCloseRace", &TestUnobservedCancellationSkipAndCloseRace);
+        Assert.Run("LogSystem_MultiInstanceHooksPostStopRaceStartFailureAndUtf8Cap", &TestMultiInstanceHooksPostStopStartFailureAndUtf8Cap);
     }
 
     private static string CreateTempLogDir(string suffix)
@@ -603,5 +604,256 @@ public static unsafe class LoggingTests
 
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after unobserved/close-race test");
         Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after unobserved/close-race test");
+    }
+
+    private static void TestMultiInstanceHooksPostStopStartFailureAndUtf8Cap()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tempDir = CreateTempLogDir("core_audit");
+        string tempDirB = CreateTempLogDir("core_audit_b");
+
+        try
+        {
+            // CORE-10: maxFiles > 20-bit handle capacity throws ArgumentOutOfRangeException
+            var capAlloc = EngineAllocators.Create(256 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+            try
+            {
+                LogState* capLog = capAlloc.Persistent.Alloc<LogState>(1, 64);
+                bool threwCap = false;
+                try { LogSystem.Start(capLog, ref capAlloc.Persistent, maxFiles: int.MaxValue, directoryOverride: tempDir, hookExceptions: false); }
+                catch (ArgumentOutOfRangeException) { threwCap = true; }
+                Assert.True(threwCap, "LogSystem.Start rejects maxFiles=int.MaxValue");
+            }
+            finally
+            {
+                capAlloc.Dispose();
+            }
+
+            // CORE-07: 10x failed LogSystem.Start on 256-byte arena does not leak pool slots or arena offset; subsequent valid Start succeeds
+            var tinyArena = LinearArena.Create(256);
+            try
+            {
+                var stateHolder = LinearArena.Create(4096);
+                try
+                {
+                    LogState* failLog = stateHolder.Alloc<LogState>(1, 64);
+                    nuint offsetBefore = tinyArena.Offset;
+                    for (int i = 0; i < 10; i++)
+                    {
+                        bool threw = false;
+                        try { LogSystem.Start(failLog, ref tinyArena, directoryOverride: tempDir, hookExceptions: false); }
+                        catch (OutOfMemoryException) { threw = true; }
+                        Assert.True(threw && tinyArena.Offset == offsetBefore, $"Failed Start #{i} rolled back tinyArena.Offset and pool slot");
+                    }
+                }
+                finally
+                {
+                    stateHolder.Dispose();
+                }
+            }
+            finally
+            {
+                tinyArena.Dispose();
+            }
+
+            // Verify a valid Start succeeds immediately after 10 failures (MaxInstances is 8!)
+            var validAlloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+            LogState* validLog = validAlloc.Persistent.Alloc<LogState>(1, 64);
+            try
+            {
+                LogSystem.Start(validLog, ref validAlloc.Persistent, directoryOverride: tempDir, hookExceptions: false);
+
+                // CORE-20 + SpriteAnimClipHandle: 3-byte CJK FixedString256 crossing 492-byte cap + 0-GC SpriteAnimClipHandle
+                FixedString256 cjk256 = FixedString256.From(new string('世', 80));
+                string pad489 = new string('A', 489);
+                string pad490 = new string('B', 490);
+                string pad491 = new string('C', 491);
+                LogSystem.Info(validLog, $"{pad489}{cjk256}");
+                LogSystem.Info(validLog, $"{pad490}{cjk256}");
+                LogSystem.Info(validLog, $"{pad491}{cjk256}");
+
+                var clipH = SpriteAnimClipHandle.Create(15, 7);
+                LogSystem.Info(validLog, $"Warmup clip={clipH}");
+                LogSystem.Flush(validLog);
+
+                long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+                for (int i = 0; i < 20; i++)
+                    LogSystem.Info(validLog, $"Clip={clipH}");
+                long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+                Assert.Equal(0L, gcAfter - gcBefore, "Formatting SpriteAnimClipHandle allocates 0 GC bytes");
+
+                LogSystem.Flush(validLog);
+                byte[] rawBytes = ReadAllBytesShared(LogSystem.GetFilePath(validLog));
+                var strictUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+                string decoded = strictUtf8.GetString(rawBytes);
+                Assert.True(!decoded.Contains('\uFFFD'), "Truncated CJK FixedString256 decodes as strictly valid UTF-8");
+                Assert.True(decoded.Contains("SpriteAnimClip(15:g7)", StringComparison.Ordinal), "SpriteAnimClipHandle formatted cleanly");
+            }
+            finally
+            {
+                // CORE-17: 4-thread barrier-synchronized concurrent LogSystem.Stop()
+                using var barrier = new Barrier(4);
+                nint lp = (nint)validLog;
+                Exception? stopErr = null;
+                var stopThreads = new Thread[4];
+                for (int t = 0; t < 4; t++)
+                {
+                    stopThreads[t] = new Thread(() =>
+                    {
+                        try
+                        {
+                            barrier.SignalAndWait();
+                            LogSystem.Stop((LogState*)lp);
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.CompareExchange(ref stopErr, ex, null);
+                        }
+                    });
+                    stopThreads[t].Start();
+                }
+                for (int t = 0; t < 4; t++) stopThreads[t].Join();
+                Assert.True(stopErr == null, $"Concurrent LogSystem.Stop had 0 exceptions ({stopErr?.Message})");
+                validAlloc.Dispose();
+            }
+
+            // CORE-04: Multi-instance exception hooks — stop B while A stays hooked + concurrent start/stop/throw stress
+            var allocA = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+            var allocB = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+            LogState* logA = allocA.Persistent.Alloc<LogState>(1, 64);
+            LogState* logB = allocB.Persistent.Alloc<LogState>(1, 64);
+            try
+            {
+                LogSystem.Start(logA, ref allocA.Persistent, directoryOverride: tempDir, defaultFileName: "instA.log", hookExceptions: true);
+                LogSystem.Start(logB, ref allocB.Persistent, directoryOverride: tempDirB, defaultFileName: "instB.log", hookExceptions: true);
+                LogSystem.Stop(logB);
+
+                try { throw new InvalidOperationException("after-b-stopped-still-logged-by-a"); }
+                catch (InvalidOperationException) { }
+
+                LogSystem.Flush(logA);
+                string[] aLines = ReadAllLinesShared(LogSystem.GetFilePath(logA));
+                bool foundInA = false;
+                for (int i = 0; i < aLines.Length; i++)
+                {
+                    if (aLines[i].Contains("after-b-stopped-still-logged-by-a", StringComparison.Ordinal))
+                        foundInA = true;
+                }
+                Assert.True(foundInA, "Stopping stateB preserves exception hooks for stateA");
+            }
+            finally
+            {
+                LogSystem.Stop(logB);
+                LogSystem.Stop(logA);
+                allocB.Dispose();
+                allocA.Dispose();
+            }
+
+            // CORE-04 stress: concurrent start/stop/arena-dispose while throwing threads fire FirstChanceException
+            int stopThrowers = 0;
+            Exception? throwStressErr = null;
+            var throwers = new Thread[2];
+            for (int t = 0; t < throwers.Length; t++)
+            {
+                throwers[t] = new Thread(() =>
+                {
+                    while (Volatile.Read(ref stopThrowers) == 0)
+                    {
+                        try { throw new InvalidOperationException("hook-stress-ex"); }
+                        catch (InvalidOperationException) { }
+                    }
+                });
+                throwers[t].Start();
+            }
+            try
+            {
+                for (int cycle = 0; cycle < 10; cycle++)
+                {
+                    var ca = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+                    LogState* cl = ca.Persistent.Alloc<LogState>(1, 64);
+                    try
+                    {
+                        LogSystem.Start(cl, ref ca.Persistent, directoryOverride: tempDirB, defaultFileName: "hookstress.log", hookExceptions: true);
+                        Thread.Sleep(2);
+                    }
+                    finally
+                    {
+                        LogSystem.Stop(cl);
+                        ca.Dispose();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                throwStressErr = ex;
+            }
+            finally
+            {
+                Volatile.Write(ref stopThrowers, 1);
+                for (int t = 0; t < throwers.Length; t++) throwers[t].Join();
+            }
+            Assert.True(throwStressErr == null, $"Concurrent exception-hook start/stop/dispose stress succeeded ({throwStressErr?.Message})");
+
+            // CORE-05 / XMOD-04: 4 producer threads hammering LogSystem.Info across 20 Start/Stop cycles
+            var cycleAlloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+            LogState* cycleLog = cycleAlloc.Persistent.Alloc<LogState>(1, 64);
+            try
+            {
+                ArenaMarker baseMark = cycleAlloc.Persistent.SaveMarker();
+                Exception? raceErr = null;
+                nint cyclePtr = (nint)cycleLog;
+
+                for (int c = 0; c < 20; c++)
+                {
+                    cycleAlloc.Persistent.Rollback(baseMark);
+                    LogSystem.Start(cycleLog, ref cycleAlloc.Persistent, directoryOverride: tempDir, defaultFileName: "race_cycle.log", defaultMaxLines: 2000, queueCapacity: 256, hookExceptions: false);
+
+                    int stopProducers = 0;
+                    var producers = new Thread[4];
+                    for (int t = 0; t < producers.Length; t++)
+                    {
+                        int tid = t;
+                        producers[t] = new Thread(() =>
+                        {
+                            try
+                            {
+                                int seq = 0;
+                                while (Volatile.Read(ref stopProducers) == 0)
+                                    LogSystem.Info((LogState*)cyclePtr, $"race c={c} t={tid} seq={seq++}");
+                            }
+                            catch (Exception ex)
+                            {
+                                Interlocked.CompareExchange(ref raceErr, ex, null);
+                            }
+                        });
+                        producers[t].Start();
+                    }
+
+                    Thread.Sleep(2);
+                    // Stop while all 4 producer threads are actively hammering LogSystem.Info!
+                    LogSystem.Stop(cycleLog);
+
+                    Volatile.Write(ref stopProducers, 1);
+                    for (int t = 0; t < producers.Length; t++) producers[t].Join();
+
+                    Assert.Equal(cycleLog->TotalLogged.Value, cycleLog->TotalWritten.Value, $"Cycle {c}: TotalWritten == TotalLogged");
+                    Assert.Equal(0L, cycleLog->PendingRingCount, $"Cycle {c}: RingHead == RingTail");
+                }
+
+                Assert.True(raceErr == null, $"20 Start/Stop cycles under 4 producers had 0 exceptions ({raceErr?.Message})");
+            }
+            finally
+            {
+                cycleAlloc.Dispose();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+            TryDeleteDir(tempDirB);
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after CORE-04/05/07/10/17/20 LoggingTests");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after CORE-04/05/07/10/17/20 LoggingTests");
     }
 }

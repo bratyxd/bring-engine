@@ -102,6 +102,7 @@ internal struct SaveOpSlotMeta
 {
     public uint Generation;
     public int State; // 0 = Free, 1 = Pending, 2 = QueuedForPoll
+    public int CancelRequested;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -153,6 +154,7 @@ public unsafe struct SaveSystemState
     public byte Active;
     public int WorkerThreadId;
     internal int ShutdownFlag;
+    internal int StopClaimed;
     internal LogState* Log;
 
     public CachePaddedInt PendingCount;
@@ -180,11 +182,13 @@ public static unsafe class SaveSystem
         public string? SavesDirectory;
         public AutoResetEvent? WakeEvent;
         public Thread? WorkerThread;
+        public object? IoLock;
         public bool InUse;
     }
 
     private static readonly ManagedSavePool[] s_pools = new ManagedSavePool[MaxInstances];
     private static readonly object s_poolLock = new();
+    private static long s_tmpSeq;
 
     public static void Start(
         SaveSystemState* state,
@@ -196,11 +200,16 @@ public static unsafe class SaveSystem
         LogState* log = null)
     {
         if (state == null) throw new ArgumentNullException(nameof(state));
+        const int maxHandleCapacity = (int)(HandlePacking.IndexMask + 1);
+        if (maxPendingOps > maxHandleCapacity)
+            throw new ArgumentOutOfRangeException(nameof(maxPendingOps), maxPendingOps, $"maxPendingOps exceeds 20-bit handle capacity ({maxHandleCapacity}).");
         if (maxPendingOps < 4) maxPendingOps = 4;
         if (maxSaveBytes < 4096) maxSaveBytes = 4096;
 
-        int qCap = 8;
-        while (qCap < maxPendingOps * 2) qCap <<= 1;
+        long qCapLong = 8;
+        long minQCap = (long)maxPendingOps * 2L;
+        while (qCapLong < minQCap) qCapLong <<= 1;
+        int qCap = (int)qCapLong;
 
         string savesDir = directoryOverride.IsEmpty
             ? PlatformPaths.ResolveSavesDirectory(appName)
@@ -217,6 +226,7 @@ public static unsafe class SaveSystem
                     s_pools[i].InUse = true;
                     s_pools[i].SavesDirectory = savesDir;
                     s_pools[i].WakeEvent = new AutoResetEvent(false);
+                    s_pools[i].IoLock = new object();
                     poolSlot = i;
                     break;
                 }
@@ -225,6 +235,7 @@ public static unsafe class SaveSystem
         if (poolSlot < 0)
             throw new InvalidOperationException("Maximum concurrent SaveSystemState instances exceeded.");
 
+        ArenaMarker mark = persistentArena.SaveMarker();
         *state = default;
         try
         {
@@ -233,6 +244,7 @@ public static unsafe class SaveSystem
             {
                 state->Slots[i].Generation = 1;
                 state->Slots[i].State = 0;
+                state->Slots[i].CancelRequested = 0;
             }
             state->CmdQueue = persistentArena.Alloc<SaveCommand>(qCap, 64);
             state->CmdMask = qCap - 1;
@@ -242,7 +254,7 @@ public static unsafe class SaveSystem
             state->MaxSaveBytes = maxSaveBytes;
             state->PoolSlot = poolSlot;
             state->Log = log;
-            state->Active = 1;
+            Volatile.Write(ref state->Active, 1);
 
             nint rawPtr = (nint)state;
             var thread = new Thread(WorkerEntry)
@@ -255,13 +267,14 @@ public static unsafe class SaveSystem
         }
         catch
         {
-            state->Active = 0;
+            *state = default;
+            persistentArena.Rollback(mark);
             s_pools[poolSlot].WakeEvent?.Dispose();
             lock (s_poolLock) { s_pools[poolSlot] = default; }
             throw;
         }
 
-        if (log != null && log->Active != 0)
+        if (log != null && Volatile.Read(ref log->Active) != 0)
             LogSystem.Info(log, $"SaveSystem started: dir={savesDir} maxPendingOps={maxPendingOps} maxSaveBytes={maxSaveBytes}");
     }
 
@@ -271,10 +284,11 @@ public static unsafe class SaveSystem
     /// </summary>
     public static void Stop(SaveSystemState* state)
     {
-        if (state == null || state->Active == 0) return;
+        if (state == null || Volatile.Read(ref state->Active) == 0) return;
+        if (Interlocked.CompareExchange(ref state->StopClaimed, 1, 0) != 0) return;
         int poolSlot = state->PoolSlot;
 
-        state->Active = 0;
+        Volatile.Write(ref state->Active, 0);
         Volatile.Write(ref state->ShutdownFlag, 1);
         Thread.MemoryBarrier();
 
@@ -296,7 +310,7 @@ public static unsafe class SaveSystem
             s_pools[poolSlot] = default;
         }
 
-        if (state->Log != null && state->Log->Active != 0)
+        if (state->Log != null && Volatile.Read(ref state->Log->Active) != 0)
             LogSystem.Info(state->Log, $"SaveSystem stopped (saves={state->TotalSavesCompleted.Value}, loads={state->TotalLoadsCompleted.Value}, backups={state->TotalBackupRecoveries.Value})");
     }
 
@@ -371,6 +385,28 @@ public static unsafe class SaveSystem
     }
 
     /// <summary>
+    /// Cooperatively cancels a pending asynchronous save/load/delete operation (0 GC).
+    /// Returns true if the handle was still pending and flagged for cancellation; the caller still receives
+    /// a completed SaveResult with SaveStatus.Cancelled via PollCompleted.
+    /// </summary>
+    public static bool Cancel(SaveSystemState* state, SaveOpHandle handle)
+    {
+        if (state == null || !handle.IsValid) return false;
+        uint idx = handle.Index;
+        if (idx >= (uint)state->MaxPendingOps) return false;
+
+        bool cancelled = false;
+        AcquireSpinLock(ref state->SlotLock.Value);
+        if (state->Slots[idx].Generation == handle.Generation && state->Slots[idx].State == 1)
+        {
+            Volatile.Write(ref state->Slots[idx].CancelRequested, 1);
+            cancelled = true;
+        }
+        ReleaseSpinLock(ref state->SlotLock.Value);
+        return cancelled;
+    }
+
+    /// <summary>
     /// Pops the next completed save/load result from the native mailbox (0 GC bytes).
     /// Caller MUST call ReleaseResult(ref result) when done.
     /// </summary>
@@ -390,6 +426,7 @@ public static unsafe class SaveSystem
             AcquireSpinLock(ref state->SlotLock.Value);
             uint nextGen = HandlePacking.NextGeneration(state->Slots[idx].Generation);
             Volatile.Write(ref state->Slots[idx].Generation, nextGen);
+            Volatile.Write(ref state->Slots[idx].CancelRequested, 0);
             Volatile.Write(ref state->Slots[idx].State, 0);
             ReleaseSpinLock(ref state->SlotLock.Value);
         }
@@ -420,11 +457,15 @@ public static unsafe class SaveSystem
         PackCompressionMode compression = PackCompressionMode.Lz4,
         bool createBackup = true)
     {
-        if (state == null || state->Active == 0)
+        if (state == null || Volatile.Read(ref state->Active) == 0)
             return MakeErrorResult(SaveOpKind.Save, slotName, SaveStatus.IoError, "SaveSystem is not active.");
-        string savesDir = s_pools[state->PoolSlot].SavesDirectory!;
+        int poolSlot = state->PoolSlot;
+        string? savesDir = s_pools[poolSlot].SavesDirectory;
+        object? ioLock = s_pools[poolSlot].IoLock;
+        if (savesDir == null || ioLock == null)
+            return MakeErrorResult(SaveOpKind.Save, slotName, SaveStatus.IoError, "SaveSystem is not active.");
         string safeName = PlatformPaths.SanitizeFileName(slotName, "save.bsav");
-        return ExecuteSaveFile(state, savesDir, safeName, payload, schemaVersion, kind, compression, createBackup);
+        return ExecuteSaveFile(state, savesDir, ioLock, safeName, payload, schemaVersion, kind, compression, createBackup);
     }
 
     public static SaveResult SaveRawSync(
@@ -436,42 +477,56 @@ public static unsafe class SaveSystem
 
     public static SaveResult LoadSync(SaveSystemState* state, ReadOnlySpan<char> slotName)
     {
-        if (state == null || state->Active == 0)
+        if (state == null || Volatile.Read(ref state->Active) == 0)
             return MakeErrorResult(SaveOpKind.Load, slotName, SaveStatus.IoError, "SaveSystem is not active.");
-        string savesDir = s_pools[state->PoolSlot].SavesDirectory!;
+        int poolSlot = state->PoolSlot;
+        string? savesDir = s_pools[poolSlot].SavesDirectory;
+        object? ioLock = s_pools[poolSlot].IoLock;
+        if (savesDir == null || ioLock == null)
+            return MakeErrorResult(SaveOpKind.Load, slotName, SaveStatus.IoError, "SaveSystem is not active.");
         string safeName = PlatformPaths.SanitizeFileName(slotName, "save.bsav");
-        return ExecuteLoadFile(state, savesDir, safeName, rawMode: false);
+        return ExecuteLoadFile(state, savesDir, ioLock, safeName, rawMode: false);
     }
 
     public static SaveResult LoadRawSync(SaveSystemState* state, ReadOnlySpan<char> fileName)
     {
-        if (state == null || state->Active == 0)
+        if (state == null || Volatile.Read(ref state->Active) == 0)
             return MakeErrorResult(SaveOpKind.Load, fileName, SaveStatus.IoError, "SaveSystem is not active.");
-        string savesDir = s_pools[state->PoolSlot].SavesDirectory!;
+        int poolSlot = state->PoolSlot;
+        string? savesDir = s_pools[poolSlot].SavesDirectory;
+        object? ioLock = s_pools[poolSlot].IoLock;
+        if (savesDir == null || ioLock == null)
+            return MakeErrorResult(SaveOpKind.Load, fileName, SaveStatus.IoError, "SaveSystem is not active.");
         string safeName = PlatformPaths.SanitizeFileName(fileName, "settings.json");
-        return ExecuteLoadFile(state, savesDir, safeName, rawMode: true);
+        return ExecuteLoadFile(state, savesDir, ioLock, safeName, rawMode: true);
     }
 
     public static bool Exists(SaveSystemState* state, ReadOnlySpan<char> slotName)
     {
-        if (state == null || state->Active == 0 || slotName.IsEmpty) return false;
+        if (state == null || Volatile.Read(ref state->Active) == 0 || slotName.IsEmpty) return false;
         string path = GetSlotPath(state, slotName);
         return File.Exists(path) || File.Exists(path + ".bak");
     }
 
     public static bool Delete(SaveSystemState* state, ReadOnlySpan<char> slotName, bool deleteBackup = true)
     {
-        if (state == null || state->Active == 0 || slotName.IsEmpty) return false;
+        if (state == null || Volatile.Read(ref state->Active) == 0 || slotName.IsEmpty) return false;
+        object? ioLock = s_pools[state->PoolSlot].IoLock;
+        if (ioLock == null) return false;
         string path = GetSlotPath(state, slotName);
-        bool removed = false;
-        if (File.Exists(path)) { File.Delete(path); removed = true; }
-        if (deleteBackup && File.Exists(path + ".bak")) { File.Delete(path + ".bak"); removed = true; }
-        if (File.Exists(path + ".tmp")) { try { File.Delete(path + ".tmp"); } catch { } }
-        return removed;
+        if (string.IsNullOrEmpty(path)) return false;
+        lock (ioLock)
+        {
+            bool removed = false;
+            if (File.Exists(path)) { File.Delete(path); removed = true; }
+            if (deleteBackup && File.Exists(path + ".bak")) { File.Delete(path + ".bak"); removed = true; }
+            if (File.Exists(path + ".tmp")) { try { File.Delete(path + ".tmp"); } catch { } }
+            return removed;
+        }
     }
 
     public static string GetSavesDirectory(SaveSystemState* state)
-        => state != null && state->Active != 0 ? (s_pools[state->PoolSlot].SavesDirectory ?? string.Empty) : string.Empty;
+        => state != null && Volatile.Read(ref state->Active) != 0 ? (s_pools[state->PoolSlot].SavesDirectory ?? string.Empty) : string.Empty;
 
     public static string GetSlotPath(SaveSystemState* state, ReadOnlySpan<char> slotName)
     {
@@ -518,10 +573,20 @@ public static unsafe class SaveSystem
         bool backupFlag,
         ulong userTag)
     {
-        if (state == null || state->Active == 0 || slotName.IsEmpty)
+        if (state == null || Volatile.Read(ref state->Active) == 0 || slotName.IsEmpty)
             return SaveOpHandle.Invalid;
         if (payload.Length > state->MaxSaveBytes)
             return SaveOpHandle.Invalid;
+
+        // Allocate & copy payload BEFORE claiming a slot so OOM cannot leak a slot in State == 1
+        byte* payloadPtr = null;
+        nuint payloadAlloc = 0;
+        if (opKind == SaveOpKind.Save && payload.Length > 0)
+        {
+            payloadAlloc = (nuint)payload.Length;
+            payloadPtr = (byte*)NativeMemoryTracker.AlignedAlloc(payloadAlloc, 16);
+            payload.CopyTo(new Span<byte>(payloadPtr, payload.Length));
+        }
 
         int slotIdx = -1;
         uint gen = 0;
@@ -531,6 +596,7 @@ public static unsafe class SaveSystem
             if (state->Slots[i].State == 0)
             {
                 state->Slots[i].State = 1;
+                state->Slots[i].CancelRequested = 0;
                 gen = state->Slots[i].Generation;
                 slotIdx = i;
                 break;
@@ -539,15 +605,10 @@ public static unsafe class SaveSystem
         ReleaseSpinLock(ref state->SlotLock.Value);
 
         if (slotIdx < 0)
-            return SaveOpHandle.Invalid;
-
-        byte* payloadPtr = null;
-        nuint payloadAlloc = 0;
-        if (opKind == SaveOpKind.Save && payload.Length > 0)
         {
-            payloadAlloc = (nuint)payload.Length;
-            payloadPtr = (byte*)NativeMemoryTracker.AlignedAlloc(payloadAlloc, 16);
-            payload.CopyTo(new Span<byte>(payloadPtr, payload.Length));
+            if (payloadPtr != null && payloadAlloc > 0)
+                NativeMemoryTracker.AlignedFree(payloadPtr, payloadAlloc);
+            return SaveOpHandle.Invalid;
         }
 
         // Pre-sanitize slotName into FixedString256 with 0 GC bytes so async & sync resolve identical paths
@@ -577,13 +638,14 @@ public static unsafe class SaveSystem
         Interlocked.Increment(ref state->PendingCount.Value);
 
         AcquireSpinLock(ref state->CmdLock.Value);
-        if (state->Active == 0 || Volatile.Read(ref state->ShutdownFlag) != 0)
+        if (Volatile.Read(ref state->Active) == 0 || Volatile.Read(ref state->ShutdownFlag) != 0)
         {
             ReleaseSpinLock(ref state->CmdLock.Value);
             Interlocked.Decrement(ref state->PendingCount.Value);
             if (payloadPtr != null && payloadAlloc > 0)
                 NativeMemoryTracker.AlignedFree(payloadPtr, payloadAlloc);
             AcquireSpinLock(ref state->SlotLock.Value);
+            Volatile.Write(ref state->Slots[slotIdx].CancelRequested, 0);
             Volatile.Write(ref state->Slots[slotIdx].State, 0);
             ReleaseSpinLock(ref state->SlotLock.Value);
             return SaveOpHandle.Invalid;
@@ -604,6 +666,7 @@ public static unsafe class SaveSystem
         int poolSlot = state->PoolSlot;
         AutoResetEvent wakeEvt = s_pools[poolSlot].WakeEvent!;
         string savesDir = s_pools[poolSlot].SavesDirectory!;
+        object ioLock = s_pools[poolSlot].IoLock!;
 
         while (true)
         {
@@ -612,33 +675,52 @@ public static unsafe class SaveSystem
                 SaveResult res;
                 try
                 {
-                    string fallback = (cmd.OpKind != SaveOpKind.Delete && cmd.PayloadKind == SavePayloadKind.Raw)
-                        ? "settings.json"
-                        : "save.bsav";
-                    string safeName = cmd.SlotName.Length > 0 ? cmd.SlotName.ToString() : fallback;
-                    if (cmd.OpKind == SaveOpKind.Save)
+                    if (Volatile.Read(ref state->Slots[cmd.SlotIndex].CancelRequested) != 0)
                     {
-                        ReadOnlySpan<byte> payload = cmd.PayloadPtr != null && cmd.PayloadLength > 0
-                            ? new ReadOnlySpan<byte>(cmd.PayloadPtr, cmd.PayloadLength)
-                            : ReadOnlySpan<byte>.Empty;
-                        res = ExecuteSaveFile(state, savesDir, safeName, payload, cmd.GameSchemaVersion, cmd.PayloadKind, cmd.Compression, cmd.CreateOrDeleteBackup != 0);
-                    }
-                    else if (cmd.OpKind == SaveOpKind.Load)
-                    {
-                        res = ExecuteLoadFile(state, savesDir, safeName, rawMode: cmd.PayloadKind == SavePayloadKind.Raw);
+                        res = new SaveResult
+                        {
+                            OpKind = cmd.OpKind,
+                            Status = SaveStatus.Cancelled,
+                            PayloadKind = cmd.PayloadKind,
+                            Compression = cmd.Compression,
+                            GameSchemaVersion = cmd.GameSchemaVersion,
+                            SlotName = cmd.SlotName,
+                            Error = FixedString256.From("Save operation cancelled."),
+                        };
                     }
                     else
                     {
-                        string path = Path.Combine(savesDir, safeName);
-                        if (File.Exists(path)) File.Delete(path);
-                        if (cmd.CreateOrDeleteBackup != 0 && File.Exists(path + ".bak")) File.Delete(path + ".bak");
-                        if (File.Exists(path + ".tmp")) { try { File.Delete(path + ".tmp"); } catch { } }
-                        res = new SaveResult
+                        string fallback = (cmd.OpKind != SaveOpKind.Delete && cmd.PayloadKind == SavePayloadKind.Raw)
+                            ? "settings.json"
+                            : "save.bsav";
+                        string safeName = cmd.SlotName.Length > 0 ? cmd.SlotName.ToString() : fallback;
+                        if (cmd.OpKind == SaveOpKind.Save)
                         {
-                            OpKind = SaveOpKind.Delete,
-                            Status = SaveStatus.Ok,
-                            SlotName = FixedString256.From(safeName),
-                        };
+                            ReadOnlySpan<byte> payload = cmd.PayloadPtr != null && cmd.PayloadLength > 0
+                                ? new ReadOnlySpan<byte>(cmd.PayloadPtr, cmd.PayloadLength)
+                                : ReadOnlySpan<byte>.Empty;
+                            res = ExecuteSaveFile(state, savesDir, ioLock, safeName, payload, cmd.GameSchemaVersion, cmd.PayloadKind, cmd.Compression, cmd.CreateOrDeleteBackup != 0);
+                        }
+                        else if (cmd.OpKind == SaveOpKind.Load)
+                        {
+                            res = ExecuteLoadFile(state, savesDir, ioLock, safeName, rawMode: cmd.PayloadKind == SavePayloadKind.Raw);
+                        }
+                        else
+                        {
+                            string path = Path.Combine(savesDir, safeName);
+                            lock (ioLock)
+                            {
+                                if (File.Exists(path)) File.Delete(path);
+                                if (cmd.CreateOrDeleteBackup != 0 && File.Exists(path + ".bak")) File.Delete(path + ".bak");
+                                if (File.Exists(path + ".tmp")) { try { File.Delete(path + ".tmp"); } catch { } }
+                            }
+                            res = new SaveResult
+                            {
+                                OpKind = SaveOpKind.Delete,
+                                Status = SaveStatus.Ok,
+                                SlotName = FixedString256.From(safeName),
+                            };
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -674,6 +756,7 @@ public static unsafe class SaveSystem
     private static SaveResult ExecuteSaveFile(
         SaveSystemState* state,
         string savesDir,
+        object ioLock,
         string safeName,
         ReadOnlySpan<byte> payload,
         uint schemaVersion,
@@ -695,56 +778,59 @@ public static unsafe class SaveSystem
         string tmpPath = string.Empty;
         try
         {
-            Directory.CreateDirectory(savesDir);
-            string targetPath = Path.Combine(savesDir, safeName);
-            tmpPath = targetPath + ".tmp";
-            string bakPath = targetPath + ".bak";
-
-            if (kind == SavePayloadKind.Raw)
+            lock (ioLock)
             {
-                using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None, 16384))
+                Directory.CreateDirectory(savesDir);
+                string targetPath = Path.Combine(savesDir, safeName);
+                tmpPath = $"{targetPath}.{Interlocked.Increment(ref s_tmpSeq)}.tmp";
+                string bakPath = targetPath + ".bak";
+
+                if (kind == SavePayloadKind.Raw)
                 {
-                    if (!payload.IsEmpty) fs.Write(payload);
-                    fs.Flush(flushToDisk: true);
+                    using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None, 16384))
+                    {
+                        if (!payload.IsEmpty) fs.Write(payload);
+                        fs.Flush(flushToDisk: true);
+                    }
                 }
-            }
-            else
-            {
-                uint crc = NetHash.Crc32(payload);
-                byte[] compressed = payload.IsEmpty || compression == PackCompressionMode.None
-                    ? (payload.IsEmpty ? Array.Empty<byte>() : payload.ToArray())
-                    : PackCompressionSystem.Compress(payload, compression);
-
-                var hdr = new BsavHeader
+                else
                 {
-                    Magic = BsavHeader.MagicValue,
-                    FormatVersion = BsavHeader.CurrentFormatVersion,
-                    PayloadKind = (byte)kind,
-                    Compression = (byte)compression,
-                    GameSchemaVersion = schemaVersion,
-                    UncompressedBytes = payload.Length,
-                    CompressedBytes = compressed.Length,
-                    PayloadCrc32 = crc,
-                    SavedUtcTicks = result.SavedUtcTicks,
-                };
+                    uint crc = NetHash.Crc32(payload);
+                    byte[] compressed = payload.IsEmpty || compression == PackCompressionMode.None
+                        ? (payload.IsEmpty ? Array.Empty<byte>() : payload.ToArray())
+                        : PackCompressionSystem.Compress(payload, compression);
 
-                byte* hdrBytes = stackalloc byte[sizeof(BsavHeader)];
-                *(BsavHeader*)hdrBytes = hdr;
+                    var hdr = new BsavHeader
+                    {
+                        Magic = BsavHeader.MagicValue,
+                        FormatVersion = BsavHeader.CurrentFormatVersion,
+                        PayloadKind = (byte)kind,
+                        Compression = (byte)compression,
+                        GameSchemaVersion = schemaVersion,
+                        UncompressedBytes = payload.Length,
+                        CompressedBytes = compressed.Length,
+                        PayloadCrc32 = crc,
+                        SavedUtcTicks = result.SavedUtcTicks,
+                    };
 
-                using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None, 16384))
-                {
-                    fs.Write(new ReadOnlySpan<byte>(hdrBytes, sizeof(BsavHeader)));
-                    if (compressed.Length > 0) fs.Write(compressed, 0, compressed.Length);
-                    fs.Flush(flushToDisk: true);
+                    byte* hdrBytes = stackalloc byte[sizeof(BsavHeader)];
+                    *(BsavHeader*)hdrBytes = hdr;
+
+                    using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None, 16384))
+                    {
+                        fs.Write(new ReadOnlySpan<byte>(hdrBytes, sizeof(BsavHeader)));
+                        if (compressed.Length > 0) fs.Write(compressed, 0, compressed.Length);
+                        fs.Flush(flushToDisk: true);
+                    }
                 }
+
+                // Preserve previous good file as .bak BEFORE replacing targetPath so targetPath is always valid
+                if (createBackup && File.Exists(targetPath))
+                    File.Copy(targetPath, bakPath, overwrite: true);
+
+                // Atomic same-directory rename replacing targetPath
+                File.Move(tmpPath, targetPath, overwrite: true);
             }
-
-            // Preserve previous good file as .bak BEFORE replacing targetPath so targetPath is always valid
-            if (createBackup && File.Exists(targetPath))
-                File.Copy(targetPath, bakPath, overwrite: true);
-
-            // Atomic same-directory rename replacing targetPath
-            File.Move(tmpPath, targetPath, overwrite: true);
 
             result.Status = SaveStatus.Ok;
             result.DataLength = payload.Length;
@@ -758,68 +844,71 @@ public static unsafe class SaveSystem
             }
             result.Status = SaveStatus.IoError;
             result.Error = FixedString256.From(ex.Message);
-            if (state->Log != null && state->Log->Active != 0)
+            if (state->Log != null && Volatile.Read(ref state->Log->Active) != 0)
                 LogSystem.Error(state->Log, $"SaveSystem failed saving '{safeName}': {ex.Message}");
         }
 
         return result;
     }
 
-    private static SaveResult ExecuteLoadFile(SaveSystemState* state, string savesDir, string safeName, bool rawMode)
+    private static SaveResult ExecuteLoadFile(SaveSystemState* state, string savesDir, object ioLock, string safeName, bool rawMode)
     {
-        string targetPath = Path.Combine(savesDir, safeName);
-        string bakPath = targetPath + ".bak";
-
-        bool hasPrimary = File.Exists(targetPath);
-        bool hasBackup = File.Exists(bakPath);
-
-        if (!hasPrimary && !hasBackup)
+        lock (ioLock)
         {
-            return new SaveResult
+            string targetPath = Path.Combine(savesDir, safeName);
+            string bakPath = targetPath + ".bak";
+
+            bool hasPrimary = File.Exists(targetPath);
+            bool hasBackup = File.Exists(bakPath);
+
+            if (!hasPrimary && !hasBackup)
             {
-                OpKind = SaveOpKind.Load,
-                Status = SaveStatus.NotFound,
-                PayloadKind = rawMode ? SavePayloadKind.Raw : SavePayloadKind.Binary,
-                SlotName = FixedString256.From(safeName),
-                Error = FixedString256.From("Save file not found."),
-            };
-        }
+                return new SaveResult
+                {
+                    OpKind = SaveOpKind.Load,
+                    Status = SaveStatus.NotFound,
+                    PayloadKind = rawMode ? SavePayloadKind.Raw : SavePayloadKind.Binary,
+                    SlotName = FixedString256.From(safeName),
+                    Error = FixedString256.From("Save file not found."),
+                };
+            }
 
-        SaveResult primary = hasPrimary
-            ? TryReadSingleFile(targetPath, safeName, rawMode, state->MaxSaveBytes)
-            : new SaveResult { OpKind = SaveOpKind.Load, Status = SaveStatus.NotFound, SlotName = FixedString256.From(safeName) };
+            SaveResult primary = hasPrimary
+                ? TryReadSingleFile(targetPath, safeName, rawMode, state->MaxSaveBytes)
+                : new SaveResult { OpKind = SaveOpKind.Load, Status = SaveStatus.NotFound, SlotName = FixedString256.From(safeName) };
 
-        if (primary.Status == SaveStatus.Ok)
-        {
-            Interlocked.Increment(ref state->TotalLoadsCompleted.Value);
+            if (primary.Status == SaveStatus.Ok)
+            {
+                Interlocked.Increment(ref state->TotalLoadsCompleted.Value);
+                return primary;
+            }
+
+            // Primary missing or corrupted -> automatically recover from .bak if present
+            if (hasBackup)
+            {
+                SaveResult backup = TryReadSingleFile(bakPath, safeName, rawMode, state->MaxSaveBytes);
+                if (backup.Status == SaveStatus.Ok)
+                {
+                    backup.LoadedFromBackup = 1;
+                    Interlocked.Increment(ref state->TotalLoadsCompleted.Value);
+                    Interlocked.Increment(ref state->TotalBackupRecoveries.Value);
+                    if (state->Log != null && Volatile.Read(ref state->Log->Active) != 0)
+                        LogSystem.Warn(state->Log, $"SaveSystem recovered '{safeName}' from .bak backup (schema v{backup.GameSchemaVersion})");
+                    return backup;
+                }
+                ReleaseResult(ref backup);
+                if (!hasPrimary)
+                {
+                    if (state->Log != null && Volatile.Read(ref state->Log->Active) != 0)
+                        LogSystem.Error(state->Log, $"SaveSystem failed loading '{safeName}': primary missing and .bak status={backup.Status}");
+                    return backup;
+                }
+            }
+
+            if (state->Log != null && Volatile.Read(ref state->Log->Active) != 0)
+                LogSystem.Error(state->Log, $"SaveSystem failed loading '{safeName}': status={primary.Status}");
             return primary;
         }
-
-        // Primary missing or corrupted -> automatically recover from .bak if present
-        if (hasBackup)
-        {
-            SaveResult backup = TryReadSingleFile(bakPath, safeName, rawMode, state->MaxSaveBytes);
-            if (backup.Status == SaveStatus.Ok)
-            {
-                backup.LoadedFromBackup = 1;
-                Interlocked.Increment(ref state->TotalLoadsCompleted.Value);
-                Interlocked.Increment(ref state->TotalBackupRecoveries.Value);
-                if (state->Log != null && state->Log->Active != 0)
-                    LogSystem.Warn(state->Log, $"SaveSystem recovered '{safeName}' from .bak backup (schema v{backup.GameSchemaVersion})");
-                return backup;
-            }
-            ReleaseResult(ref backup);
-            if (!hasPrimary)
-            {
-                if (state->Log != null && state->Log->Active != 0)
-                    LogSystem.Error(state->Log, $"SaveSystem failed loading '{safeName}': primary missing and .bak status={backup.Status}");
-                return backup;
-            }
-        }
-
-        if (state->Log != null && state->Log->Active != 0)
-            LogSystem.Error(state->Log, $"SaveSystem failed loading '{safeName}': status={primary.Status}");
-        return primary;
     }
 
     private static SaveResult TryReadSingleFile(string path, string safeName, bool rawMode, int maxSaveBytes)
@@ -853,13 +942,21 @@ public static unsafe class SaveSystem
                 {
                     allocSize = (nuint)len;
                     ptr = (byte*)NativeMemoryTracker.AlignedAlloc(allocSize, 16);
-                    int got = ReadExact(fs, new Span<byte>(ptr, len));
-                    if (got != len)
+                    try
+                    {
+                        int got = ReadExact(fs, new Span<byte>(ptr, len));
+                        if (got != len)
+                        {
+                            NativeMemoryTracker.AlignedFree(ptr, allocSize);
+                            result.Status = SaveStatus.Corrupted;
+                            result.Error = FixedString256.From("Unexpected EOF reading raw save file.");
+                            return result;
+                        }
+                    }
+                    catch
                     {
                         NativeMemoryTracker.AlignedFree(ptr, allocSize);
-                        result.Status = SaveStatus.Corrupted;
-                        result.Error = FixedString256.From("Unexpected EOF reading raw save file.");
-                        return result;
+                        throw;
                     }
                 }
 

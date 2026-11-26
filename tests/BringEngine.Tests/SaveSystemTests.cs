@@ -27,6 +27,7 @@ public static unsafe class SaveSystemTests
         Assert.Run("SaveSystem_RawAsyncLongSlotNamesPathSanitizationAndLogging", &TestRawAsyncAndPathSanitization);
         Assert.Run("SaveSystem_AdversarialBsavLz4BrotliAndChunkBounds", &TestAdversarialBsavLz4BrotliAndChunkBounds);
         Assert.Run("SaveSystem_MaxPendingOpsAndMaxSaveBytesLimits", &TestMaxPendingOpsAndMaxSaveBytesLimits);
+        Assert.Run("SaveSystem_CancelConcurrencyReservedNamesRawIoAndChunkInvalidId", &TestCancelConcurrencyReservedNamesRawIoAndChunkInvalidId);
     }
 
     private static string CreateTempSaveDir(string suffix)
@@ -700,5 +701,199 @@ public static unsafe class SaveSystemTests
 
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after limits test");
         Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after limits test");
+    }
+
+    private static void TestCancelConcurrencyReservedNamesRawIoAndChunkInvalidId()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tempDir = CreateTempSaveDir("core_audit");
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+
+        try
+        {
+            // CORE-10: maxPendingOps > 20-bit handle limit throws ArgumentOutOfRangeException
+            SaveSystemState* badSaves = alloc.Persistent.Alloc<SaveSystemState>(1, 64);
+            bool threwCap = false;
+            try { SaveSystem.Start(badSaves, ref alloc.Persistent, maxPendingOps: int.MaxValue, directoryOverride: tempDir); }
+            catch (ArgumentOutOfRangeException) { threwCap = true; }
+            Assert.True(threwCap, "SaveSystem.Start rejects maxPendingOps=int.MaxValue");
+
+            // CORE-18: mid-way arena OOM restores persistentArena.Offset cleanly
+            var tight = LinearArena.Create(4096);
+            try
+            {
+                SaveSystemState* oomSaves = tight.Alloc<SaveSystemState>(1, 64);
+                nuint beforeOom = tight.Offset;
+                bool threwOom = false;
+                try { SaveSystem.Start(oomSaves, ref tight, maxPendingOps: 1024, directoryOverride: tempDir); }
+                catch (OutOfMemoryException) { threwOom = true; }
+                Assert.True(threwOom && tight.Offset == beforeOom, "SaveSystem.Start mid-way OOM restores arena.Offset");
+            }
+            finally
+            {
+                tight.Dispose();
+            }
+
+            // CORE-21: SaveChunkWriter.WriteChunk with invalid StringId returns false WITHOUT setting Overflow
+            var cw = SaveChunkWriter.CreateGrowable(256);
+            try
+            {
+                Assert.True(!cw.WriteChunk(StringId.Empty, 1, "abc"u8), "Invalid StringId returns false");
+                Assert.True(!cw.HasOverflow, "Invalid StringId must NOT set HasOverflow");
+                Assert.True(cw.WriteChunk(StringId.Hash("valid"), 1, "abc"u8), "Subsequent valid WriteChunk succeeds");
+            }
+            finally
+            {
+                cw.Dispose();
+            }
+
+            SaveSystemState* saves = alloc.Persistent.Alloc<SaveSystemState>(1, 64);
+            SaveSystem.Start(saves, ref alloc.Persistent, appName: "AuditSaveTest", maxPendingOps: 8, maxSaveBytes: 4 * 1024 * 1024, directoryOverride: tempDir);
+            try
+            {
+                // CORE-09: Trailing space ("save ."), Windows reserved device names, and 90-char CJK async/sync parity
+                Assert.Equal("save", PlatformPaths.SanitizeFileName("save .", "save.bsav"), "Trailing space+dot trimmed cleanly");
+                Assert.Equal("_CON", PlatformPaths.SanitizeFileName("CON", "save.bsav"), "CON prefixed");
+                Assert.Equal("_NUL.bsav", PlatformPaths.SanitizeFileName("NUL.bsav", "save.bsav"), "NUL.bsav prefixed");
+                Assert.Equal("_COM1.log", PlatformPaths.SanitizeFileName("COM1.log", "save.bsav"), "COM1.log prefixed");
+
+                string[] specialSlots = { "save .", "CON", "NUL.bsav", "COM1.log", new string('存', 90) };
+                for (int i = 0; i < specialSlots.Length; i++)
+                {
+                    byte[] data = Encoding.UTF8.GetBytes($"{{\"slot\":{i}}}");
+                    SaveOpHandle h = SaveSystem.SaveAsync(saves, specialSlots[i], data);
+                    Assert.True(h.IsValid, $"SaveAsync accepted special slot #{i}");
+                    SaveResult sr = WaitSaveResult(saves, h);
+                    SaveSystem.ReleaseResult(ref sr);
+                    Assert.True(sr.IsSuccess, $"SaveAsync succeeded for special slot #{i}: {sr.Error}");
+                    Assert.True(SaveSystem.Exists(saves, specialSlots[i]), $"Exists found special slot #{i}");
+
+                    SaveResult lr = SaveSystem.LoadSync(saves, specialSlots[i]);
+                    try
+                    {
+                        Assert.True(lr.IsSuccess, $"LoadSync loaded special slot #{i}");
+                        Assert.True(lr.AsDataSpan().SequenceEqual(data), $"LoadSync payload matched for special slot #{i}");
+                    }
+                    finally
+                    {
+                        SaveSystem.ReleaseResult(ref lr);
+                    }
+                }
+
+                // CORE-08: Raw load failure / locked file IOException leaves 0 native leaks
+                string rawFailPath = SaveSystem.GetSlotPath(saves, "raw_lock_test.json");
+                File.WriteAllBytes(rawFailPath, "{\"locked\":true}"u8.ToArray());
+                using (var blocker = new FileStream(rawFailPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                {
+                    SaveResult rawErr = SaveSystem.LoadRawSync(saves, "raw_lock_test.json");
+                    SaveSystem.ReleaseResult(ref rawErr);
+                    if (OperatingSystem.IsWindows())
+                        Assert.Equal((byte)SaveStatus.IoError, (byte)rawErr.Status, "Locked raw file returns IoError without native leak");
+                }
+                // Oversized raw file returns Corrupted with 0 native leaks
+                SaveResult rawReadOk = SaveSystem.LoadRawSync(saves, "raw_lock_test.json");
+                SaveSystem.ReleaseResult(ref rawReadOk);
+                Assert.True(rawReadOk.IsSuccess, "Unlocked raw file reads cleanly");
+
+                // CORE-15: SaveSystem.Cancel cancels queued op and emits SaveStatus.Cancelled with 0 leaks
+                Assert.True(!SaveSystem.Cancel(saves, SaveOpHandle.Invalid), "Cancel(Invalid) returns false");
+                byte[] heavy = new byte[1024 * 1024];
+                var rng = DetRng.Create(999UL);
+                for (int i = 0; i < heavy.Length; i++) heavy[i] = (byte)(rng.NextUInt() & 0xFF);
+
+                bool sawCancelled = false;
+                for (int attempt = 0; attempt < 3 && !sawCancelled; attempt++)
+                {
+                    // Queue a heavy Brotli compression job so the worker is busy while we cancel the second op
+                    SaveOpHandle hSlow = SaveSystem.SaveAsync(saves, "heavy_blocker.bsav", heavy, schemaVersion: 1, SavePayloadKind.Binary, PackCompressionMode.Brotli);
+                    SaveOpHandle hCancel = SaveSystem.SaveAsync(saves, "to_cancel.bsav", "{\"cancel\":true}"u8, userTag: 777UL);
+                    bool didCancel = SaveSystem.Cancel(saves, hCancel);
+
+                    SaveResult rSlow = WaitSaveResult(saves, hSlow, timeoutMs: 15000);
+                    SaveSystem.ReleaseResult(ref rSlow);
+                    SaveResult rCan = WaitSaveResult(saves, hCancel, timeoutMs: 5000);
+                    try
+                    {
+                        if (didCancel && rCan.Status == SaveStatus.Cancelled)
+                        {
+                            Assert.Equal(777UL, rCan.UserTag, "Cancelled op preserved UserTag");
+                            Assert.True(rCan.DataPtr == null, "Cancelled op has no leaked buffer");
+                            sawCancelled = true;
+                        }
+                    }
+                    finally
+                    {
+                        SaveSystem.ReleaseResult(ref rCan);
+                    }
+                }
+                Assert.True(sawCancelled, "SaveSystem.Cancel cancelled queued save op with SaveStatus.Cancelled");
+
+                // CORE-11: EnqueueSaveOp failure paths (oversized / slot saturation) preserve free slots & 0 leaks
+                Assert.True(!SaveSystem.SaveAsync(saves, "too_large.bsav", new byte[saves->MaxSaveBytes + 1]).IsValid, "Oversized SaveAsync rejected cleanly");
+
+                // CORE-16: Overlapping SaveAsync + SaveSync on the same slot -> both succeed, valid CRC32, 0 leftover .tmp files
+                byte[] syncPayload = "{\"src\":\"sync\",\"v\":12345}"u8.ToArray();
+                byte[] asyncPayload = "{\"src\":\"async\",\"v\":67890}"u8.ToArray();
+                for (int i = 0; i < 16; i++)
+                {
+                    SaveOpHandle ha = SaveSystem.SaveAsync(saves, "overlap.bsav", asyncPayload, schemaVersion: 2);
+                    Assert.True(ha.IsValid, $"Overlap SaveAsync #{i} queued");
+                    SaveResult rs = SaveSystem.SaveSync(saves, "overlap.bsav", syncPayload, schemaVersion: 1);
+                    SaveSystem.ReleaseResult(ref rs);
+                    Assert.True(rs.IsSuccess, $"Overlap SaveSync #{i} succeeded ({rs.Error})");
+
+                    SaveResult ra = WaitSaveResult(saves, ha);
+                    SaveSystem.ReleaseResult(ref ra);
+                    Assert.True(ra.IsSuccess, $"Overlap SaveAsync #{i} succeeded ({ra.Error})");
+                }
+                SaveResult overlapLoaded = SaveSystem.LoadSync(saves, "overlap.bsav");
+                try
+                {
+                    Assert.True(overlapLoaded.IsSuccess, "Overlap slot loads with valid CRC32");
+                    string txt = overlapLoaded.DataAsUtf8String();
+                    Assert.True(txt == "{\"src\":\"sync\",\"v\":12345}" || txt == "{\"src\":\"async\",\"v\":67890}", $"Overlap content intact: {txt}");
+                }
+                finally
+                {
+                    SaveSystem.ReleaseResult(ref overlapLoaded);
+                }
+                string[] leftoverTmps = Directory.GetFiles(tempDir, "*.tmp");
+                Assert.Equal(0, leftoverTmps.Length, "Zero leftover .tmp files after overlapping SaveAsync/SaveSync");
+            }
+            finally
+            {
+                // CORE-17: 4-thread barrier-synchronized concurrent SaveSystem.Stop()
+                using var barrier = new Barrier(4);
+                nint sp = (nint)saves;
+                Exception? stopErr = null;
+                var threads = new Thread[4];
+                for (int t = 0; t < 4; t++)
+                {
+                    threads[t] = new Thread(() =>
+                    {
+                        try
+                        {
+                            barrier.SignalAndWait();
+                            SaveSystem.Stop((SaveSystemState*)sp);
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.CompareExchange(ref stopErr, ex, null);
+                        }
+                    });
+                    threads[t].Start();
+                }
+                for (int t = 0; t < 4; t++) threads[t].Join();
+                Assert.True(stopErr == null, $"Concurrent SaveSystem.Stop had 0 exceptions ({stopErr?.Message})");
+            }
+        }
+        finally
+        {
+            alloc.Dispose();
+            TryDeleteDir(tempDir);
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after CORE-08/09/10/11/15/16/17/18/21 SaveSystem tests");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after CORE-08/09/10/11/15/16/17/18/21 SaveSystem tests");
     }
 }

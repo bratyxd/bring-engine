@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using BringEngine.Core.Memory;
 
 namespace BringEngine.Core.Storage;
 
@@ -83,23 +84,86 @@ public static class PlatformPaths
         return SanitizeSegmentToSpan(name, fallback, dst);
     }
 
+    private static bool IsWindowsReservedDeviceName(ReadOnlySpan<char> stem)
+    {
+        if (stem.Length == 3)
+        {
+            return stem.Equals("CON", StringComparison.OrdinalIgnoreCase) ||
+                   stem.Equals("PRN", StringComparison.OrdinalIgnoreCase) ||
+                   stem.Equals("AUX", StringComparison.OrdinalIgnoreCase) ||
+                   stem.Equals("NUL", StringComparison.OrdinalIgnoreCase);
+        }
+        if (stem.Length == 4)
+        {
+            char last = stem[3];
+            if (last >= '1' && last <= '9')
+            {
+                ReadOnlySpan<char> prefix = stem.Slice(0, 3);
+                return prefix.Equals("COM", StringComparison.OrdinalIgnoreCase) ||
+                       prefix.Equals("LPT", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        return false;
+    }
+
     private static int SanitizeSegmentToSpan(ReadOnlySpan<char> input, ReadOnlySpan<char> fallback, Span<char> dst)
     {
         if (!input.IsEmpty && dst.Length > 0)
         {
             int cap = dst.Length < 128 ? dst.Length : 128;
+            Span<char> tmp = stackalloc char[128];
             int len = 0;
             for (int i = 0; i < input.Length && len < cap; i++)
             {
                 char c = input[i];
                 if (char.IsLetterOrDigit(c) || c == '-' || c == '_' || c == '.' || c == ' ')
-                    dst[len++] = c;
+                    tmp[len++] = c;
             }
-            ReadOnlySpan<char> trimmed = dst.Slice(0, len).Trim().Trim('.');
+            ReadOnlySpan<char> trimmed = tmp.Slice(0, len).Trim(" \t\r\n.".AsSpan());
             if (!trimmed.IsEmpty && !trimmed.IsWhiteSpace())
             {
-                trimmed.CopyTo(dst);
-                return trimmed.Length;
+                Span<char> work = stackalloc char[128];
+                int outLen = 0;
+
+                int dotIdx = trimmed.IndexOf('.');
+                ReadOnlySpan<char> stem = (dotIdx >= 0 ? trimmed.Slice(0, dotIdx) : trimmed).TrimEnd();
+                if (IsWindowsReservedDeviceName(stem))
+                {
+                    if (cap > 1)
+                    {
+                        work[outLen++] = '_';
+                        int copyLen = trimmed.Length < (cap - 1) ? trimmed.Length : (cap - 1);
+                        trimmed.Slice(0, copyLen).CopyTo(work.Slice(1));
+                        outLen += copyLen;
+                    }
+                }
+                else
+                {
+                    int copyLen = trimmed.Length < cap ? trimmed.Length : cap;
+                    trimmed.Slice(0, copyLen).CopyTo(work);
+                    outLen = copyLen;
+                }
+
+                // Cap UTF-8 encoded length to <= FixedString256.MaxBytes (252) at whole rune boundaries
+                // so async FixedString256.From and sync SanitizeFileName are 100% byte-identical for all Unicode inputs.
+                int utf8Bytes = 0;
+                int runeSafeLen = 0;
+                while (runeSafeLen < outLen)
+                {
+                    char ch = work[runeSafeLen];
+                    int charBytes = ch <= 0x7F ? 1 : (ch <= 0x7FF ? 2 : 3);
+                    if (utf8Bytes + charBytes > FixedString256.MaxBytes)
+                        break;
+                    utf8Bytes += charBytes;
+                    runeSafeLen++;
+                }
+
+                ReadOnlySpan<char> finalSpan = work.Slice(0, runeSafeLen).Trim(" \t\r\n.".AsSpan());
+                if (!finalSpan.IsEmpty && !finalSpan.IsWhiteSpace())
+                {
+                    finalSpan.CopyTo(dst);
+                    return finalSpan.Length;
+                }
             }
         }
         int fbLen = fallback.Length < dst.Length ? fallback.Length : dst.Length;

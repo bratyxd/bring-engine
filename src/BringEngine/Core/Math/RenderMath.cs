@@ -55,18 +55,39 @@ public static class DetMath
     public static float Sin(float x)
     {
         if (!float.IsFinite(x)) return 0f;
-        // Range reduce to [-Pi, Pi]
-        float k = MathF.Floor((x + Pi) / TwoPi);
-        x -= k * TwoPi;
+        return SinDouble(x);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float Cos(float x)
+    {
+        if (!float.IsFinite(x)) return 0f;
+        return SinDouble((double)x + 0.5 * System.Math.PI);
+    }
+
+    private static float SinDouble(double xd)
+    {
+        const double TwoPiD = 2.0 * System.Math.PI;
+        double r;
+        if (System.Math.Abs(xd) <= 1e15)
+        {
+            double k = System.Math.Floor((xd + System.Math.PI) / TwoPiD);
+            r = xd - k * TwoPiD;
+        }
+        else
+        {
+            r = xd % TwoPiD;
+        }
+        if (r > System.Math.PI) r -= TwoPiD;
+        else if (r < -System.Math.PI) r += TwoPiD;
+
+        float x = (float)r;
         if (x > HalfPi) x = Pi - x;
         else if (x < -HalfPi) x = -Pi - x;
 
         float x2 = x * x;
         return x * (1.0f + x2 * (-0.16666667f + x2 * (0.0083333310f + x2 * (-0.0001984090f + x2 * 0.0000027526f))));
     }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static float Cos(float x) => Sin(x + HalfPi);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float Tan(float x)
@@ -77,6 +98,13 @@ public static class DetMath
 
     public static float Atan2(float y, float x)
     {
+        if (float.IsNaN(y) || float.IsNaN(x))
+            return float.NaN;
+        if (float.IsInfinity(y) && float.IsInfinity(x))
+        {
+            float infAngle = x > 0f ? (Pi * 0.25f) : (Pi * 0.75f);
+            return y < 0f ? -infAngle : infAngle;
+        }
         if (x == 0f)
         {
             if (y > 0f) return HalfPi;
@@ -464,10 +492,11 @@ public struct Quat : IEquatable<Quat>
 
     public static Quat FromAxisAngle(Vec3 axis, float angleRad)
     {
+        Vec3 n = axis.Normalized();
+        if (n.LengthSq() < 1e-8f) return Identity;
         float half = angleRad * 0.5f;
         float s = DetMath.Sin(half);
         float c = DetMath.Cos(half);
-        Vec3 n = axis.Normalized();
         return new Quat(n.X * s, n.Y * s, n.Z * s, c);
     }
 

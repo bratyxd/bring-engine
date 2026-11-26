@@ -60,6 +60,7 @@ public static unsafe class JobSystemTests
         Assert.Run("JobSystem_SingleThreadZeroWorkers_CombineSpanAndCompleteAll", &TestZeroWorkersCombineSpanAndCompleteAll);
         Assert.Run("JobSystem_WorkerExceptionPropagationAndZeroLeaks", &TestWorkerExceptionPropagationAndZeroLeaks);
         Assert.Run("JobSystem_DepLinkExhaustionDoesNotDeadlock", &TestDepLinkExhaustionDoesNotDeadlock);
+        Assert.Run("JobSystem_SlotRecyclingOverflowFreeDepBoundsAndConcurrentStop", &TestSlotRecyclingOverflowFreeDepBoundsAndConcurrentStop);
     }
 
     private static void ParallelSquareKernel(void* userData, int begin, int end, int workerIndex)
@@ -569,5 +570,170 @@ public static unsafe class JobSystemTests
         }
 
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after DepLink exhaustion test");
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ChunkRecordCtx
+    {
+        public int Count;
+        public fixed int Begins[8];
+        public fixed int Ends[8];
+    }
+
+    private static void RecordChunkKernel(void* ud, int begin, int end, int workerIndex)
+    {
+        _ = workerIndex;
+        ChunkRecordCtx* ctx = (ChunkRecordCtx*)ud;
+        int idx = Interlocked.Increment(ref ctx->Count) - 1;
+        if ((uint)idx < 8)
+        {
+            ctx->Begins[idx] = begin;
+            ctx->Ends[idx] = end;
+        }
+    }
+
+    private static void TestSlotRecyclingOverflowFreeDepBoundsAndConcurrentStop()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+
+        try
+        {
+            // CORE-10: maxJobs > 20-bit handle limit throws ArgumentOutOfRangeException
+            JobScheduler* badSched = alloc.Persistent.Alloc<JobScheduler>(1, 64);
+            bool threwCap = false;
+            try { JobSystem.Start(badSched, ref alloc.Persistent, workerCount: 1, maxJobs: int.MaxValue); }
+            catch (ArgumentOutOfRangeException) { threwCap = true; }
+            Assert.True(threwCap, "JobSystem.Start rejects maxJobs=int.MaxValue");
+
+            // CORE-18: mid-way arena OOM restores persistentArena.Offset cleanly
+            var tightArena = LinearArena.Create(4096);
+            try
+            {
+                JobScheduler* oomSched = tightArena.Alloc<JobScheduler>(1, 64);
+                nuint beforeOom = tightArena.Offset;
+                bool threwOom = false;
+                try { JobSystem.Start(oomSched, ref tightArena, workerCount: 1, maxJobs: 1024, maxDepLinks: 2048); }
+                catch (OutOfMemoryException) { threwOom = true; }
+                Assert.True(threwOom && tightArena.Offset == beforeOom, "JobSystem.Start mid-way OOM restores arena.Offset");
+            }
+            finally
+            {
+                tightArena.Dispose();
+            }
+
+            // CORE-03: Depending on an unallocated Free slot (JobHandle.Create(0, 1)) completes immediately & leaks 0 dep links
+            JobScheduler* schedFree = alloc.Persistent.Alloc<JobScheduler>(1, 64);
+            JobSystem.Start(schedFree, ref alloc.Persistent, workerCount: 2, maxJobs: 16, maxDepLinks: 32);
+            try
+            {
+                int doneFlag = 0;
+                JobHandle ghostDep = JobHandle.Create(0, 1); // slot 0 is Free with Generation == 1
+                JobHandle h = JobSystem.Schedule(schedFree, &doneFlag, &InlineCounterJob, dependency: ghostDep);
+                JobSystem.Complete(schedFree, h);
+                Assert.Equal(1, doneFlag, "Job depending on unallocated Free slot completed immediately");
+
+                // Verify all 32 dep links are still available (0 leaked)
+                int* gate = alloc.Persistent.Alloc<int>(1, 64);
+                *gate = 0;
+                JobHandle root = JobSystem.Schedule(schedFree, gate, &SpinWaitFlagJob);
+                int dummy = 0;
+                int attached = 0;
+                for (int i = 0; i < 15; i++)
+                {
+                    _ = JobSystem.Schedule(schedFree, &dummy, &InlineCounterJob, dependency: root);
+                    attached++;
+                }
+                Assert.Equal(15, attached, "All 15 dependent slots attached cleanly with 0 leaked dep links");
+                Volatile.Write(ref *gate, 1);
+                JobSystem.Complete(schedFree, root);
+
+                // CORE-02: Signed 32-bit int overflow in ScheduleParallelFor / TryExecuteOneChunk
+                ChunkRecordCtx* rec = alloc.Persistent.Alloc<ChunkRecordCtx>(1, 64);
+                // Warmup JIT
+                JobHandle hw = JobSystem.ScheduleParallelFor(schedFree, int.MaxValue, 1_000_000_000, rec, &RecordChunkKernel);
+                JobSystem.Complete(schedFree, hw);
+
+                *rec = default;
+                long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+                JobHandle hBig = JobSystem.ScheduleParallelFor(schedFree, int.MaxValue, 1_000_000_000, rec, &RecordChunkKernel);
+                JobSystem.Complete(schedFree, hBig);
+                long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+                Assert.Equal(0L, gcAfter - gcBefore, "Large-count ScheduleParallelFor allocates 0 GC bytes");
+                Assert.Equal(3, rec->Count, "int.MaxValue with batchSize=1e9 produces exactly 3 chunks");
+
+                int[] begins = { rec->Begins[0], rec->Begins[1], rec->Begins[2] };
+                int[] ends = { rec->Ends[0], rec->Ends[1], rec->Ends[2] };
+                Array.Sort(begins);
+                Array.Sort(ends);
+                Assert.Equal(0, begins[0], "Chunk 0 begin == 0");
+                Assert.Equal(1_000_000_000, begins[1], "Chunk 1 begin == 1e9");
+                Assert.Equal(2_000_000_000, begins[2], "Chunk 2 begin == 2e9");
+                Assert.Equal(1_000_000_000, ends[0], "Chunk 0 end == 1e9");
+                Assert.Equal(2_000_000_000, ends[1], "Chunk 1 end == 2e9");
+                Assert.Equal(int.MaxValue, ends[2], "Chunk 2 end == int.MaxValue");
+            }
+            finally
+            {
+                JobSystem.Stop(schedFree);
+            }
+
+            // CORE-01: High-contention maxJobs=16 rapid recycling + stale/live dependency attachment
+            JobScheduler* schedHot = alloc.Persistent.Alloc<JobScheduler>(1, 64);
+            JobSystem.Start(schedHot, ref alloc.Persistent, workerCount: 4, maxJobs: 16, maxDepLinks: 64);
+            try
+            {
+                int* counter = alloc.Persistent.Alloc<int>(1, 64);
+                *counter = 0;
+                JobHandle prev = JobHandle.Invalid;
+                JobHandle stale = JobHandle.Invalid;
+                for (int iter = 0; iter < 400; iter++)
+                {
+                    JobHandle a = JobSystem.Schedule(schedHot, counter, &InlineCounterJob, dependency: prev);
+                    JobHandle b = JobSystem.Schedule(schedHot, counter, &InlineCounterJob, dependency: stale);
+                    JobHandle c = JobSystem.CombineDependencies(schedHot, a, b);
+                    JobHandle d = JobSystem.Schedule(schedHot, counter, &InlineCounterJob, dependency: c);
+                    if ((iter & 3) == 3)
+                        JobSystem.Complete(schedHot, d);
+                    stale = prev;
+                    prev = d;
+                }
+                JobSystem.Complete(schedHot, prev);
+                Assert.Equal(1200, Volatile.Read(ref *counter), "All 1200 recycled jobs completed under maxJobs=16 contention");
+            }
+            finally
+            {
+                // CORE-17: 4-thread barrier-synchronized concurrent JobSystem.Stop()
+                using var barrier = new Barrier(4);
+                nint sp = (nint)schedHot;
+                Exception? stopErr = null;
+                var threads = new Thread[4];
+                for (int t = 0; t < 4; t++)
+                {
+                    threads[t] = new Thread(() =>
+                    {
+                        try
+                        {
+                            barrier.SignalAndWait();
+                            JobSystem.Stop((JobScheduler*)sp);
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.CompareExchange(ref stopErr, ex, null);
+                        }
+                    });
+                    threads[t].Start();
+                }
+                for (int t = 0; t < 4; t++) threads[t].Join();
+                Assert.True(stopErr == null, $"Concurrent JobSystem.Stop had 0 exceptions ({stopErr?.Message})");
+            }
+        }
+        finally
+        {
+            alloc.Dispose();
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after CORE-01/02/03/10/17/18 JobSystem tests");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after CORE-01/02/03/10/17/18 JobSystem tests");
     }
 }

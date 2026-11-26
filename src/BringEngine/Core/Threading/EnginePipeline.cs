@@ -47,6 +47,7 @@ public unsafe struct EnginePipelineState
     public byte HasRenderablePacket;  // 1 once at least one packet has been extracted
     public byte Active;
     public int ShutdownFlag;
+    internal int StopClaimed;
 
     public double LastLogicMs;
     public double LastRenderCpuMs;
@@ -192,7 +193,7 @@ public static unsafe class EnginePipelineSystem
         bool captureToOffscreen = false,
         FrameProfiler* profiler = null)
     {
-        if (state == null || state->Active == 0)
+        if (state == null || Volatile.Read(ref state->Active) == 0)
             throw new InvalidOperationException("EnginePipeline is not active.");
 
         int slot = state->SyncSlot;
@@ -287,7 +288,9 @@ public static unsafe class EnginePipelineSystem
 
     public static void Stop(EnginePipelineState* state)
     {
-        if (state == null || state->Active == 0) return;
+        if (state == null || Volatile.Read(ref state->Active) == 0) return;
+        if (Interlocked.CompareExchange(ref state->StopClaimed, 1, 0) != 0) return;
+        Volatile.Write(ref state->Active, 0);
         int slot = state->SyncSlot;
 
         Volatile.Write(ref state->ShutdownFlag, 1);
@@ -300,7 +303,5 @@ public static unsafe class EnginePipelineSystem
         {
             s_sync[slot] = default;
         }
-
-        state->Active = 0;
     }
 }

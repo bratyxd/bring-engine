@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using BringEngine.Assets.Fonts;
 using BringEngine.Assets.Textures;
 using BringEngine.Core.Handles;
@@ -38,6 +39,7 @@ public static unsafe class ProfilingAndPacingTests
         Assert.Run("FrameProfilerAndOverlay_SeparateBarsAndZeroGc", &TestProfilerAndOverlayZeroGc);
         Assert.Run("ProfilerOverlay_AnchorsResizeVisibilityAndScopesReset", &TestOverlayAnchorsResizeAndScopesReset);
         Assert.Run("EnginePipeline_HeadlessFaultRecoveryAndFlushZeroLeak", &TestEnginePipelineHeadlessFaultAndFlush);
+        Assert.Run("FrameProfiler_ConcurrentSeqlockReadAndPipelineConcurrentStop", &TestProfilerSeqlockAndPipelineConcurrentStop);
         if (!headlessOnly)
         {
             Assert.Run("GpuVSyncToggle_SetPassCallsAndGpuDebugValidation", &TestGpuVSyncAndDebugValidation);
@@ -227,7 +229,7 @@ public static unsafe class ProfilingAndPacingTests
         finally
         {
             BringEngine.Assets.AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
-            GpuSystem.Dispose(ref *gpu);
+            GpuSystem.Dispose(ref *gpu, ref world.Assets);
             PlatformSystem.Shutdown(ref window);
             bundleArena.Dispose();
             alloc.Dispose();
@@ -321,7 +323,7 @@ public static unsafe class ProfilingAndPacingTests
         {
             EnginePipelineSystem.Stop(pipe);
             BringEngine.Assets.AssetSystem.UnloadByBundle(ref world->Assets, bundleId);
-            GpuSystem.Dispose(ref *gpu);
+            GpuSystem.Dispose(ref *gpu, ref world->Assets);
             PlatformSystem.Shutdown(ref window);
             bundleArena.Dispose();
             alloc.Dispose();
@@ -438,5 +440,113 @@ public static unsafe class ProfilingAndPacingTests
             alloc.Dispose();
         }
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after pipeline fault test");
+    }
+
+    private static void TestProfilerSeqlockAndPipelineConcurrentStop()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 256 * 1024, 256 * 1024, 64 * 1024);
+
+        try
+        {
+            // CORE-12: Concurrent TryGetLastScopeMs reader while writer loops BeginFrame/BeginScope/EndScope/EndFrame
+            FrameProfiler* prof = alloc.Persistent.Alloc<FrameProfiler>(1, 64);
+            *prof = FrameProfiler.Create(ref alloc.Persistent, enabled: true, measureGpuWithFence: false);
+
+            int stopReader = 0;
+            int tornDetected = 0;
+            int validReads = 0;
+            Exception? readerErr = null;
+            nint profPtr = (nint)prof;
+
+            var reader = new Thread(() =>
+            {
+                try
+                {
+                    FrameProfiler* p = (FrameProfiler*)profPtr;
+                    while (Volatile.Read(ref stopReader) == 0)
+                    {
+                        if (ProfilerSystem.TryGetLastScopeMs(in *p, "Sim", out double simMs))
+                        {
+                            if (!double.IsFinite(simMs) || simMs < 0.0 || simMs > 60000.0)
+                                Interlocked.Increment(ref tornDetected);
+                            else
+                                Interlocked.Increment(ref validReads);
+                        }
+                        if (ProfilerSystem.TryGetLastScopeMs(in *p, "View", out double viewMs))
+                        {
+                            if (!double.IsFinite(viewMs) || viewMs < 0.0 || viewMs > 60000.0)
+                                Interlocked.Increment(ref tornDetected);
+                            else
+                                Interlocked.Increment(ref validReads);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    readerErr = ex;
+                }
+            });
+            reader.Start();
+
+            try
+            {
+                for (int iter = 0; iter < 4000; iter++)
+                {
+                    ProfilerSystem.BeginFrame(ref *prof);
+                    int s1 = ProfilerSystem.BeginScope(ref *prof, "Sim");
+                    ProfilerSystem.EndScope(ref *prof, s1);
+                    int s2 = ProfilerSystem.BeginScope(ref *prof, "View");
+                    ProfilerSystem.EndScope(ref *prof, s2);
+                    ProfilerSystem.EndFrame(ref *prof);
+                }
+            }
+            finally
+            {
+                Volatile.Write(ref stopReader, 1);
+                reader.Join();
+            }
+
+            Assert.True(readerErr == null, $"Concurrent TryGetLastScopeMs reader had 0 exceptions ({readerErr?.Message})");
+            Assert.Equal(0, tornDetected, "Zero torn scope durations observed under concurrent BeginFrame");
+            Assert.True(validReads > 0, $"Observed valid concurrent scope reads ({validReads})");
+
+            // CORE-17: 4-thread barrier-synchronized concurrent EnginePipelineSystem.Stop()
+            EnginePipelineState* pipe = alloc.Persistent.Alloc<EnginePipelineState>(1, 64);
+            int* flag = alloc.Persistent.Alloc<int>(1, 16);
+            *flag = 0;
+            var shaders = default(RenderShaderDefaults);
+            EnginePipelineSystem.Start(pipe, flag, &FaultingLogicCallback, in shaders);
+
+            using var barrier = new Barrier(4);
+            nint pipePtr = (nint)pipe;
+            Exception? stopErr = null;
+            var threads = new Thread[4];
+            for (int t = 0; t < 4; t++)
+            {
+                threads[t] = new Thread(() =>
+                {
+                    try
+                    {
+                        barrier.SignalAndWait();
+                        EnginePipelineSystem.Stop((EnginePipelineState*)pipePtr);
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.CompareExchange(ref stopErr, ex, null);
+                    }
+                });
+                threads[t].Start();
+            }
+            for (int t = 0; t < 4; t++) threads[t].Join();
+            Assert.True(stopErr == null, $"Concurrent EnginePipelineSystem.Stop had 0 exceptions ({stopErr?.Message})");
+        }
+        finally
+        {
+            alloc.Dispose();
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after seqlock & concurrent pipeline stop tests");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after seqlock & concurrent pipeline stop tests");
     }
 }

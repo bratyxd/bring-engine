@@ -101,6 +101,8 @@ public unsafe struct LogState
     public int WriterThreadId;
     internal int ShutdownFlag;
     internal int WriterAlive;
+    internal int StopClaimed;
+    internal CachePaddedInt InFlightProducers;
 
     internal CachePaddedLong FlushRequestSeq;
     internal CachePaddedLong FlushAckSeq;
@@ -110,6 +112,8 @@ public unsafe struct LogState
     public CachePaddedLong TotalDropped;
     public CachePaddedLong TotalCompactions;
     public CachePaddedLong TotalExceptionsLogged;
+
+    public readonly long PendingRingCount => Volatile.Read(ref Unsafe.AsRef(in RingTail)) - Volatile.Read(ref Unsafe.AsRef(in RingHead));
 }
 
 /// <summary>
@@ -153,10 +157,16 @@ public static unsafe class LogSystem
     private static readonly ManagedLogPool[] s_pools = new ManagedLogPool[MaxInstances];
     private static readonly object s_poolLock = new();
 
+    private struct ExceptionHookSlot
+    {
+        public nint StatePtr;
+        public int ActiveHooks;
+    }
+
     private static readonly object s_exceptionHookLock = new();
-    private static nint s_exceptionLogState;
+    private static readonly ExceptionHookSlot[] s_exceptionHookSlots = new ExceptionHookSlot[MaxInstances];
+    private static int s_hookedInstanceCount;
     private static bool s_exceptionHooksRegistered;
-    private static int s_activeExceptionHooks;
 
     private const int MaxAllowedLines = 500_000_000;
 
@@ -197,11 +207,15 @@ public static unsafe class LogSystem
         if (state == null) throw new ArgumentNullException(nameof(state));
         if (defaultMaxLines < 1) defaultMaxLines = LogState.DefaultMaxLines;
         if (defaultMaxLines > MaxAllowedLines) defaultMaxLines = MaxAllowedLines;
+        const int maxHandleCapacity = (int)(HandlePacking.IndexMask + 1);
+        if (maxFiles > maxHandleCapacity)
+            throw new ArgumentOutOfRangeException(nameof(maxFiles), maxFiles, $"maxFiles exceeds 20-bit handle capacity ({maxHandleCapacity}).");
         if (maxFiles < 1) maxFiles = 1;
         if (queueCapacity > 0x2000_0000) queueCapacity = 0x2000_0000;
 
-        int ringCap = 64;
-        while (ringCap < queueCapacity) ringCap <<= 1;
+        long ringCapLong = 64;
+        while (ringCapLong < queueCapacity) ringCapLong <<= 1;
+        int ringCap = (int)ringCapLong;
 
         string baseDir = directoryOverride.IsEmpty
             ? ResolvePlatformLogDirectory(appName)
@@ -233,51 +247,70 @@ public static unsafe class LogSystem
         if (poolSlot < 0)
             throw new InvalidOperationException("Maximum concurrent LogState instances exceeded.");
 
-        *state = default;
-        state->Ring = persistentArena.Alloc<LogEntry>(ringCap, 64);
-        state->RingMask = ringCap - 1;
-        state->Files = persistentArena.Alloc<LogFileSlotMeta>(maxFiles, 64);
-        for (int i = 0; i < maxFiles; i++)
-        {
-            state->Files[i].Generation = 1;
-            state->Files[i].State = 0;
-        }
-        state->MaxFiles = maxFiles;
-        state->PoolSlot = poolSlot;
-        state->MinLevelInt = (int)minLevel;
-        state->OverflowPolicy = overflowPolicy;
-        state->AutoFlushOnError = autoFlushOnError ? (byte)1 : (byte)0;
-        state->MirrorToConsole = mirrorToConsole ? (byte)1 : (byte)0;
-        state->HookExceptions = hookExceptions ? (byte)1 : (byte)0;
-        state->IncludeCancellationExceptions = includeCancellationExceptions ? (byte)1 : (byte)0;
-        state->Active = 1;
-        state->WriterAlive = 1;
-
-        // Open default file at slot 0 before launching background thread
+        ArenaMarker mark = persistentArena.SaveMarker();
+        bool threadStarted = false;
+        bool hooksRegistered = false;
         try
         {
+            *state = default;
+            state->Ring = persistentArena.Alloc<LogEntry>(ringCap, 64);
+            state->RingMask = ringCap - 1;
+            state->Files = persistentArena.Alloc<LogFileSlotMeta>(maxFiles, 64);
+            for (int i = 0; i < maxFiles; i++)
+            {
+                state->Files[i].Generation = 1;
+                state->Files[i].State = 0;
+            }
+            state->MaxFiles = maxFiles;
+            state->PoolSlot = poolSlot;
+            state->MinLevelInt = (int)minLevel;
+            state->OverflowPolicy = overflowPolicy;
+            state->AutoFlushOnError = autoFlushOnError ? (byte)1 : (byte)0;
+            state->MirrorToConsole = mirrorToConsole ? (byte)1 : (byte)0;
+            state->HookExceptions = hookExceptions ? (byte)1 : (byte)0;
+            state->IncludeCancellationExceptions = includeCancellationExceptions ? (byte)1 : (byte)0;
+            Volatile.Write(ref state->WriterAlive, 1);
+
+            // Open default file at slot 0 before launching background thread
             OpenFileSlotInternal(state, slotIdx: 0, defName, defaultMaxLines);
+
+            nint rawPtr = (nint)state;
+            var thread = new Thread(WriterThreadEntry)
+            {
+                Name = "BringEngine.LogWriter",
+                IsBackground = true,
+                Priority = ThreadPriority.BelowNormal,
+            };
+            s_pools[poolSlot].WriterThread = thread;
+            thread.Start(rawPtr);
+            threadStarted = true;
+
+            Volatile.Write(ref state->Active, 1);
+
+            if (hookExceptions)
+            {
+                RegisterExceptionHooks(state);
+                hooksRegistered = true;
+            }
         }
         catch
         {
+            if (hooksRegistered)
+                UnregisterExceptionHooks(state);
+            Volatile.Write(ref state->Active, 0);
+            Volatile.Write(ref state->ShutdownFlag, 1);
+            Thread.MemoryBarrier();
+            if (threadStarted)
+            {
+                try { s_pools[poolSlot].WakeEvent?.Set(); } catch { }
+                s_pools[poolSlot].WriterThread?.Join();
+            }
             CleanupPoolSlotOnStartFailure(poolSlot);
-            state->Active = 0;
-            state->WriterAlive = 0;
+            Volatile.Write(ref state->WriterAlive, 0);
+            *state = default;
+            persistentArena.Rollback(mark);
             throw;
         }
-
-        nint rawPtr = (nint)state;
-        var thread = new Thread(WriterThreadEntry)
-        {
-            Name = "BringEngine.LogWriter",
-            IsBackground = true,
-            Priority = ThreadPriority.BelowNormal,
-        };
-        s_pools[poolSlot].WriterThread = thread;
-        thread.Start(rawPtr);
-
-        if (hookExceptions)
-            RegisterExceptionHooks(state);
     }
 
     /// <summary>
@@ -289,7 +322,7 @@ public static unsafe class LogSystem
         ReadOnlySpan<char> fileName,
         int maxLines = LogState.DefaultMaxLines)
     {
-        if (state == null || state->Active == 0 || fileName.IsEmpty)
+        if (state == null || Volatile.Read(ref state->Active) == 0 || fileName.IsEmpty)
             return LogFileHandle.Invalid;
         if (maxLines < 1) maxLines = LogState.DefaultMaxLines;
         if (maxLines > MaxAllowedLines) maxLines = MaxAllowedLines;
@@ -352,21 +385,35 @@ public static unsafe class LogSystem
     /// </summary>
     public static void CloseFile(LogState* state, LogFileHandle handle)
     {
-        if (state == null || state->Active == 0 || !handle.IsValid) return;
-        uint idx = handle.Index;
-        if (idx == 0 || idx >= (uint)state->MaxFiles) return;
+        if (state == null || !handle.IsValid) return;
 
-        AcquireSpinLock(ref state->FileSlotLock.Value);
-        bool canClose = Volatile.Read(ref state->Files[idx].Generation) == handle.Generation &&
-                        Interlocked.CompareExchange(ref state->Files[idx].State, 2, 1) == 1;
-        ReleaseSpinLock(ref state->FileSlotLock.Value);
-        if (!canClose) return;
+        bool shouldFlush = false;
+        Interlocked.Increment(ref state->InFlightProducers.Value);
+        try
+        {
+            if (Volatile.Read(ref state->Active) == 0) return;
+            uint idx = handle.Index;
+            if (idx == 0 || idx >= (uint)state->MaxFiles) return;
 
-        LogEntry cmd = default;
-        cmd.FileRaw = handle.Raw;
-        cmd.CommandKind = (byte)LogCommandKind.CloseFile;
-        EnqueueEntry(state, in cmd, forceBlock: true);
-        Flush(state);
+            AcquireSpinLock(ref state->FileSlotLock.Value);
+            bool canClose = Volatile.Read(ref state->Files[idx].Generation) == handle.Generation &&
+                            Interlocked.CompareExchange(ref state->Files[idx].State, 2, 1) == 1;
+            ReleaseSpinLock(ref state->FileSlotLock.Value);
+            if (!canClose) return;
+
+            LogEntry cmd = default;
+            cmd.FileRaw = handle.Raw;
+            cmd.CommandKind = (byte)LogCommandKind.CloseFile;
+            EnqueueEntry(state, in cmd, forceBlock: true);
+            shouldFlush = true;
+        }
+        finally
+        {
+            Interlocked.Decrement(ref state->InFlightProducers.Value);
+        }
+
+        if (shouldFlush)
+            Flush(state);
     }
 
     /// <summary>
@@ -374,7 +421,7 @@ public static unsafe class LogSystem
     /// </summary>
     public static void Flush(LogState* state)
     {
-        if (state == null || state->Active == 0) return;
+        if (state == null || Volatile.Read(ref state->Active) == 0) return;
         FlushInternal(state);
     }
 
@@ -384,11 +431,13 @@ public static unsafe class LogSystem
         if (Environment.CurrentManagedThreadId == Volatile.Read(ref state->WriterThreadId)) return;
 
         int poolSlot = state->PoolSlot;
-        try { s_pools[poolSlot].FlushEvent?.Reset(); }
+        ManualResetEventSlim? flushEvt = s_pools[poolSlot].FlushEvent;
+        AutoResetEvent? wakeEvt = s_pools[poolSlot].WakeEvent;
+        try { flushEvt?.Reset(); }
         catch (ObjectDisposedException) { return; }
 
         long req = Interlocked.Increment(ref state->FlushRequestSeq.Value);
-        try { s_pools[poolSlot].WakeEvent?.Set(); } catch { }
+        try { wakeEvt?.Set(); } catch { }
 
         while (Volatile.Read(ref state->FlushAckSeq.Value) < req &&
                Volatile.Read(ref state->WriterAlive) != 0 &&
@@ -396,7 +445,7 @@ public static unsafe class LogSystem
         {
             try
             {
-                s_pools[poolSlot].FlushEvent?.Wait(10);
+                flushEvt?.Wait(10);
             }
             catch (ObjectDisposedException)
             {
@@ -411,22 +460,29 @@ public static unsafe class LogSystem
     /// </summary>
     public static void Stop(LogState* state)
     {
-        if (state == null || state->Active == 0) return;
+        if (state == null || Volatile.Read(ref state->Active) == 0) return;
+        if (Interlocked.CompareExchange(ref state->StopClaimed, 1, 0) != 0) return;
         int poolSlot = state->PoolSlot;
 
         // 1. Detach exception hooks and wait for any active hook callback to finish before tearing down
         UnregisterExceptionHooks(state);
 
-        // 2. Reject new producers BEFORE draining, then flush any in-flight producers cleanly
-        state->Active = 0;
+        // 2. Reject new producers BEFORE draining, and wait until all in-flight producers finish writing & signaling
+        Volatile.Write(ref state->Active, 0);
         Thread.MemoryBarrier();
+        while (Volatile.Read(ref state->InFlightProducers.Value) > 0)
+            Thread.Yield();
+
+        // 3. Drain all already-enqueued entries so TotalWritten == TotalLogged and RingHead == RingTail
         FlushInternal(state);
 
-        // 3. Signal writer thread shutdown and wait for exit
+        // 4. Signal writer thread shutdown and wait for exit
         Volatile.Write(ref state->ShutdownFlag, 1);
         Thread.MemoryBarrier();
 
-        try { s_pools[poolSlot].WakeEvent?.Set(); } catch { }
+        AutoResetEvent? wakeEvt = s_pools[poolSlot].WakeEvent;
+        ManualResetEventSlim? flushEvt = s_pools[poolSlot].FlushEvent;
+        try { wakeEvt?.Set(); } catch { }
         s_pools[poolSlot].WriterThread?.Join();
 
         ManagedFileWriter[]? files = s_pools[poolSlot].Files;
@@ -436,8 +492,8 @@ public static unsafe class LogSystem
                 CloseManagedFile(ref files[i]);
         }
 
-        s_pools[poolSlot].WakeEvent?.Dispose();
-        s_pools[poolSlot].FlushEvent?.Dispose();
+        wakeEvt?.Dispose();
+        flushEvt?.Dispose();
         lock (s_poolLock)
         {
             s_pools[poolSlot] = default;
@@ -457,14 +513,14 @@ public static unsafe class LogSystem
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsEnabled(LogState* state, LogLevel level)
-        => state != null && state->Active != 0 && (int)level >= Volatile.Read(ref state->MinLevelInt) && level != LogLevel.None;
+        => state != null && Volatile.Read(ref state->Active) != 0 && (int)level >= Volatile.Read(ref state->MinLevelInt) && level != LogLevel.None;
 
     public static string GetLogDirectory(LogState* state)
-        => state != null && state->Active != 0 ? (s_pools[state->PoolSlot].BaseDirectory ?? string.Empty) : string.Empty;
+        => state != null && Volatile.Read(ref state->Active) != 0 ? (s_pools[state->PoolSlot].BaseDirectory ?? string.Empty) : string.Empty;
 
     public static string GetFilePath(LogState* state, LogFileHandle handle = default)
     {
-        if (state == null || state->Active == 0) return string.Empty;
+        if (state == null || Volatile.Read(ref state->Active) == 0) return string.Empty;
         uint idx = handle.IsValid ? handle.Index : 0u;
         if (idx >= (uint)state->MaxFiles) return string.Empty;
         if (handle.IsValid && Volatile.Read(ref state->Files[idx].Generation) != handle.Generation)
@@ -626,7 +682,7 @@ public static unsafe class LogSystem
         ReadOnlySpan<char> context = default,
         LogFileHandle file = default)
     {
-        if (state == null || state->Active == 0 || exception == null || !IsEnabled(state, LogLevel.Error))
+        if (state == null || Volatile.Read(ref state->Active) == 0 || exception == null || !IsEnabled(state, LogLevel.Error))
             return;
 
         bool prevGuard = t_inExceptionHook;
@@ -666,10 +722,14 @@ public static unsafe class LogSystem
 
     private static void RegisterExceptionHooks(LogState* state)
     {
+        int slot = state->PoolSlot;
+        if ((uint)slot >= MaxInstances) return;
         lock (s_exceptionHookLock)
         {
-            Volatile.Write(ref s_exceptionLogState, (nint)state);
-            if (!s_exceptionHooksRegistered)
+            if (Volatile.Read(ref s_exceptionHookSlots[slot].StatePtr) == nint.Zero)
+                s_hookedInstanceCount++;
+            Interlocked.Exchange(ref s_exceptionHookSlots[slot].StatePtr, (nint)state);
+            if (!s_exceptionHooksRegistered && s_hookedInstanceCount > 0)
             {
                 AppDomain.CurrentDomain.FirstChanceException += OnFirstChanceException;
                 AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
@@ -681,13 +741,16 @@ public static unsafe class LogSystem
 
     private static void UnregisterExceptionHooks(LogState* state)
     {
+        int slot = state->PoolSlot;
+        if ((uint)slot >= MaxInstances) return;
         bool detached = false;
         lock (s_exceptionHookLock)
         {
-            if (Volatile.Read(ref s_exceptionLogState) == (nint)state)
+            if (Volatile.Read(ref s_exceptionHookSlots[slot].StatePtr) == (nint)state)
             {
-                Volatile.Write(ref s_exceptionLogState, nint.Zero);
-                if (s_exceptionHooksRegistered)
+                Interlocked.Exchange(ref s_exceptionHookSlots[slot].StatePtr, nint.Zero);
+                if (s_hookedInstanceCount > 0) s_hookedInstanceCount--;
+                if (s_hookedInstanceCount == 0 && s_exceptionHooksRegistered)
                 {
                     AppDomain.CurrentDomain.FirstChanceException -= OnFirstChanceException;
                     AppDomain.CurrentDomain.UnhandledException -= OnUnhandledException;
@@ -700,7 +763,7 @@ public static unsafe class LogSystem
 
         if (detached)
         {
-            while (Volatile.Read(ref s_activeExceptionHooks) > 0)
+            while (Volatile.Read(ref s_exceptionHookSlots[slot].ActiveHooks) > 0)
                 Thread.Yield();
         }
     }
@@ -708,143 +771,164 @@ public static unsafe class LogSystem
     private static void OnFirstChanceException(object? sender, FirstChanceExceptionEventArgs e)
     {
         if (t_inExceptionHook) return;
-        nint ptr = Volatile.Read(ref s_exceptionLogState);
-        if (ptr == nint.Zero) return;
-
-        Interlocked.Increment(ref s_activeExceptionHooks);
+        t_inExceptionHook = true;
         try
         {
-            if (Volatile.Read(ref s_exceptionLogState) != ptr) return;
-            LogState* state = (LogState*)ptr;
-            if (state->Active == 0 || state->HookExceptions == 0 || !IsEnabled(state, LogLevel.Error))
-                return;
-            if (Environment.CurrentManagedThreadId == Volatile.Read(ref state->WriterThreadId))
-                return;
-
             Exception ex = e.Exception;
-            if (state->IncludeCancellationExceptions == 0 && ex is OperationCanceledException)
-                return;
+            string? typeName = null;
+            string? msg = null;
+            string? site = null;
 
-            t_inExceptionHook = true;
-            try
+            for (int i = 0; i < MaxInstances; i++)
             {
-                string typeName = ex.GetType().Name;
-                string msg = ex.Message ?? string.Empty;
-                string? site = FindTopCallSite(ex, skipLogSystemFrames: true);
+                nint ptr = Volatile.Read(ref s_exceptionHookSlots[i].StatePtr);
+                if (ptr == nint.Zero) continue;
 
-                if (!string.IsNullOrEmpty(site))
-                    Error(state, $"[Exception] {typeName}: {msg} | at {site}");
-                else
-                    Error(state, $"[Exception] {typeName}: {msg}");
+                Interlocked.Increment(ref s_exceptionHookSlots[i].ActiveHooks);
+                try
+                {
+                    if (Volatile.Read(ref s_exceptionHookSlots[i].StatePtr) != ptr) continue;
+                    LogState* state = (LogState*)ptr;
+                    if (Volatile.Read(ref state->Active) == 0 || state->HookExceptions == 0 || !IsEnabled(state, LogLevel.Error))
+                        continue;
+                    if (Environment.CurrentManagedThreadId == Volatile.Read(ref state->WriterThreadId))
+                        continue;
+                    if (state->IncludeCancellationExceptions == 0 && ex is OperationCanceledException)
+                        continue;
 
-                Interlocked.Increment(ref state->TotalExceptionsLogged.Value);
-            }
-            catch
-            {
-                // Never throw inside FirstChanceException hook
-            }
-            finally
-            {
-                t_inExceptionHook = false;
+                    try
+                    {
+                        typeName ??= ex.GetType().Name;
+                        msg ??= ex.Message ?? string.Empty;
+                        site ??= FindTopCallSite(ex, skipLogSystemFrames: true);
+
+                        if (!string.IsNullOrEmpty(site))
+                            Error(state, $"[Exception] {typeName}: {msg} | at {site}");
+                        else
+                            Error(state, $"[Exception] {typeName}: {msg}");
+
+                        Interlocked.Increment(ref state->TotalExceptionsLogged.Value);
+                    }
+                    catch
+                    {
+                        // Never throw inside FirstChanceException hook
+                    }
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref s_exceptionHookSlots[i].ActiveHooks);
+                }
             }
         }
         finally
         {
-            Interlocked.Decrement(ref s_activeExceptionHooks);
+            t_inExceptionHook = false;
         }
     }
 
     private static void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
     {
         if (t_inExceptionHook) return;
-        nint ptr = Volatile.Read(ref s_exceptionLogState);
-        if (ptr == nint.Zero) return;
-
-        Interlocked.Increment(ref s_activeExceptionHooks);
+        t_inExceptionHook = true;
         try
         {
-            if (Volatile.Read(ref s_exceptionLogState) != ptr) return;
-            LogState* state = (LogState*)ptr;
-            if (state->Active == 0 || state->HookExceptions == 0 || !IsEnabled(state, LogLevel.Error))
-                return;
-            if (Environment.CurrentManagedThreadId == Volatile.Read(ref state->WriterThreadId))
-                return;
+            for (int i = 0; i < MaxInstances; i++)
+            {
+                nint ptr = Volatile.Read(ref s_exceptionHookSlots[i].StatePtr);
+                if (ptr == nint.Zero) continue;
 
-            t_inExceptionHook = true;
-            try
-            {
-                if (e.ExceptionObject is Exception ex)
+                Interlocked.Increment(ref s_exceptionHookSlots[i].ActiveHooks);
+                try
                 {
-                    string typeName = ex.GetType().Name;
-                    string msg = ex.Message ?? string.Empty;
-                    Error(state, $"[UnhandledException terminating={e.IsTerminating}] {typeName}: {msg}");
-                    LogStackFrames(state, ex.StackTrace, maxFrames: 6);
-                }
-                else
-                {
-                    Error(state, $"[UnhandledException terminating={e.IsTerminating}] Non-Exception object thrown");
-                }
+                    if (Volatile.Read(ref s_exceptionHookSlots[i].StatePtr) != ptr) continue;
+                    LogState* state = (LogState*)ptr;
+                    if (Volatile.Read(ref state->Active) == 0 || state->HookExceptions == 0 || !IsEnabled(state, LogLevel.Error))
+                        continue;
+                    if (Environment.CurrentManagedThreadId == Volatile.Read(ref state->WriterThreadId))
+                        continue;
 
-                Interlocked.Increment(ref state->TotalExceptionsLogged.Value);
-                Flush(state);
-            }
-            catch
-            {
-                // Best-effort crash flush
-            }
-            finally
-            {
-                t_inExceptionHook = false;
+                    try
+                    {
+                        if (e.ExceptionObject is Exception ex)
+                        {
+                            string typeName = ex.GetType().Name;
+                            string msg = ex.Message ?? string.Empty;
+                            Error(state, $"[UnhandledException terminating={e.IsTerminating}] {typeName}: {msg}");
+                            LogStackFrames(state, ex.StackTrace, maxFrames: 6);
+                        }
+                        else
+                        {
+                            Error(state, $"[UnhandledException terminating={e.IsTerminating}] Non-Exception object thrown");
+                        }
+
+                        Interlocked.Increment(ref state->TotalExceptionsLogged.Value);
+                        Flush(state);
+                    }
+                    catch
+                    {
+                        // Best-effort crash flush
+                    }
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref s_exceptionHookSlots[i].ActiveHooks);
+                }
             }
         }
         finally
         {
-            Interlocked.Decrement(ref s_activeExceptionHooks);
+            t_inExceptionHook = false;
         }
     }
 
     private static void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
     {
         if (t_inExceptionHook) return;
-        nint ptr = Volatile.Read(ref s_exceptionLogState);
-        if (ptr == nint.Zero) return;
-
-        Interlocked.Increment(ref s_activeExceptionHooks);
+        t_inExceptionHook = true;
         try
         {
-            if (Volatile.Read(ref s_exceptionLogState) != ptr) return;
-            LogState* state = (LogState*)ptr;
-            if (state->Active == 0 || state->HookExceptions == 0 || !IsEnabled(state, LogLevel.Error))
-                return;
-            if (Environment.CurrentManagedThreadId == Volatile.Read(ref state->WriterThreadId))
-                return;
+            for (int i = 0; i < MaxInstances; i++)
+            {
+                nint ptr = Volatile.Read(ref s_exceptionHookSlots[i].StatePtr);
+                if (ptr == nint.Zero) continue;
 
-            t_inExceptionHook = true;
-            try
-            {
-                AggregateException flat = e.Exception.Flatten();
-                if (state->IncludeCancellationExceptions == 0 && IsCancellationOnly(flat))
-                    return;
+                Interlocked.Increment(ref s_exceptionHookSlots[i].ActiveHooks);
+                try
+                {
+                    if (Volatile.Read(ref s_exceptionHookSlots[i].StatePtr) != ptr) continue;
+                    LogState* state = (LogState*)ptr;
+                    if (Volatile.Read(ref state->Active) == 0 || state->HookExceptions == 0 || !IsEnabled(state, LogLevel.Error))
+                        continue;
+                    if (Environment.CurrentManagedThreadId == Volatile.Read(ref state->WriterThreadId))
+                        continue;
 
-                Exception root = flat.InnerException ?? e.Exception;
-                string typeName = root.GetType().Name;
-                string msg = root.Message ?? string.Empty;
-                Error(state, $"[UnobservedTaskException] {typeName}: {msg}");
-                LogStackFrames(state, root.StackTrace, maxFrames: 4);
-                Interlocked.Increment(ref state->TotalExceptionsLogged.Value);
-            }
-            catch
-            {
-                // Never throw inside UnobservedTaskException hook
-            }
-            finally
-            {
-                t_inExceptionHook = false;
+                    try
+                    {
+                        AggregateException flat = e.Exception.Flatten();
+                        if (state->IncludeCancellationExceptions == 0 && IsCancellationOnly(flat))
+                            continue;
+
+                        Exception root = flat.InnerException ?? e.Exception;
+                        string typeName = root.GetType().Name;
+                        string msg = root.Message ?? string.Empty;
+                        Error(state, $"[UnobservedTaskException] {typeName}: {msg}");
+                        LogStackFrames(state, root.StackTrace, maxFrames: 4);
+                        Interlocked.Increment(ref state->TotalExceptionsLogged.Value);
+                    }
+                    catch
+                    {
+                        // Never throw inside UnobservedTaskException hook
+                    }
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref s_exceptionHookSlots[i].ActiveHooks);
+                }
             }
         }
         finally
         {
-            Interlocked.Decrement(ref s_activeExceptionHooks);
+            t_inExceptionHook = false;
         }
     }
 
@@ -938,64 +1022,84 @@ public static unsafe class LogSystem
 
     private static void EnqueueUtf8(LogState* state, LogFileHandle file, LogLevel level, ReadOnlySpan<byte> utf8, byte truncated)
     {
-        LogEntry entry = default;
-        entry.UtcTicks = DateTime.UtcNow.Ticks;
-        entry.FileRaw = file.Raw;
-        entry.Level = level;
-        entry.CommandKind = (byte)LogCommandKind.WriteLine;
-        byte flags = truncated != 0 ? (byte)1 : (byte)0;
-        if (state->AutoFlushOnError != 0 && level >= LogLevel.Error)
-            flags |= 2;
-        entry.Flags = flags;
-
-        int len = utf8.Length;
-        if (len > LogEntry.MaxMessageBytes)
+        if (state == null) return;
+        Interlocked.Increment(ref state->InFlightProducers.Value);
+        try
         {
-            len = LogEntry.MaxMessageBytes;
-            int minLen = len > 3 ? len - 3 : 0;
-            while (len > minLen && (utf8[len] & 0xC0) == 0x80)
-                len--;
-            entry.Flags |= 1;
-        }
-        entry.MessageLength = (ushort)len;
-        if (len > 0)
-            utf8.Slice(0, len).CopyTo(new Span<byte>(entry.Message, len));
+            if (Volatile.Read(ref state->Active) == 0) return;
 
-        EnqueueEntry(state, in entry, forceBlock: false);
+            LogEntry entry = default;
+            entry.UtcTicks = DateTime.UtcNow.Ticks;
+            entry.FileRaw = file.Raw;
+            entry.Level = level;
+            entry.CommandKind = (byte)LogCommandKind.WriteLine;
+            byte flags = truncated != 0 ? (byte)1 : (byte)0;
+            if (state->AutoFlushOnError != 0 && level >= LogLevel.Error)
+                flags |= 2;
+            entry.Flags = flags;
+
+            int len = utf8.Length;
+            if (len > LogEntry.MaxMessageBytes)
+            {
+                len = LogEntry.MaxMessageBytes;
+                int minLen = len > 3 ? len - 3 : 0;
+                while (len > minLen && (utf8[len] & 0xC0) == 0x80)
+                    len--;
+                entry.Flags |= 1;
+            }
+            entry.MessageLength = (ushort)len;
+            if (len > 0)
+                utf8.Slice(0, len).CopyTo(new Span<byte>(entry.Message, len));
+
+            EnqueueEntry(state, in entry, forceBlock: false);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref state->InFlightProducers.Value);
+        }
     }
 
     private static void EnqueueEntry(LogState* state, in LogEntry entry, bool forceBlock)
     {
         bool shouldBlock = forceBlock || state->OverflowPolicy == LogOverflowPolicy.BlockUntilSpace;
         int poolSlot = state->PoolSlot;
+        AutoResetEvent? wakeEvt = s_pools[poolSlot].WakeEvent;
 
         while (true)
         {
             AcquireSpinLock(ref state->QueueLock.Value);
+            if (Volatile.Read(ref state->Active) == 0 || Volatile.Read(ref state->ShutdownFlag) != 0)
+            {
+                ReleaseSpinLock(ref state->QueueLock.Value);
+                return;
+            }
+
             long head = Volatile.Read(ref state->RingHead);
             long tail = state->RingTail;
             if ((tail - head) <= state->RingMask)
             {
                 state->Ring[tail & state->RingMask] = entry;
                 Volatile.Write(ref state->RingTail, tail + 1);
-                ReleaseSpinLock(ref state->QueueLock.Value);
-
                 if (entry.CommandKind == (byte)LogCommandKind.WriteLine)
                     Interlocked.Increment(ref state->TotalLogged.Value);
+                ReleaseSpinLock(ref state->QueueLock.Value);
 
-                // Wake background writer (0 GC bytes)
-                try { s_pools[poolSlot].WakeEvent?.Set(); } catch { }
+                // Wake background writer (0 GC bytes; wakeEvt cannot be disposed while InFlightProducers > 0)
+                try { wakeEvt?.Set(); } catch { }
                 return;
             }
             ReleaseSpinLock(ref state->QueueLock.Value);
 
-            if (!shouldBlock || Volatile.Read(ref state->ShutdownFlag) != 0 || Volatile.Read(ref state->WriterAlive) == 0)
+            if (Volatile.Read(ref state->Active) == 0 || Volatile.Read(ref state->ShutdownFlag) != 0)
+                return;
+
+            if (!shouldBlock || Volatile.Read(ref state->WriterAlive) == 0)
             {
                 Interlocked.Increment(ref state->TotalDropped.Value);
                 return;
             }
 
-            try { s_pools[poolSlot].WakeEvent?.Set(); } catch { }
+            try { wakeEvt?.Set(); } catch { }
             Thread.Yield();
         }
     }
