@@ -16,6 +16,7 @@ public static class Program
         Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - CoreCLR Test Suite{(headlessOnly ? " (Headless Only)" : "")}");
         CoreTests.RunAll();
         JobSystemTests.RunAll();
+        NetworkingTests.RunAll();
         SimulationTests.RunAll();
         TweenAnimParticleTests.RunAll();
         AssetBundleSceneGltfTests.RunAll();

@@ -9,7 +9,7 @@
 
 1. **NO OOP — Pure Data + Static Systems**
    - NEVER use class inheritance, `virtual`, `override`, `abstract`, or interface dispatch in engine or game code.
-   - Store all state in `[StructLayout(LayoutKind.Sequential)]` `unmanaged struct` tables (SoA / dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`).
+   - Store all state in `[StructLayout(LayoutKind.Sequential)]` `unmanaged struct` tables (SoA / dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`, `HttpRequestHandle`, `WebSocketHandle`).
    - Put behavior in `public static unsafe class <Feature>System` methods and use unmanaged function pointers (`delegate*<...>`) for callbacks.
 
 2. **Desktop CoreCLR (.NET 10) + Self-Contained ReadyToRun — Windows, Linux (Steam Deck), macOS**
@@ -39,6 +39,7 @@
 - `BringEngine.sln` & `Directory.Build.props` — Solution and Desktop CoreCLR (`.NET 10`) build settings.
 - `src/BringEngine/` — Core Engine Library (`net10.0`):
   - `Core/` — `Memory/` (`LinearArena`, `PoolAllocator<T>`, `FreeListAllocator`, `EngineAllocators`, native containers, `FixedString*`, `StringId`), `Profiling/` (`FrameProfiler`, `ProfilerSystem`), `Threading/` (`EnginePipelineSystem`, `JobSystem`), `Handles/`, `Math/` (`Fix32/64`, `FixVec2/3`, `DetMath`, `DetRng`, `Vec/Quat/Mat4`).
+  - `Networking/` — Zero-dependency `.NET 10` BCL networking (`HttpSystem`, `WebSocketSystem`), zero-GC binary `NetWriter`/`NetReader`/`NetHash.Crc32`, pluggable `NetTransportVTable`, and deterministic `LoopbackTransportSystem`.
   - `Simulation/` — `EntityTable`, `TransformTable`, `EngineWorld`, `CameraTable`, `InputState`, `TweenTable`, `AnimationTable`, `ParticleTable`, `RenderComponentTables`, `SceneManager`.
   - `Assets/` — `AssetRegistry`, `BundleManager`, `Compression/` (BC1/BC3 `BRTX`, LZ4/Brotli, `BGLB`), `Atlases/` (`AtlasPacker`), `Packing/` (`AssetPackBuilder` / `AssetPackLoader`), `TextureLoader`, `SdfFontLoader`, `GltfLoader`, `GlbBuilder`.
   - `Rendering/` — `SdlPlatform`, `FramePacer`, `GpuContext`, `ShaderSystem` (`SDL_shadercross`), `SceneLighting`, `TextLayoutSystem`, `RenderPacket`, `BatchRenderer`, `ProfilerOverlay`.
@@ -74,6 +75,7 @@
 | 11 | [`11-vsync-fps-cap-and-profiling.md`](docs/agents/11-vsync-fps-cap-and-profiling.md) | Borderless fullscreen default, 2-thread loop, VSync/FPS cap, `FrameProfiler`, `ProfilerOverlay` |
 | 12 | [`12-multithreading-and-jobs.md`](docs/agents/12-multithreading-and-jobs.md) | Data-oriented `JobSystem` (`ParallelFor`, async DAGs, cancel, worker scratch, when NOT to parallelize) |
 | 13 | [`13-asset-compression-atlases-and-9slice.md`](docs/agents/13-asset-compression-atlases-and-9slice.md) | BC1/BC3 texture compression, LZ4/Brotli `.bpack` & GLB compression, default atlasing, `BringPacker`, 9-slice UI |
+| 16 | [`16-networking-and-multiplayer.md`](docs/agents/16-networking-and-multiplayer.md) | Lean core `HttpSystem`, `WebSocketSystem`, zero-GC `NetWriter`/`NetReader`, `NetTransportVTable`, `LoopbackTransport`, and game-level multiplayer (`LiteNetLib`, `Backdash`, `Facepunch.Steamworks`) |
 
 ---
 

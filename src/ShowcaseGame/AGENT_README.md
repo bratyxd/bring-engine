@@ -50,7 +50,10 @@ src/<YourGame>/
    - Use `JobScheduler` + `JobSystem` (`ParallelFor`, async `ScheduleParallelFor` + `IsComplete`, `CombineDependencies`, `RequestCancel`, per-worker `GetWorkerScratch`) when profiling shows a genuinely heavy SoA loop (hundreds/thousands of independent entities, particles, transforms, spatial/flow grids) or multi-frame background generation (maps, nav grids, chunk meshes).
    - **Do NOT multithread tiny loops** (< ~500–1000 items or < 0.5 ms) — pass a sensible `minParallelCount` so small workloads stay single-threaded inline with zero sync overhead.
    - Keep parallel kernels deterministic (disjoint writes, per-item seeded `DetRng`, zero SDL3/GPU calls, always `RequestCancel` + `Complete` before resetting/disposing arenas). See [`docs/agents/12-multithreading-and-jobs.md`](../../docs/agents/12-multithreading-and-jobs.md).
-10. **Verify Desktop Publish, Cross-OS Targets, Headless Determinism & GPU Render**:
+10. **Core Networking & Custom Multiplayer (Zero Core Bloat)**:
+   - Use core `HttpSystem` (HTTP/HTTPS), `WebSocketSystem` (`ws://`/`wss://`), `NetWriter`/`NetReader`, and `NetTransportVTable` / `LoopbackTransportSystem` for web APIs, lobbies, and headless multiplayer testing; keep all sockets outside `Simulation/` and always call `ReleaseResponse`/`ReleaseEvent`.
+   - For real-time UDP multiplayer, add only the NuGet your game needs (`LiteNetLib 2.x`, `Backdash` rollback, or `Facepunch.Steamworks`) directly to `<YourGame>.csproj`. See [`docs/agents/16-networking-and-multiplayer.md`](../../docs/agents/16-networking-and-multiplayer.md).
+11. **Verify Desktop Publish, Cross-OS Targets, Headless Determinism & GPU Render**:
     ```bash
     # Windows (default local verification)
     dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r win-x64 -o dist/win-x64

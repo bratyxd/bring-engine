@@ -342,3 +342,45 @@ public readonly struct JobHandle : IEquatable<JobHandle>
     public static bool operator !=(JobHandle a, JobHandle b) => a.Raw != b.Raw;
     public override string ToString() => IsValid ? $"Job({Index}:g{Generation})" : "Job(Invalid)";
 }
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct HttpRequestHandle : IEquatable<HttpRequestHandle>
+{
+    public readonly uint Raw;
+    public static readonly HttpRequestHandle Invalid = default;
+    public bool IsValid => Raw != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public HttpRequestHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static HttpRequestHandle Create(uint index, uint generation) => new HttpRequestHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(HttpRequestHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is HttpRequestHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(HttpRequestHandle a, HttpRequestHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(HttpRequestHandle a, HttpRequestHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"HttpReq({Index}:g{Generation})" : "HttpReq(Invalid)";
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct WebSocketHandle : IEquatable<WebSocketHandle>
+{
+    public readonly uint Raw;
+    public static readonly WebSocketHandle Invalid = default;
+    public bool IsValid => Raw != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public WebSocketHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static WebSocketHandle Create(uint index, uint generation) => new WebSocketHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(WebSocketHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is WebSocketHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(WebSocketHandle a, WebSocketHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(WebSocketHandle a, WebSocketHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"WebSocket({Index}:g{Generation})" : "WebSocket(Invalid)";
+}
