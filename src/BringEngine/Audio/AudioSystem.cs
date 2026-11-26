@@ -207,7 +207,9 @@ public static unsafe class AudioSystem
         if (maxClips > maxHandleSlots) maxClips = maxHandleSlots;
         int maxVoices = config.MaxVoices > 0 ? config.MaxVoices : 64;
         if (maxVoices > maxHandleSlots) maxVoices = maxHandleSlots;
-        int mixFrames = config.MixBufferFrames >= 64 ? config.MixBufferFrames : 512;
+        int mixFrames = config.MixBufferFrames <= 0
+            ? 512
+            : (config.MixBufferFrames < 64 ? 64 : (config.MixBufferFrames > 65536 ? 65536 : config.MixBufferFrames));
 
         int syncSlot = -1;
         lock (s_syncLock)
@@ -227,6 +229,8 @@ public static unsafe class AudioSystem
             throw new InvalidOperationException("Maximum concurrent AudioSystem instances exceeded.");
 
         AudioState* state = null;
+        Thread? thread = null;
+        bool threadStarted = false;
         try
         {
             state = persistentArena.Alloc<AudioState>(1, 64);
@@ -269,7 +273,7 @@ public static unsafe class AudioSystem
             Volatile.Write(ref state->Active, 1);
 
             nint rawState = (nint)state;
-            var thread = new Thread(MixerThreadEntry)
+            thread = new Thread(MixerThreadEntry)
             {
                 Name = "BringEngine.AudioMixer",
                 IsBackground = true,
@@ -278,20 +282,22 @@ public static unsafe class AudioSystem
             s_sync[syncSlot].MixerThread = thread;
             Volatile.Write(ref state->MixerThreadId, thread.ManagedThreadId);
             thread.Start(rawState);
-
-            if (state->Log != null && state->Log->Active != 0)
-            {
-                LogSystem.Info(state->Log,
-                    $"AudioSystem started (mode={(state->IsHeadless != 0 ? "headless" : "sdl3")}, rate={sampleRate}Hz, ch={channels}, maxClips={maxClips}, maxVoices={maxVoices})");
-            }
-
-            return state;
+            threadStarted = true;
         }
         catch
         {
             if (state != null)
             {
                 Volatile.Write(ref state->Active, 0);
+                Volatile.Write(ref state->ShutdownFlag, 1);
+            }
+            if (threadStarted)
+            {
+                try { s_sync[syncSlot].StopSignal?.Set(); } catch { }
+                try { thread?.Join(); } catch { }
+            }
+            if (state != null)
+            {
                 if (state->AudioStream != nint.Zero)
                 {
                     SDL.DestroyAudioStream(state->AudioStream);
@@ -321,6 +327,14 @@ public static unsafe class AudioSystem
             }
             throw;
         }
+
+        if (state->Log != null && state->Log->Active != 0)
+        {
+            LogSystem.Info(state->Log,
+                $"AudioSystem started (mode={(state->IsHeadless != 0 ? "headless" : "sdl3")}, rate={sampleRate}Hz, ch={channels}, maxClips={maxClips}, maxVoices={maxVoices})");
+        }
+
+        return state;
     }
 
     private static void TryInitSdlAudio(AudioState* state, bool allowFallback)
@@ -601,11 +615,14 @@ public static unsafe class AudioSystem
     /// </summary>
     public static AudioClipHandle CreateClipFromDecoded(AudioState* audio, ref DecodedPcmData decoded, StringId name = default)
     {
+        bool dimsValid = decoded.FrameCount > 0 && decoded.SampleRate > 0 &&
+                         decoded.Channels > 0 && decoded.Channels <= 2;
+        nuint requiredBytes = dimsValid ? (nuint)((long)decoded.FrameCount * decoded.Channels * sizeof(float)) : 0;
         if (audio == null || Volatile.Read(ref audio->Active) == 0 ||
-            decoded.Samples == null || decoded.FrameCount <= 0 || decoded.SampleRate <= 0 ||
-            decoded.Channels <= 0 || decoded.Channels > 2)
+            decoded.Samples == null || !dimsValid || decoded.AllocBytes < requiredBytes)
         {
-            WavDecoder.Free(ref decoded);
+            if (decoded.Samples != null && decoded.AllocBytes > 0)
+                WavDecoder.Free(ref decoded);
             decoded = default;
             return AudioClipHandle.Invalid;
         }
@@ -619,6 +636,7 @@ public static unsafe class AudioSystem
     /// <summary>
     /// By-value convenience overload; prefer <see cref="CreateClipFromDecoded(AudioState*, ref DecodedPcmData, StringId)"/> so caller's struct is cleared on ownership transfer.
     /// </summary>
+    [Obsolete("Use CreateClipFromDecoded(AudioState*, ref DecodedPcmData, StringId) to prevent double-free.", error: false)]
     public static AudioClipHandle CreateClipFromDecoded(AudioState* audio, DecodedPcmData decoded, StringId name = default)
         => CreateClipFromDecoded(audio, ref decoded, name);
 
@@ -1033,7 +1051,10 @@ public static unsafe class AudioSystem
         if (audio == null || outInterleaved == null || frameCount <= 0) return;
 
         int outCh = audio->Channels;
-        int totalOutSamples = frameCount * outCh;
+        if (outCh <= 0) return;
+        long totalOutSamplesLong = (long)frameCount * outCh;
+        if (totalOutSamplesLong > int.MaxValue) return;
+        int totalOutSamples = (int)totalOutSamplesLong;
         new Span<float>(outInterleaved, totalOutSamples).Clear();
 
         if (Volatile.Read(ref audio->Active) == 0 || Volatile.Read(ref audio->GlobalPaused) != 0)
@@ -1211,8 +1232,13 @@ public static unsafe class AudioSystem
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void AcquireLock(AudioState* audio)
     {
+        if (Interlocked.CompareExchange(ref audio->SpinLock, 1, 0) == 0) return;
+        int spins = 0;
         while (Interlocked.CompareExchange(ref audio->SpinLock, 1, 0) != 0)
-            Thread.SpinWait(4);
+        {
+            if (++spins < 32) Thread.SpinWait(16);
+            else Thread.Yield();
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

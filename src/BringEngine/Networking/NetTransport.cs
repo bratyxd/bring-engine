@@ -135,8 +135,8 @@ public unsafe struct LoopbackEndpoint
     internal int DisconnectReason;
     internal int MaxPacketBytes;
     internal byte* PollScratch;
-    internal uint LastUnreliableSequencedSeq;
-    internal byte HasUnreliableSequenced;
+    internal uint* LastUnreliableSequencedSeq; // 256-entry per-channel array
+    internal byte* HasUnreliableSequenced;     // 256-entry per-channel array
     internal int LastOrderedDeliverTick;
     internal long PacketsSent;
     internal long PacketsReceived;
@@ -182,6 +182,9 @@ public static unsafe class LoopbackTransportSystem
         if (link == null) throw new ArgumentNullException(nameof(link));
         if (queueCapacity < 8) queueCapacity = 8;
         if (maxPacketBytes < 64) maxPacketBytes = 64;
+        long payloadPoolBytes = (long)queueCapacity * maxPacketBytes;
+        if (payloadPoolBytes > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(queueCapacity), "queueCapacity * maxPacketBytes exceeds int.MaxValue.");
 
         *link = default;
         link->Config = config;
@@ -189,7 +192,7 @@ public static unsafe class LoopbackTransportSystem
         link->QueueCapacity = queueCapacity;
         link->MaxPacketBytes = maxPacketBytes;
         link->Queue = arena.Alloc<LoopbackQueuedPacket>(queueCapacity, 64);
-        link->PayloadPool = arena.AllocUninitialized<byte>(queueCapacity * maxPacketBytes, 64);
+        link->PayloadPool = arena.AllocUninitialized<byte>((int)payloadPoolBytes, 64);
 
         InitEndpoint(ref link->PeerA, link, 0, ref arena, maxPacketBytes);
         InitEndpoint(ref link->PeerB, link, 1, ref arena, maxPacketBytes);
@@ -205,6 +208,8 @@ public static unsafe class LoopbackTransportSystem
             PendingConnectEvent = 1,
             MaxPacketBytes = maxPacketBytes,
             PollScratch = arena.AllocUninitialized<byte>(maxPacketBytes, 16),
+            LastUnreliableSequencedSeq = arena.Alloc<uint>(256, 16),
+            HasUnreliableSequenced = arena.Alloc<byte>(256, 16),
         };
     }
 
@@ -230,9 +235,7 @@ public static unsafe class LoopbackTransportSystem
         if (ep == null || ep->Link == null || ep->Connected == 0) return false;
         LoopbackLink* link = ep->Link;
         if (length < 0 || length > link->MaxPacketBytes) return false;
-
-        ep->PacketsSent++;
-        ep->BytesSent += length;
+        if (length > 0 && payload == null) return false;
 
         // Apply deterministic packet loss ONLY to unreliable packets (reliable packets retransmit in real transports)
         bool isUnreliable = mode == NetDeliveryMode.Unreliable || mode == NetDeliveryMode.UnreliableSequenced;
@@ -241,6 +244,8 @@ public static unsafe class LoopbackTransportSystem
             int roll = link->Rng.NextInt(0, 1000);
             if (roll < link->Config.PacketLossPermille)
             {
+                ep->PacketsSent++;
+                ep->BytesSent += length;
                 link->TotalDropped++;
                 return true;
             }
@@ -261,6 +266,9 @@ public static unsafe class LoopbackTransportSystem
             link->TotalDropped++;
             return false;
         }
+
+        ep->PacketsSent++;
+        ep->BytesSent += length;
 
         int jitter = link->Config.JitterTicks > 0 ? link->Rng.NextInt(0, link->Config.JitterTicks + 1) : 0;
         int delay = link->Config.OneWayLatencyTicks + jitter;
@@ -360,16 +368,17 @@ public static unsafe class LoopbackTransportSystem
             LoopbackQueuedPacket pkt = link->Queue[bestIdx];
             link->Queue[bestIdx].Active = 0;
 
-            // Drop stale out-of-order packets for UnreliableSequenced independently from other delivery modes
+            // Drop stale out-of-order packets for UnreliableSequenced independently per channel
             if (pkt.Delivery == NetDeliveryMode.UnreliableSequenced)
             {
-                if (ep->HasUnreliableSequenced != 0 && (int)(pkt.Sequence - ep->LastUnreliableSequencedSeq) < 0)
+                int ch = pkt.Channel;
+                if (ep->HasUnreliableSequenced[ch] != 0 && (int)(pkt.Sequence - ep->LastUnreliableSequencedSeq[ch]) < 0)
                 {
                     link->TotalDropped++;
                     continue;
                 }
-                ep->HasUnreliableSequenced = 1;
-                ep->LastUnreliableSequencedSeq = pkt.Sequence;
+                ep->HasUnreliableSequenced[ch] = 1;
+                ep->LastUnreliableSequencedSeq[ch] = pkt.Sequence;
             }
 
             if (pkt.Length > 0)

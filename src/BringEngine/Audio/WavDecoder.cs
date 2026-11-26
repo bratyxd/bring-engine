@@ -160,9 +160,24 @@ public static unsafe class WavDecoder
                     dst[i] = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(i * 4, 4)) * inv32;
             }
         }
+        else if (srcChannels == 4)
+        {
+            // Quadraphonic downmix (FL, FR, RL, RR -> stereo)
+            const float invSqrt2 = 0.70710678f;
+            for (int f = 0; f < frameCount; f++)
+            {
+                int frameOff = f * bytesPerFrame;
+                float fl = ReadSample(data, frameOff, isFloat, bitsPerSample);
+                float fr = ReadSample(data, frameOff + bytesPerSample, isFloat, bitsPerSample);
+                float rl = ReadSample(data, frameOff + bytesPerSample * 2, isFloat, bitsPerSample);
+                float rr = ReadSample(data, frameOff + bytesPerSample * 3, isFloat, bitsPerSample);
+                dst[f * 2 + 0] = DetMath.Clamp(fl + rl * invSqrt2, -1f, 1f);
+                dst[f * 2 + 1] = DetMath.Clamp(fr + rr * invSqrt2, -1f, 1f);
+            }
+        }
         else
         {
-            // Downmix >2 channels to stereo by taking front-left/right + center blend
+            // Downmix 3ch / 5ch+ to stereo by taking front-left/right + center blend
             for (int f = 0; f < frameCount; f++)
             {
                 int frameOff = f * bytesPerFrame;
@@ -251,7 +266,9 @@ public static unsafe class WavDecoder
         BinaryPrimitives.WriteUInt16LittleEndian(span.Slice(20, 2), FormatPcm);
         BinaryPrimitives.WriteUInt16LittleEndian(span.Slice(22, 2), (ushort)ch);
         BinaryPrimitives.WriteInt32LittleEndian(span.Slice(24, 4), sampleRate);
-        BinaryPrimitives.WriteInt32LittleEndian(span.Slice(28, 4), sampleRate * ch * 2);
+        ulong byteRateLong = (ulong)sampleRate * (ulong)ch * 2UL;
+        uint byteRate = byteRateLong > uint.MaxValue ? uint.MaxValue : (uint)byteRateLong;
+        BinaryPrimitives.WriteUInt32LittleEndian(span.Slice(28, 4), byteRate);
         BinaryPrimitives.WriteUInt16LittleEndian(span.Slice(32, 2), (ushort)(ch * 2));
         BinaryPrimitives.WriteUInt16LittleEndian(span.Slice(34, 2), 16);
         BinaryPrimitives.WriteUInt32LittleEndian(span.Slice(36, 4), ChunkData);
@@ -283,8 +300,12 @@ public static unsafe class WavDecoder
         if (!float.IsFinite(amplitude)) amplitude = 0f;
 
         int ch = channels <= 1 ? 1 : 2;
-        long framesLong = (long)(durationSeconds * sampleRate);
-        int frames = framesLong < 1 ? 1 : (framesLong > int.MaxValue / (ch * sizeof(float)) ? int.MaxValue / (ch * sizeof(float)) : (int)framesLong);
+        const int MaxGeneratedFrames = 48000 * 60; // 60s @ 48kHz cap prevents huge OOM / int-overflow allocations
+        int maxFrames = Math.Min(MaxGeneratedFrames, int.MaxValue / (ch * sizeof(float)));
+        double framesDouble = (double)durationSeconds * sampleRate;
+        int frames = !double.IsFinite(framesDouble) || framesDouble < 1.0
+            ? 1
+            : (framesDouble >= maxFrames ? maxFrames : (int)framesDouble);
 
         nuint allocBytes = (nuint)((long)frames * ch * sizeof(float));
         float* buf = (float*)NativeMemoryTracker.AlignedAlloc(allocBytes, 64);

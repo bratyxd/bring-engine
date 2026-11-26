@@ -258,18 +258,20 @@ public static unsafe class HttpSystem
         guard = (uint)poolSlot < MaxInstances ? s_pools[poolSlot].Guard : null;
         reqs = guard?.Requests;
         if (guard != null)
+        {
             guard.Stopped = true;
+            guard.Requests = null;
+        }
+        for (int i = 0; i < state->MaxConcurrent; i++)
+            Volatile.Write(ref state->Slots[i].State, 0);
+        ReleaseSpinLock(ref state->SlotLock.Value);
+
         if (reqs != null)
         {
             for (int i = 0; i < reqs.Length; i++)
             {
                 try { reqs[i].Cts?.Cancel(); } catch { /* ignore shutdown races */ }
             }
-        }
-        ReleaseSpinLock(ref state->SlotLock.Value);
-
-        if (reqs != null)
-        {
             for (int i = 0; i < reqs.Length; i++)
             {
                 Task? t = reqs[i].InFlightTask;
@@ -282,6 +284,8 @@ public static unsafe class HttpSystem
                 reqs[i] = default;
             }
         }
+
+        Interlocked.Exchange(ref state->PendingCount.Value, 0);
 
         // Free any response buffers still sitting unpolled in the native completion ring buffer
         while (TryDequeueCompletedRaw(state, out HttpResponse leftover))
@@ -341,102 +345,146 @@ public static unsafe class HttpSystem
         if (state == null || Volatile.Read(ref state->Active) == 0 || url.IsEmpty)
             return HttpRequestHandle.Invalid;
 
-        int slotIdx = -1;
-        uint gen = 0;
-        HttpRequestHandle handle = HttpRequestHandle.Invalid;
         int effTimeout = timeoutMs > 0 ? timeoutMs : state->DefaultTimeoutMsValue;
         if (maxResponseBytes <= 0) maxResponseBytes = HttpClientState.DefaultMaxResponseBytes;
+
+        // Parse Uri, copy body, attach headers, and construct CTS before acquiring SlotLock
+        HttpRequestMessage? msg = null;
+        CancellationTokenSource? cts = null;
+        int bodyByteLen = 0;
+        string? buildError = null;
+        try
+        {
+            var uri = new Uri(new string(url), UriKind.Absolute);
+            msg = new HttpRequestMessage(ToHttpMethod(method), uri);
+
+            if (!body.IsEmpty)
+            {
+                byte[] copy = body.ToArray();
+                bodyByteLen = copy.Length;
+                var content = new ByteArrayContent(copy);
+                if (!contentType.IsEmpty)
+                    content.Headers.ContentType = MediaTypeHeaderValue.Parse(new string(contentType));
+                msg.Content = content;
+            }
+
+            for (int i = 0; i < headers.Length; i++)
+            {
+                if (headers[i].Name.Length <= 0) continue;
+                string k = headers[i].Name.ToString();
+                string v = headers[i].Value.ToString();
+                if (!msg.Headers.TryAddWithoutValidation(k, v) && msg.Content != null)
+                    msg.Content.Headers.TryAddWithoutValidation(k, v);
+            }
+
+            cts = new CancellationTokenSource();
+        }
+        catch (Exception ex)
+        {
+            msg?.Dispose();
+            msg = null;
+            cts?.Dispose();
+            cts = null;
+            buildError = ex.Message;
+        }
+
+        int slotIdx = -1;
+        uint gen = 0;
+        bool inactive = false;
+        bool poolFull = false;
+        HttpRequestHandle handle = HttpRequestHandle.Invalid;
 
         AcquireSpinLock(ref state->SlotLock.Value);
         try
         {
             ManagedHttpGuard? guard = (uint)state->PoolSlot < MaxInstances ? s_pools[state->PoolSlot].Guard : null;
             if (Volatile.Read(ref state->Active) == 0 || guard == null || guard.Stopped || guard.Client == null || guard.Requests == null)
-                return HttpRequestHandle.Invalid;
-
-            for (int i = 0; i < state->MaxConcurrent; i++)
             {
-                if (state->Slots[i].State == 0)
-                {
-                    state->Slots[i].State = 1;
-                    gen = state->Slots[i].Generation;
-                    slotIdx = i;
-                    break;
-                }
+                inactive = true;
             }
-
-            if (slotIdx < 0)
+            else
             {
-                LogSystem.Warn(state->Log, $"HttpSystem slot pool exhausted (maxConcurrent={state->MaxConcurrent})");
-                return HttpRequestHandle.Invalid;
-            }
-
-            handle = HttpRequestHandle.Create((uint)slotIdx, gen);
-            HttpRequestMessage? msg = null;
-            int bodyByteLen = 0;
-            try
-            {
-                var uri = new Uri(new string(url), UriKind.Absolute);
-                msg = new HttpRequestMessage(ToHttpMethod(method), uri);
-
-                if (!body.IsEmpty)
+                for (int i = 0; i < state->MaxConcurrent; i++)
                 {
-                    byte[] copy = body.ToArray();
-                    bodyByteLen = copy.Length;
-                    var content = new ByteArrayContent(copy);
-                    if (!contentType.IsEmpty)
-                        content.Headers.ContentType = MediaTypeHeaderValue.Parse(new string(contentType));
-                    msg.Content = content;
+                    if (state->Slots[i].State == 0)
+                    {
+                        state->Slots[i].State = buildError != null ? 2 : 1;
+                        gen = state->Slots[i].Generation;
+                        slotIdx = i;
+                        break;
+                    }
                 }
 
-                for (int i = 0; i < headers.Length; i++)
+                if (slotIdx < 0)
                 {
-                    if (headers[i].Name.Length <= 0) continue;
-                    string k = headers[i].Name.ToString();
-                    string v = headers[i].Value.ToString();
-                    if (!msg.Headers.TryAddWithoutValidation(k, v) && msg.Content != null)
-                        msg.Content.Headers.TryAddWithoutValidation(k, v);
+                    poolFull = true;
+                }
+                else
+                {
+                    handle = HttpRequestHandle.Create((uint)slotIdx, gen);
+                    if (buildError != null)
+                    {
+                        Interlocked.Increment(ref state->TotalRequestsSent.Value);
+                        Interlocked.Increment(ref state->TotalResponsesCompleted.Value);
+                        var fail = new HttpResponse
+                        {
+                            Handle = handle,
+                            UserTag = userTag,
+                            Status = HttpRequestStatus.Failed,
+                            Error = FixedString256.From(buildError),
+                        };
+                        EnqueueCompleted(state, slotIdx, in fail);
+                    }
+                    else
+                    {
+                        if (bodyByteLen > 0)
+                            Interlocked.Add(ref state->TotalBytesSent.Value, bodyByteLen);
+
+                        ManagedRequestSlot[] reqs = guard.Requests;
+                        reqs[slotIdx].Cts = cts;
+
+                        Interlocked.Increment(ref state->PendingCount.Value);
+                        Interlocked.Increment(ref state->TotalRequestsSent.Value);
+                        Interlocked.Increment(ref guard.ActiveWorkers);
+
+                        nint statePtr = (nint)state;
+                        HttpClient client = guard.Client;
+                        HttpRequestMessage localMsg = msg!;
+                        CancellationTokenSource localCts = cts!;
+                        ManagedHttpGuard localGuard = guard;
+                        int capturedSlot = slotIdx;
+                        HttpRequestHandle capturedHandle = handle;
+                        reqs[slotIdx].InFlightTask = Task.Run(() => HttpAsyncWorker.ExecuteRequestAsync(
+                            statePtr, localGuard, client, localMsg, localCts, capturedSlot, capturedHandle, userTag, effTimeout, maxResponseBytes));
+                    }
                 }
             }
-            catch (Exception ex)
-            {
-                msg?.Dispose();
-                Interlocked.Increment(ref state->TotalRequestsSent.Value);
-                Interlocked.Increment(ref state->TotalResponsesCompleted.Value);
-                LogSystem.Warn(state->Log, $"HTTP {handle} request build failed: {ex.Message}");
-                var fail = new HttpResponse
-                {
-                    Handle = handle,
-                    UserTag = userTag,
-                    Status = HttpRequestStatus.Failed,
-                    Error = FixedString256.From(ex.Message),
-                };
-                EnqueueCompleted(state, slotIdx, in fail);
-                return handle;
-            }
-
-            if (bodyByteLen > 0)
-                Interlocked.Add(ref state->TotalBytesSent.Value, bodyByteLen);
-
-            var cts = new CancellationTokenSource();
-            ManagedRequestSlot[] reqs = guard.Requests;
-            reqs[slotIdx].Cts = cts;
-
-            Interlocked.Increment(ref state->PendingCount.Value);
-            Interlocked.Increment(ref state->TotalRequestsSent.Value);
-            Interlocked.Increment(ref guard.ActiveWorkers);
-
-            nint statePtr = (nint)state;
-            HttpClient client = guard.Client;
-            reqs[slotIdx].InFlightTask = Task.Run(() => HttpAsyncWorker.ExecuteRequestAsync(
-                statePtr, guard, client, msg, cts, slotIdx, handle, userTag, effTimeout, maxResponseBytes));
-
-            return handle;
         }
         finally
         {
             ReleaseSpinLock(ref state->SlotLock.Value);
         }
+
+        if (inactive)
+        {
+            msg?.Dispose();
+            cts?.Dispose();
+            return HttpRequestHandle.Invalid;
+        }
+        if (poolFull)
+        {
+            msg?.Dispose();
+            cts?.Dispose();
+            LogSystem.Warn(state->Log, $"HttpSystem slot pool exhausted (maxConcurrent={state->MaxConcurrent})");
+            return HttpRequestHandle.Invalid;
+        }
+        if (buildError != null)
+        {
+            LogSystem.Warn(state->Log, $"HTTP {handle} request build failed: {buildError}");
+            return handle;
+        }
+
+        return handle;
     }
 
     /// <summary>
@@ -448,19 +496,23 @@ public static unsafe class HttpSystem
         uint idx = handle.Index;
         if (idx >= (uint)state->MaxConcurrent) return;
 
+        CancellationTokenSource? ctsToCancel = null;
         AcquireSpinLock(ref state->SlotLock.Value);
         try
         {
             if (Volatile.Read(ref state->Active) == 0) return;
             if (state->Slots[idx].Generation != handle.Generation || state->Slots[idx].State != 1) return;
             ManagedHttpGuard? guard = (uint)state->PoolSlot < MaxInstances ? s_pools[state->PoolSlot].Guard : null;
-            CancellationTokenSource? cts = guard?.Requests?[idx].Cts;
-            try { cts?.Cancel(); } catch (ObjectDisposedException) { }
+            ManagedRequestSlot[]? reqs = guard?.Requests;
+            if (reqs != null && idx < (uint)reqs.Length)
+                ctsToCancel = reqs[idx].Cts;
         }
         finally
         {
             ReleaseSpinLock(ref state->SlotLock.Value);
         }
+
+        try { ctsToCancel?.Cancel(); } catch (ObjectDisposedException) { }
     }
 
     /// <summary>
@@ -469,7 +521,7 @@ public static unsafe class HttpSystem
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsPending(HttpClientState* state, HttpRequestHandle handle)
     {
-        if (state == null || !handle.IsValid) return false;
+        if (state == null || Volatile.Read(ref state->Active) == 0 || !handle.IsValid) return false;
         uint idx = handle.Index;
         if (idx >= (uint)state->MaxConcurrent) return false;
         if (Volatile.Read(ref state->Slots[idx].Generation) != handle.Generation) return false;
@@ -482,7 +534,7 @@ public static unsafe class HttpSystem
     /// </summary>
     public static bool PollCompleted(HttpClientState* state, out HttpResponse response)
     {
-        if (state == null)
+        if (state == null || Volatile.Read(ref state->Active) == 0)
         {
             response = default;
             return false;
@@ -496,17 +548,20 @@ public static unsafe class HttpSystem
         {
             CancellationTokenSource? ctsToDispose = null;
             AcquireSpinLock(ref state->SlotLock.Value);
-            ManagedHttpGuard? guard = (uint)state->PoolSlot < MaxInstances ? s_pools[state->PoolSlot].Guard : null;
-            ManagedRequestSlot[]? reqs = guard?.Requests;
-            if (reqs != null)
+            if (Volatile.Read(ref state->Active) != 0)
             {
-                ctsToDispose = reqs[idx].Cts;
-                reqs[idx] = default;
+                ManagedHttpGuard? guard = (uint)state->PoolSlot < MaxInstances ? s_pools[state->PoolSlot].Guard : null;
+                ManagedRequestSlot[]? reqs = guard?.Requests;
+                if (reqs != null)
+                {
+                    ctsToDispose = reqs[idx].Cts;
+                    reqs[idx] = default;
+                    uint nextGen = (state->Slots[idx].Generation + 1) & HandlePacking.GenerationMask;
+                    if (nextGen == 0) nextGen = 1;
+                    Volatile.Write(ref state->Slots[idx].Generation, nextGen);
+                    Volatile.Write(ref state->Slots[idx].State, 0);
+                }
             }
-            uint nextGen = (state->Slots[idx].Generation + 1) & HandlePacking.GenerationMask;
-            if (nextGen == 0) nextGen = 1;
-            Volatile.Write(ref state->Slots[idx].Generation, nextGen);
-            Volatile.Write(ref state->Slots[idx].State, 0);
             ReleaseSpinLock(ref state->SlotLock.Value);
 
             ctsToDispose?.Dispose();
@@ -717,6 +772,8 @@ file static class HttpAsyncWorker
         }
         catch (OperationCanceledException)
         {
+            FreeNative(ref bodyPtr, ref bodyCap);
+            bodyLen = 0;
             if (timeoutCts.IsCancellationRequested)
             {
                 status = HttpRequestStatus.TimedOut;

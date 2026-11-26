@@ -23,6 +23,7 @@ public static unsafe class AudioTests
         Assert.Run("AudioSystem_VoiceControls_Resampling_NaNSafety_GenWrap_AndErrors", &TestAudioVoiceBusResampleAndSafety);
         Assert.Run("AudioSystem_StartFailureCleanup_DefaultConfig_AndDecodedOwnership", &TestAudioStartConfigAndOwnership);
         Assert.Run("AudioSystem_ConcurrencyStress_ZeroCrashAndZeroLeak", &TestAudioConcurrencyStress);
+        Assert.Run("AudioSystem_HighContentionPausePlayMix_MixClamp_DecodedGuard_AndWavHardening", &TestAudioAndWavRegressionFixes);
         Assert.Run("AudioSystem_HotPlaybackAndMixLoop_ZeroGc", &TestAudioHotLoopZeroGc);
     }
 
@@ -796,6 +797,169 @@ public static unsafe class AudioTests
 
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after Audio concurrency stress");
         Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after Audio concurrency stress");
+    }
+
+    private static void TestAudioAndWavRegressionFixes()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+
+        try
+        {
+            // 1. AUDIONET-09: MixBufferFrames clamping [64, 65536] & RenderMixFrames overflow guard
+            var hugeCfg = AudioConfig.Headless;
+            hugeCfg.MixBufferFrames = int.MaxValue;
+            AudioState* hugeAudio = AudioSystem.Start(ref alloc.Persistent, in hugeCfg);
+            try
+            {
+                Assert.Equal(65536, hugeAudio->MixBufferFrames, "MixBufferFrames clamped to 65536 upper bound");
+                Assert.Equal((nuint)(65536 * 2 * sizeof(float)), hugeAudio->MixScratchBytes, "MixScratchBytes matches clamped frames");
+
+                float* dummy = stackalloc float[4];
+                dummy[0] = 0.75f;
+                // frameCount * outCh overflows int.MaxValue -> must return safely without clearing or throwing
+                AudioSystem.RenderMixFrames(hugeAudio, dummy, int.MaxValue);
+                Assert.Near(0.75f, dummy[0], 1e-6f, "RenderMixFrames overflow guard returned early safely");
+            }
+            finally
+            {
+                AudioSystem.Stop(hugeAudio);
+            }
+
+            var tinyCfg = AudioConfig.Headless;
+            tinyCfg.MixBufferFrames = 1;
+            AudioState* tinyAudio = AudioSystem.Start(ref alloc.Persistent, in tinyCfg);
+            try
+            {
+                Assert.Equal(64, tinyAudio->MixBufferFrames, "Small positive MixBufferFrames clamped to 64");
+            }
+            finally
+            {
+                AudioSystem.Stop(tinyAudio);
+            }
+
+            // 2. AUDIONET-10: CreateClipFromDecoded undersized AllocBytes & zero AllocBytes guards
+            AudioState* decAudio = AudioSystem.Start(ref alloc.Persistent, AudioConfig.Headless);
+            try
+            {
+                long bytesBefore = NativeMemoryTracker.LiveBytes;
+                long blocksBefore = NativeMemoryTracker.LiveBlocks;
+
+                // Undersized real allocation (16 bytes allocated, but claims 100 mono frames = 400 bytes)
+                nuint smallBytes = 16;
+                float* smallPtr = (float*)NativeMemoryTracker.AlignedAlloc(smallBytes, 64);
+                var undersized = new DecodedPcmData
+                {
+                    Samples = smallPtr,
+                    AllocBytes = smallBytes,
+                    FrameCount = 100,
+                    Channels = 1,
+                    SampleRate = 48000,
+                };
+                AudioClipHandle badClip1 = AudioSystem.CreateClipFromDecoded(decAudio, ref undersized, StringId.Hash("undersized"));
+                Assert.True(!badClip1.IsValid && undersized.Samples == null, "Undersized AllocBytes rejected, freed, and cleared");
+                Assert.Equal(bytesBefore, NativeMemoryTracker.LiveBytes, "LiveBytes uncorrupted after undersized AllocBytes rejection");
+                Assert.Equal(blocksBefore, NativeMemoryTracker.LiveBlocks, "LiveBlocks uncorrupted after undersized AllocBytes rejection");
+
+                // AllocBytes == 0 with non-null pointer -> rejected without calling AlignedFree(..., 0)
+                float* stackPcm = stackalloc float[16];
+                var zeroAlloc = new DecodedPcmData
+                {
+                    Samples = stackPcm,
+                    AllocBytes = 0,
+                    FrameCount = 16,
+                    Channels = 1,
+                    SampleRate = 48000,
+                };
+                AudioClipHandle badClip2 = AudioSystem.CreateClipFromDecoded(decAudio, ref zeroAlloc, StringId.Hash("zero_alloc"));
+                Assert.True(!badClip2.IsValid && zeroAlloc.Samples == null, "Zero AllocBytes rejected safely");
+                Assert.Equal(bytesBefore, NativeMemoryTracker.LiveBytes, "LiveBytes uncorrupted after zero AllocBytes rejection");
+                Assert.Equal(blocksBefore, NativeMemoryTracker.LiveBlocks, "LiveBlocks uncorrupted after zero AllocBytes rejection");
+            }
+            finally
+            {
+                AudioSystem.Stop(decAudio);
+            }
+
+            // 3. AUDIONET-08: High-contention SetPaused + PlayOneShot + RenderMixFrames concurrency stress
+            AudioState* stressAudio = AudioSystem.Start(ref alloc.Persistent, AudioConfig.Headless);
+            try
+            {
+                float* dc = stackalloc float[128];
+                for (int i = 0; i < 128; i++) dc[i] = 0.3f;
+                AudioClipHandle clip = AudioSystem.CreateClipFromPcm(stressAudio, dc, 128, 1, 48000, StringId.Hash("stress"));
+                Assert.True(clip.IsValid, "Created stress clip");
+
+                using var cts = new CancellationTokenSource();
+                CancellationToken ct = cts.Token;
+
+                Task tMix = Task.Run(() =>
+                {
+                    float* buf = (float*)NativeMemoryTracker.AlignedAlloc(128 * 2 * sizeof(float), 64);
+                    try
+                    {
+                        while (!ct.IsCancellationRequested)
+                            AudioSystem.RenderMixFrames(stressAudio, buf, 128);
+                    }
+                    finally
+                    {
+                        NativeMemoryTracker.AlignedFree(buf, 128 * 2 * sizeof(float));
+                    }
+                });
+
+                Task tPause = Task.Run(() =>
+                {
+                    for (int i = 0; i < 500; i++)
+                        AudioSystem.SetPaused(stressAudio, (i & 1) == 0);
+                });
+
+                Task tPlay = Task.Run(() =>
+                {
+                    for (int i = 0; i < 500; i++)
+                        _ = AudioSystem.PlayOneShot(stressAudio, clip, 0.5f);
+                });
+
+                Task.WaitAll(tPause, tPlay);
+                cts.Cancel();
+                tMix.Wait();
+            }
+            finally
+            {
+                AudioSystem.Stop(stressAudio);
+            }
+
+            // 4. AUDIONET-12: WavDecoder quad downmix, GenerateSineWave(440f, 1e30f), high-sample-rate EncodeWav16
+            byte[] quadData = new byte[16]; // 1 frame x 4ch x 4 bytes float: FL=0.4, FR=-0.4, RL=0.2, RR=-0.2
+            BinaryPrimitives.WriteInt32LittleEndian(quadData.AsSpan(0, 4), BitConverter.SingleToInt32Bits(0.4f));
+            BinaryPrimitives.WriteInt32LittleEndian(quadData.AsSpan(4, 4), BitConverter.SingleToInt32Bits(-0.4f));
+            BinaryPrimitives.WriteInt32LittleEndian(quadData.AsSpan(8, 4), BitConverter.SingleToInt32Bits(0.2f));
+            BinaryPrimitives.WriteInt32LittleEndian(quadData.AsSpan(12, 4), BitConverter.SingleToInt32Bits(-0.2f));
+            byte[] wav4ch = BuildWavWithChunks(channels: 4, sampleRate: 48000, formatTag: 3, bitsPerSample: 32, dataBytes: quadData);
+            Assert.True(WavDecoder.TryDecode(wav4ch, out DecodedPcmData dec4ch), "Decoded 4ch quad WAV");
+            Assert.Equal(2, dec4ch.Channels, "4ch quad downmixed to stereo");
+            Assert.Near(0.4f + 0.2f * 0.70710678f, dec4ch.Samples[0], 1e-3f, "4ch quad downmix L = FL + 0.707*RL");
+            Assert.Near(-0.4f + (-0.2f) * 0.70710678f, dec4ch.Samples[1], 1e-3f, "4ch quad downmix R = FR + 0.707*RR");
+            WavDecoder.Free(ref dec4ch);
+
+            DecodedPcmData hugeSine = WavDecoder.GenerateSineWave(440f, 1e30f);
+            Assert.True(hugeSine.Samples != null && hugeSine.FrameCount > 1, "GenerateSineWave(440f, 1e30f) clamped safely without negative overflow");
+            Assert.True(float.IsFinite(hugeSine.Samples[0]) && float.IsFinite(hugeSine.Samples[hugeSine.FrameCount - 1]), "Clamped sine samples finite");
+            WavDecoder.Free(ref hugeSine);
+
+            float* hiSamples = stackalloc float[8];
+            for (int i = 0; i < 8; i++) hiSamples[i] = 0.25f;
+            byte[] hiRateWav = WavDecoder.EncodeWav16(hiSamples, 4, 2, int.MaxValue);
+            Assert.Equal(44 + 16, hiRateWav.Length, "High-sample-rate EncodeWav16 produced valid buffer");
+            uint encodedByteRate = BinaryPrimitives.ReadUInt32LittleEndian(hiRateWav.AsSpan(28, 4));
+            Assert.Equal(uint.MaxValue, encodedByteRate, "High-sample-rate EncodeWav16 clamped uint byteRate without signed overflow");
+        }
+        finally
+        {
+            alloc.Dispose();
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after Audio & WavDecoder regression tests");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after Audio & WavDecoder regression tests");
     }
 
     private static byte[] BuildCustomPcmWav(ushort channels, int sampleRate, ushort bitsPerSample, byte[] dataBytes)

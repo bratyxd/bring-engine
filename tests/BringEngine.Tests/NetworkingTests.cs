@@ -25,10 +25,13 @@ public static class NetworkingTests
         Assert.Run("NetSerialization_EdgeCasesOverflowVarintAndCrc32", &TestNetSerializationEdgeCases);
         Assert.Run("NetTransport_Loopback_DeterministicLatencyLossOrderedAndZeroGc", &TestLoopbackTransport);
         Assert.Run("NetTransport_LoopbackEdgeCases_SequencedMixed_Saturation_DisconnectDrain", &TestLoopbackTransportEdgeCases);
+        Assert.Run("NetTransport_LoopbackRegression_NullPayload_PerChannel_Stats_AndInitOverflow", &TestLoopbackTransportRegressions);
         Assert.Run("HttpSystem_LoopbackGetPostHeadersCancelTimeoutAndZeroGcPoll", &TestHttpSystem);
         Assert.Run("HttpSystem_EdgeCases_SlotExhaustion_MaxBytes_Methods_Headers_AndStop", &TestHttpSystemEdgeCases);
+        Assert.Run("HttpSystem_Regression_StopReset_CancelNoLeak_AndConcurrentLargePostZeroGcPoll", &TestHttpSystemRegressions);
         Assert.Run("WebSocketSystem_LoopbackTextBinaryFragmentedCloseAndZeroGcHotLoop", &TestWebSocketSystem);
         Assert.Run("WebSocketSystem_EdgeCases_Timeouts_CloseDuringSend_QueueOverflow_AndStop", &TestWebSocketSystemEdgeCases);
+        Assert.Run("WebSocketSystem_Regression_Concurrency_SlotReuse_CloseRace_AndRfc6455", &TestWebSocketSystemRegressions);
     }
 
     // =========================================================================
@@ -1272,7 +1275,14 @@ public static class NetworkingTests
 
             // 3. Slot exhaustion (maxConnections == 2) + recovery
             WebSocketHandle c1 = WebSocketSystem.Connect(ws, $"{baseWsUrl}/echo");
-            WebSocketHandle c2 = WebSocketSystem.Connect(ws, $"{baseWsUrl}/echo");
+            WebSocketHandle c2 = WebSocketHandle.Invalid;
+            Stopwatch reclaimSw = Stopwatch.StartNew();
+            while (!c2.IsValid && reclaimSw.ElapsedMilliseconds < 200)
+            {
+                c2 = WebSocketSystem.Connect(ws, $"{baseWsUrl}/echo");
+                if (!c2.IsValid) Thread.Sleep(1);
+            }
+            Assert.True(c1.IsValid && c2.IsValid, "Both slots acquired after timeout slot reclaimed");
             WebSocketHandle cOver = WebSocketSystem.Connect(ws, $"{baseWsUrl}/echo");
             Assert.True(!cOver.IsValid, "3rd concurrent connection rejected when maxConnections==2");
 
@@ -1332,7 +1342,8 @@ public static class NetworkingTests
 
             // 6. MaxMessageBytes overrun (> 1024 bytes from server) -> Error event with 0 leaks
             WebSocketHandle cOverrun = WebSocketSystem.Connect(ws, $"{baseWsUrl}/bigmsg");
-            Assert.Equal((byte)WebSocketStateKind.Disconnected, (byte)WebSocketSystem.GetState(ws, c1), "Stale handle GetState == Disconnected after slot reuse");
+            WebSocketHandle reusedOld = cOverrun.Index == c1.Index ? c1 : c2;
+            Assert.Equal((byte)WebSocketStateKind.Disconnected, (byte)WebSocketSystem.GetState(ws, reusedOld), "Stale handle GetState == Disconnected after slot reuse");
             WebSocketEvent evConnOver = WaitWsEvent(ws, cOverrun);
             Assert.Equal((byte)WebSocketEventKind.Connected, (byte)evConnOver.Kind, "cOverrun connected");
             WebSocketSystem.ReleaseEvent(ref evConnOver);
@@ -1495,6 +1506,505 @@ public static class NetworkingTests
                                 Encoding.UTF8.GetString(buf, 0, 10) == "CLOSE_SOON")
                             {
                                 await srvWs.CloseAsync(WebSocketCloseStatus.NormalClosure, "srv-close", ct).ConfigureAwait(false);
+                                break;
+                            }
+                            await srvWs.SendAsync(new ReadOnlyMemory<byte>(buf, 0, res.Count), res.MessageType, res.EndOfMessage, ct).ConfigureAwait(false);
+                        }
+                    }
+                    catch { }
+                }
+            }, ct);
+        }
+    }
+
+    // =========================================================================
+    // 9. WP-B4 Regression Tests (AUDIONET-01..07, 11, 12)
+    // =========================================================================
+
+    private static unsafe void TestLoopbackTransportRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+
+        try
+        {
+            // 1. AUDIONET-06: Huge Init throws ArgumentOutOfRangeException (overflow guard)
+            LoopbackLink* badLink = alloc.Persistent.Alloc<LoopbackLink>(1, 64);
+            var cfg = new LoopbackSimConfig { OneWayLatencyTicks = 0, JitterTicks = 0, PacketLossPermille = 0, RngSeed = 123 };
+            bool threwOverflow = false;
+            try
+            {
+                LoopbackTransportSystem.Init(badLink, ref alloc.Persistent, in cfg, queueCapacity: 1_000_000, maxPacketBytes: 4096);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                threwOverflow = true;
+            }
+            Assert.True(threwOverflow, "Huge queueCapacity * maxPacketBytes throws ArgumentOutOfRangeException");
+
+            LoopbackLink* link = alloc.Persistent.Alloc<LoopbackLink>(1, 64);
+            LoopbackTransportSystem.Init(link, ref alloc.Persistent, in cfg, queueCapacity: 8, maxPacketBytes: 64);
+            NetTransportVTable a = LoopbackTransportSystem.GetVTable(&link->PeerA);
+            NetTransportVTable b = LoopbackTransportSystem.GetVTable(&link->PeerB);
+            Assert.True(a.TryPoll(out _) && b.TryPoll(out _), "Polled initial connects");
+
+            // 2. Null payload with length > 0 rejected & delivers nothing without bumping stats
+            bool nullSent = a.Send(a.Context, 1, null, 16, NetDeliveryMode.ReliableOrdered, 0);
+            Assert.True(!nullSent, "Null payload with length > 0 returns false");
+            Assert.True(!b.TryPoll(out _), "Null payload delivers nothing");
+            Assert.Equal(0L, a.QueryStats().PacketsSent, "Null payload did not increment PacketsSent");
+            Assert.Equal(0L, a.QueryStats().BytesSent, "Null payload did not increment BytesSent");
+
+            // 3. Per-channel UnreliableSequenced independence (delayed ch0 + immediate ch1 -> both arrive)
+            byte* pkt = stackalloc byte[4];
+            link->Config.OneWayLatencyTicks = 3;
+            pkt[0] = 0xA0;
+            Assert.True(a.TrySend(1, new ReadOnlySpan<byte>(pkt, 1), NetDeliveryMode.UnreliableSequenced, channel: 0), "Send delayed US on ch0");
+            link->Config.OneWayLatencyTicks = 0;
+            pkt[0] = 0xB1;
+            Assert.True(a.TrySend(1, new ReadOnlySpan<byte>(pkt, 1), NetDeliveryMode.UnreliableSequenced, channel: 1), "Send immediate US on ch1");
+
+            Assert.True(b.TryPoll(out NetTransportEvent evCh1) && evCh1.Channel == 1 && evCh1.AsPayloadSpan()[0] == 0xB1, "Immediate ch1 US arrived");
+            for (int t = 0; t < 3; t++) LoopbackTransportSystem.AdvanceTick(link);
+            Assert.True(b.TryPoll(out NetTransportEvent evCh0) && evCh0.Channel == 0 && evCh0.AsPayloadSpan()[0] == 0xA0, "Delayed ch0 US arrived without being dropped by ch1");
+
+            // 4. Queue-full rejection does NOT bump PacketsSent / BytesSent
+            for (int i = 0; i < 8; i++)
+                Assert.True(a.TrySend(1, new ReadOnlySpan<byte>(pkt, 4), NetDeliveryMode.ReliableOrdered), $"Fill queue slot {i}");
+
+            NetTransportStats statsBeforeFull = a.QueryStats();
+            Assert.True(!a.TrySend(1, new ReadOnlySpan<byte>(pkt, 4), NetDeliveryMode.ReliableOrdered), "Full queue TrySend returns false");
+            NetTransportStats statsAfterFull = a.QueryStats();
+            Assert.Equal(statsBeforeFull.PacketsSent, statsAfterFull.PacketsSent, "Queue-full send did not bump PacketsSent");
+            Assert.Equal(statsBeforeFull.BytesSent, statsAfterFull.BytesSent, "Queue-full send did not bump BytesSent");
+        }
+        finally
+        {
+            alloc.Dispose();
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after LoopbackTransport regression tests");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after LoopbackTransport regression tests");
+    }
+
+    private static unsafe void TestHttpSystemRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        string logDir = Path.Combine(Path.GetTempPath(), "BringHttpRegLog_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(logDir);
+
+        // Small-ring LogSystem to verify HttpSystem.Send never holds SlotLock across LogSystem.Warn (AUDIONET-05)
+        LogState* log = alloc.Persistent.Alloc<LogState>(1, 64);
+        LogSystem.Start(log, ref alloc.Persistent, appName: "BringHttpReg", directoryOverride: logDir, queueCapacity: 64, hookExceptions: false);
+
+        using var serverCts = new CancellationTokenSource();
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        Task serverTask = Task.Run(() => RunRegressionHttpServerAsync(listener, serverCts.Token));
+
+        HttpClientState* http = alloc.Persistent.Alloc<HttpClientState>(1, 64);
+        HttpSystem.Start(http, ref alloc.Persistent, maxConcurrent: 16, defaultTimeoutMs: 5000, log: log);
+
+        try
+        {
+            string baseUrl = $"http://127.0.0.1:{port}";
+
+            // 1. AUDIONET-11: Cancelled & timed-out mid-body HTTP requests always free native BodyPtr
+            HttpRequestHandle hTimeoutBody = HttpSystem.Get(http, $"{baseUrl}/slow-body", timeoutMs: 120);
+            HttpResponse rTimeoutBody = WaitHttpResponse(http, hTimeoutBody);
+            try
+            {
+                Assert.Equal((byte)HttpRequestStatus.TimedOut, (byte)rTimeoutBody.Status, "Slow-body request timed out");
+                Assert.True(rTimeoutBody.BodyPtr == null && rTimeoutBody.BodyLength == 0 && rTimeoutBody.BodyAllocSize == 0,
+                    "Timed-out HttpResponse has null BodyPtr and 0 lengths (AUDIONET-11)");
+            }
+            finally
+            {
+                HttpSystem.ReleaseResponse(ref rTimeoutBody);
+            }
+
+            HttpRequestHandle hCancelBody = HttpSystem.Get(http, $"{baseUrl}/slow-body", timeoutMs: 5000);
+            Thread.Sleep(40); // Allow headers + initial chunk to allocate native body buffer
+            HttpSystem.Cancel(http, hCancelBody);
+            HttpResponse rCancelBody = WaitHttpResponse(http, hCancelBody);
+            try
+            {
+                Assert.Equal((byte)HttpRequestStatus.Cancelled, (byte)rCancelBody.Status, "Slow-body request cancelled");
+                Assert.True(rCancelBody.BodyPtr == null && rCancelBody.BodyLength == 0 && rCancelBody.BodyAllocSize == 0,
+                    "Cancelled HttpResponse has null BodyPtr and 0 lengths (AUDIONET-11)");
+            }
+            finally
+            {
+                HttpSystem.ReleaseResponse(ref rCancelBody);
+            }
+
+            // 2. AUDIONET-05: Multi-threaded large-body PostJson + 0-GC PollCompleted + small-ring LogSystem
+            byte[] largePayload = new byte[32768];
+            Array.Fill(largePayload, (byte)'J');
+            int totalDispatched = 0;
+
+            // Warmup PollCompleted & ReleaseResponse before measuring 0 GC
+            HttpResponse warmResp = default;
+            _ = HttpSystem.PollCompleted(http, out warmResp);
+            HttpSystem.ReleaseResponse(ref warmResp);
+
+            Task tSend1 = Task.Run(() =>
+            {
+                for (int i = 0; i < 8; i++)
+                {
+                    HttpRequestHandle h = HttpSystem.PostJson(http, $"{baseUrl}/ok", largePayload);
+                    if (h.IsValid) Interlocked.Increment(ref totalDispatched);
+                    HttpRequestHandle hb = HttpSystem.Get(http, "://bad url");
+                    if (hb.IsValid) Interlocked.Increment(ref totalDispatched);
+                }
+            });
+            Task tSend2 = Task.Run(() =>
+            {
+                for (int i = 0; i < 8; i++)
+                {
+                    HttpRequestHandle h = HttpSystem.PostJson(http, $"{baseUrl}/ok", largePayload);
+                    if (h.IsValid) Interlocked.Increment(ref totalDispatched);
+                }
+            });
+
+            int polled = 0;
+            long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * 10;
+            long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+            while ((!tSend1.IsCompleted || !tSend2.IsCompleted || polled < Volatile.Read(ref totalDispatched)) &&
+                   Stopwatch.GetTimestamp() < deadline)
+            {
+                if (HttpSystem.PollCompleted(http, out HttpResponse resp))
+                {
+                    polled++;
+                    HttpSystem.ReleaseResponse(ref resp);
+                }
+                else
+                {
+                    Thread.Sleep(1);
+                }
+            }
+            long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+            Task.WaitAll(tSend1, tSend2);
+            Assert.Equal(Volatile.Read(ref totalDispatched), polled, "All multi-threaded large-body requests polled");
+            Assert.Equal(0L, gcAfter - gcBefore, "Polling thread allocates 0 GC bytes during concurrent large PostJson (AUDIONET-05)");
+
+            // 3. AUDIONET-03: Stop() with in-flight requests resets IsPending == false and PendingCount == 0
+            HttpRequestHandle hInFlight = HttpSystem.Get(http, $"{baseUrl}/slow-body", timeoutMs: 5000);
+            Assert.True(hInFlight.IsValid, "In-flight request handle valid before Stop");
+            HttpSystem.Stop(http);
+            Assert.True(!HttpSystem.IsPending(http, hInFlight), "Post-Stop IsPending == false (AUDIONET-03)");
+            Assert.Equal(0, Volatile.Read(ref http->PendingCount.Value), "Post-Stop PendingCount == 0 (AUDIONET-03)");
+            Assert.True(!HttpSystem.PollCompleted(http, out _), "Post-Stop PollCompleted returns false");
+        }
+        finally
+        {
+            HttpSystem.Stop(http);
+            serverCts.Cancel();
+            listener.Stop();
+            try { serverTask.Wait(TimeSpan.FromSeconds(3)); } catch { }
+            LogSystem.Stop(log);
+            alloc.Dispose();
+            try { Directory.Delete(logDir, true); } catch { }
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after HttpSystem regression tests");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after HttpSystem regression tests");
+    }
+
+    private static async Task RunRegressionHttpServerAsync(TcpListener listener, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            TcpClient client;
+            try { client = await listener.AcceptTcpClientAsync(ct).ConfigureAwait(false); }
+            catch { break; }
+
+            _ = Task.Run(async () =>
+            {
+                using (client)
+                using (NetworkStream stream = client.GetStream())
+                {
+                    try
+                    {
+                        string headersText = await ReadHttpHeadersAsync(stream, ct).ConfigureAwait(false);
+                        if (string.IsNullOrEmpty(headersText)) return;
+                        string[] lines = headersText.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
+                        string[] reqParts = lines[0].Split(' ');
+                        string path = reqParts.Length > 1 ? reqParts[1] : "/";
+
+                        int contentLength = 0;
+                        for (int i = 1; i < lines.Length; i++)
+                        {
+                            int colon = lines[i].IndexOf(':');
+                            if (colon > 0 && lines[i].Substring(0, colon).Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                                int.TryParse(lines[i].Substring(colon + 1).Trim(), out contentLength);
+                        }
+                        if (contentLength > 0)
+                        {
+                            byte[] sink = new byte[Math.Min(contentLength, 65536)];
+                            int rem = contentLength;
+                            while (rem > 0)
+                            {
+                                int n = await stream.ReadAsync(sink.AsMemory(0, Math.Min(rem, sink.Length)), ct).ConfigureAwait(false);
+                                if (n <= 0) break;
+                                rem -= n;
+                            }
+                        }
+
+                        if (path == "/slow-body")
+                        {
+                            // Send headers + partial body immediately so client allocates native buffer, then stall
+                            string hdr = "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n";
+                            await stream.WriteAsync(Encoding.ASCII.GetBytes(hdr), ct).ConfigureAwait(false);
+                            await stream.WriteAsync(new byte[1024], ct).ConfigureAwait(false);
+                            await stream.FlushAsync(ct).ConfigureAwait(false);
+                            await Task.Delay(3000, ct).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await WriteHttpResponseAsync(stream, 200, "OK", "ok"u8.ToArray(), ct).ConfigureAwait(false);
+                        }
+                    }
+                    catch { }
+                }
+            }, ct);
+        }
+    }
+
+    private static unsafe void TestWebSocketSystemRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+
+        using var serverCts = new CancellationTokenSource();
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        Task serverTask = Task.Run(() => RunRegressionWsServerAsync(listener, serverCts.Token));
+
+        string baseWsUrl = $"ws://127.0.0.1:{port}";
+
+        try
+        {
+            // 1. AUDIONET-07: Close(closeStatus: 0) normalizes to 1000 & server close with queued sends finishes cleanly
+            WebSocketClientState* ws1 = alloc.Persistent.Alloc<WebSocketClientState>(1, 64);
+            WebSocketSystem.Start(ws1, ref alloc.Persistent, maxConnections: 2, eventQueueCapacity: 64, outboundQueueCapacity: 64);
+            try
+            {
+                WebSocketHandle hZero = WebSocketSystem.Connect(ws1, $"{baseWsUrl}/echo");
+                WebSocketEvent evC = WaitWsEvent(ws1, hZero);
+                Assert.Equal((byte)WebSocketEventKind.Connected, (byte)evC.Kind, "hZero connected");
+                WebSocketSystem.ReleaseEvent(ref evC);
+
+                WebSocketSystem.Close(ws1, hZero, closeStatus: 0, reason: "zero-status");
+                WebSocketEvent evCl = WaitWsEvent(ws1, hZero);
+                Assert.Equal((byte)WebSocketEventKind.Closed, (byte)evCl.Kind, "Close(status: 0) closed cleanly (AUDIONET-07)");
+                Assert.Equal((ushort)1000, evCl.CloseStatus, "Close(status: 0) normalized to status 1000");
+                WebSocketSystem.ReleaseEvent(ref evCl);
+
+                // Server initiates Close immediately while client queues outbound sends (reciprocal close even if CloseRequested==0)
+                WebSocketHandle hSrvClose = WebSocketSystem.Connect(ws1, $"{baseWsUrl}/close-immediate");
+                WebSocketEvent evSc = WaitWsEvent(ws1, hSrvClose);
+                Assert.Equal((byte)WebSocketEventKind.Connected, (byte)evSc.Kind, "hSrvClose connected");
+                WebSocketSystem.ReleaseEvent(ref evSc);
+                for (int i = 0; i < 8; i++)
+                    _ = WebSocketSystem.SendBinary(ws1, hSrvClose, "queued-payload"u8);
+                WebSocketEvent evSrvClosed = WaitWsEventKind(ws1, hSrvClose, WebSocketEventKind.Closed);
+                Assert.Equal((byte)WebSocketEventKind.Closed, (byte)evSrvClosed.Kind, "Reciprocal close completed cleanly with queued sends (AUDIONET-07)");
+                WebSocketSystem.ReleaseEvent(ref evSrvClosed);
+            }
+            finally
+            {
+                WebSocketSystem.Stop(ws1);
+            }
+
+            // 2. AUDIONET-01 & AUDIONET-04: maxConnections=1 stale handle Close & SendBinary cannot corrupt/cancel reused slot
+            WebSocketClientState* wsSingle = alloc.Persistent.Alloc<WebSocketClientState>(1, 64);
+            WebSocketSystem.Start(wsSingle, ref alloc.Persistent, maxConnections: 1, eventQueueCapacity: 64, outboundQueueCapacity: 64);
+            try
+            {
+                WebSocketHandle hOld = WebSocketSystem.Connect(wsSingle, $"{baseWsUrl}/echo");
+                WebSocketEvent evOldC = WaitWsEvent(wsSingle, hOld);
+                Assert.Equal((byte)WebSocketEventKind.Connected, (byte)evOldC.Kind, "hOld connected");
+                WebSocketSystem.ReleaseEvent(ref evOldC);
+
+                WebSocketSystem.Close(wsSingle, hOld, 1000, "done");
+                WebSocketEvent evOldCl = WaitWsEvent(wsSingle, hOld);
+                WebSocketSystem.ReleaseEvent(ref evOldCl);
+
+                // Reclaim slot 0 as soon as worker finishes finally epilogue
+                WebSocketHandle hNew = WebSocketHandle.Invalid;
+                Stopwatch sw = Stopwatch.StartNew();
+                while (!hNew.IsValid && sw.ElapsedMilliseconds < 1000)
+                {
+                    hNew = WebSocketSystem.Connect(wsSingle, $"{baseWsUrl}/echo");
+                    if (!hNew.IsValid) Thread.Sleep(1);
+                }
+                Assert.True(hNew.IsValid && hNew.Index == hOld.Index && hNew.Generation != hOld.Generation, "Slot 0 reused with new generation");
+
+                // Stale Close during handshake MUST NOT cancel hNew (AUDIONET-04)
+                WebSocketSystem.Close(wsSingle, hOld, 1000, "stale");
+                WebSocketEvent evNewC = WaitWsEvent(wsSingle, hNew);
+                Assert.Equal((byte)WebSocketEventKind.Connected, (byte)evNewC.Kind, "Stale Close did not cancel reused handle handshake (AUDIONET-04)");
+                WebSocketSystem.ReleaseEvent(ref evNewC);
+
+                // Stale SendBinary MUST NOT inject payload into hNew (AUDIONET-01)
+                Assert.True(!WebSocketSystem.SendBinary(wsSingle, hOld, "POISON"u8), "Stale SendBinary rejected on reused slot (AUDIONET-01)");
+                Assert.True(WebSocketSystem.SendText(wsSingle, hNew, "CLEAN"u8), "Valid SendText succeeded on hNew");
+                WebSocketEvent evClean = WaitWsEvent(wsSingle, hNew);
+                Assert.Equal((byte)WebSocketEventKind.TextMessage, (byte)evClean.Kind, "Received clean message on hNew");
+                Assert.Equal("CLEAN", evClean.DataAsUtf8String(), "No cross-connection payload injection");
+                WebSocketSystem.ReleaseEvent(ref evClean);
+            }
+            finally
+            {
+                WebSocketSystem.Stop(wsSingle);
+            }
+
+            // 3. AUDIONET-02: Rapid slot-reuse against slow-closing server -> Connect NEVER blocks >50ms
+            WebSocketClientState* wsSlow = alloc.Persistent.Alloc<WebSocketClientState>(1, 64);
+            WebSocketSystem.Start(wsSlow, ref alloc.Persistent, maxConnections: 2, eventQueueCapacity: 64, outboundQueueCapacity: 64);
+            try
+            {
+                WebSocketHandle hSlow = WebSocketSystem.Connect(wsSlow, $"{baseWsUrl}/slow-close");
+                WebSocketEvent evSlowC = WaitWsEvent(wsSlow, hSlow);
+                Assert.Equal((byte)WebSocketEventKind.Connected, (byte)evSlowC.Kind, "hSlow connected");
+                WebSocketSystem.ReleaseEvent(ref evSlowC);
+
+                WebSocketSystem.Close(wsSlow, hSlow, 1000, "bye-slow");
+
+                // Immediately attempt Connect calls while slot 0 is still slow-closing; Connect must NEVER block >50ms
+                Stopwatch connectTimer = new Stopwatch();
+                WebSocketHandle hFast = WebSocketHandle.Invalid;
+                for (int i = 0; i < 5; i++)
+                {
+                    connectTimer.Restart();
+                    WebSocketHandle candidate = WebSocketSystem.Connect(wsSlow, $"{baseWsUrl}/echo");
+                    connectTimer.Stop();
+                    Assert.True(connectTimer.ElapsedMilliseconds < 50,
+                        $"Connect did not block on slow-closing slot (took {connectTimer.ElapsedMilliseconds}ms)");
+                    if (candidate.IsValid)
+                    {
+                        if (!hFast.IsValid) hFast = candidate;
+                        else WebSocketSystem.Close(wsSlow, candidate);
+                    }
+                }
+                Assert.True(hFast.IsValid, "Acquired free slot while other slot was slow-closing");
+                WebSocketEvent evFastC = WaitWsEvent(wsSlow, hFast);
+                Assert.Equal((byte)WebSocketEventKind.Connected, (byte)evFastC.Kind, "Fast slot connected cleanly");
+                WebSocketSystem.ReleaseEvent(ref evFastC);
+            }
+            finally
+            {
+                WebSocketSystem.Stop(wsSlow);
+            }
+
+            // 4. AUDIONET-01, AUDIONET-02, AUDIONET-03: Concurrent SendBinary & Connect vs Stop() cycles + post-Stop state/counters
+            WebSocketClientState* wsRace = alloc.Persistent.Alloc<WebSocketClientState>(1, 64);
+            for (int cycle = 0; cycle < 3; cycle++)
+            {
+                WebSocketSystem.Start(wsRace, ref alloc.Persistent, maxConnections: 4, eventQueueCapacity: 64, outboundQueueCapacity: 32);
+                WebSocketHandle hMain = WebSocketSystem.Connect(wsRace, $"{baseWsUrl}/echo");
+                WebSocketEvent evMainC = WaitWsEvent(wsRace, hMain);
+                WebSocketSystem.ReleaseEvent(ref evMainC);
+
+                using var raceCts = new CancellationTokenSource();
+                CancellationToken rct = raceCts.Token;
+
+                Task tSend = Task.Run(() =>
+                {
+                    byte[] payload = "race-frame"u8.ToArray();
+                    while (!rct.IsCancellationRequested)
+                        _ = WebSocketSystem.SendBinary(wsRace, hMain, payload);
+                });
+                Task tConn = Task.Run(() =>
+                {
+                    while (!rct.IsCancellationRequested)
+                    {
+                        WebSocketHandle hc = WebSocketSystem.Connect(wsRace, $"{baseWsUrl}/echo");
+                        if (hc.IsValid) WebSocketSystem.Close(wsRace, hc);
+                    }
+                });
+
+                Thread.Sleep(25);
+                WebSocketSystem.Stop(wsRace);
+                raceCts.Cancel();
+                Task.WaitAll(tSend, tConn);
+
+                Assert.Equal((byte)WebSocketStateKind.Disconnected, (byte)WebSocketSystem.GetState(wsRace, hMain),
+                    "Post-Stop GetState == Disconnected (AUDIONET-03)");
+                Assert.Equal(0, Volatile.Read(ref wsRace->ActiveConnectionCount.Value),
+                    "Post-Stop ActiveConnectionCount == 0 (AUDIONET-03)");
+            }
+        }
+        finally
+        {
+            serverCts.Cancel();
+            listener.Stop();
+            try { serverTask.Wait(TimeSpan.FromSeconds(3)); } catch { }
+            alloc.Dispose();
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after WebSocketSystem regression tests");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after WebSocketSystem regression tests");
+    }
+
+    private static async Task RunRegressionWsServerAsync(TcpListener listener, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            TcpClient client;
+            try { client = await listener.AcceptTcpClientAsync(ct).ConfigureAwait(false); }
+            catch { break; }
+
+            _ = Task.Run(async () =>
+            {
+                using (client)
+                using (NetworkStream stream = client.GetStream())
+                {
+                    try
+                    {
+                        string headers = await ReadHttpHeadersAsync(stream, ct).ConfigureAwait(false);
+                        string[] lines = headers.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
+                        string path = lines.Length > 0 && lines[0].Split(' ').Length > 1 ? lines[0].Split(' ')[1] : "/";
+
+                        string? secKey = null;
+                        foreach (string line in lines)
+                        {
+                            int colon = line.IndexOf(':');
+                            if (colon > 0 && line.Substring(0, colon).Trim().Equals("Sec-WebSocket-Key", StringComparison.OrdinalIgnoreCase))
+                                secKey = line.Substring(colon + 1).Trim();
+                        }
+                        if (string.IsNullOrEmpty(secKey)) return;
+
+                        string acceptKey = Convert.ToBase64String(
+                            SHA1.HashData(Encoding.ASCII.GetBytes(secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+                        string upgrade = $"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {acceptKey}\r\n\r\n";
+                        await stream.WriteAsync(Encoding.ASCII.GetBytes(upgrade), ct).ConfigureAwait(false);
+                        await stream.FlushAsync(ct).ConfigureAwait(false);
+
+                        using WebSocket srvWs = WebSocket.CreateFromStream(stream, isServer: true, subProtocol: null, keepAliveInterval: TimeSpan.FromSeconds(10));
+
+                        if (path == "/close-immediate")
+                        {
+                            await srvWs.CloseAsync(WebSocketCloseStatus.NormalClosure, "srv-bye", ct).ConfigureAwait(false);
+                            return;
+                        }
+
+                        byte[] buf = new byte[4096];
+                        while (!ct.IsCancellationRequested && srvWs.State == WebSocketState.Open)
+                        {
+                            WebSocketReceiveResult res = await srvWs.ReceiveAsync(buf, ct).ConfigureAwait(false);
+                            if (res.MessageType == WebSocketMessageType.Close)
+                            {
+                                if (path == "/slow-close")
+                                    await Task.Delay(350, ct).ConfigureAwait(false);
+                                await srvWs.CloseOutputAsync(
+                                    res.CloseStatus ?? WebSocketCloseStatus.NormalClosure,
+                                    res.CloseStatusDescription ?? string.Empty,
+                                    ct).ConfigureAwait(false);
                                 break;
                             }
                             await srvWs.SendAsync(new ReadOnlyMemory<byte>(buf, 0, res.Count), res.MessageType, res.EndOfMessage, ct).ConfigureAwait(false);
