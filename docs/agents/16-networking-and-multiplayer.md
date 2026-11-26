@@ -24,18 +24,38 @@ Bring Engine keeps networking **strictly lean** inside core `BringEngine`:
 
 ---
 
-## 2. Threading, Memory & Determinism Rules
+## 2. Two-Zone Async Architecture, Threading & Determinism Rules
 
-1. **Keep sockets completely outside `Simulation/`**:
+Bring Engine uses a **Two-Zone Async Architecture** so core engine code and frame loops stay strictly Zero-OOP, Zero-GC, and deterministic while games with heavy live-ops can still use idiomatic `.NET 10` async tooling cleanly:
+
+| Zone | Where It Applies | Pattern to Use | Hard Rules |
+|---|---|---|---|
+| **Zone 1 — Handle + Frame Polling** | **All core `BringEngine` APIs**, `Simulation/`, `View/`, CPU background jobs, simple 1–2 step HTTP calls, WebSockets, and real-time packet polling | **32-bit Generational Handle + Native Mailbox + Zero-GC Frame Poll** (`HttpSystem`, `WebSocketSystem`, `JobSystem`, `NetTransportVTable`) | **0 GC** on Logic/Render threads; **0 `async`/`await` or `Task<T>`**; **0 managed closures**; always call `ReleaseResponse`/`ReleaseEvent` and `Stop` |
+| **Zone 2 — Quarantined Cold-Path `async`/`await`** | **Game-level heavy multi-step cold-path orchestration** (`src/<Game>/Services/`): login + OAuth/JWT refresh, exponential retries, parallel catalog/config/events fetch, IAP receipt verification, CDN patch downloads, or `Task`-based SDKs (PlayFab, Nakama, EOS, Discord) | Standard C# `async`/`await` + `Task` using `.NET 10` `HttpClient` or the service's NuGet SDK on background threads with a shutdown `CancellationToken` | Background tasks MUST **NEVER** read/mutate `GameSimState`, `EngineWorld`, `EngineAllocators`, or SDL3/GPU directly — publish plain unmanaged result structs / immutable snapshots into a **thread-safe mailbox** polled once per frame on the Logic Thread (0 GC) |
+
+```text
+[Zone 2: Game Services/ (async/await, Task, retries, OAuth, SDKs)]
+                            │
+           (plain unmanaged result / snapshot)
+                            ▼
+            [Thread-Safe Mailbox / Ring Buffer]
+                            │
+                (Poll once per frame — 0 GC)
+                            ▼
+[Zone 1: Logic Thread — Simulation/ & View/ (Zero-OOP, deterministic)]
+```
+
+### Mandatory Boundary Checklist
+1. **Keep sockets and `Task`s completely outside `Simulation/`**:
    - `Simulation/` (`GameSimSystems.StepFixed`) MUST stay pure deterministic unmanaged math with zero socket or I/O calls so `--headless` verification and replays always work offline.
-   - Poll `HttpSystem`, `WebSocketSystem`, or your multiplayer transport at the **start of the Logic Thread tick**, decode packets into plain unmanaged input/command structs, and pass those into `Simulation/`.
+   - Poll `HttpSystem`, `WebSocketSystem`, your multiplayer transport, or your `Services/` mailbox at the **start of the Logic Thread tick**, decode into plain unmanaged input/command structs, and pass those into `Simulation/`.
 2. **Allocate engine networking state in `EngineAllocators.Persistent`**:
    - Like `JobScheduler` and `EnginePipelineState`, allocate `HttpClientState*` and `WebSocketClientState*` in stable pinned native memory (`engAlloc.Persistent.Alloc<...>(1, 64)`), call `Start(...)` once at startup, and call `Stop(...)` cleanly **before** `engAlloc.Dispose()`.
 3. **Zero-GC Logic Thread Polling & Zero Native Leaks**:
    - `HttpSystem.PollCompleted`, `HttpSystem.IsPending`, `HttpSystem.ReleaseResponse`, `WebSocketSystem.SendBinary`, `WebSocketSystem.SendText`, `WebSocketSystem.PollEvent`, and `WebSocketSystem.ReleaseEvent` allocate **0 managed GC bytes** on the calling thread.
    - **ALWAYS** call `HttpSystem.ReleaseResponse(ref resp)` and `WebSocketSystem.ReleaseEvent(ref ev)` after consuming payloads so `NativeMemoryTracker.LiveBytes == 0`. (`Stop()` also drains and frees any unpolled buffers safely.)
-4. **Never use `async`/`await` inside `StepFixed` or `OnViewSync`**:
-   - Background I/O runs automatically off the Logic/Render threads; gameplay code stays strictly synchronous and frame-polled.
+4. **Never use `async`/`await` inside `StepFixed` or `OnViewSync`, and never wrap `HttpSystem` back into `Task<T>`**:
+   - If a game's `Services/` layer wants `Task`-based HTTP with retries/OAuth, use `.NET 10`'s pooled `HttpClient` directly inside `Services/` rather than double-wrapping `HttpSystem`.
 
 ---
 

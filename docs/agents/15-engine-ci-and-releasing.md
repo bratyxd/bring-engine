@@ -9,6 +9,7 @@
 Games consume released SDK archives (`bring-sdk-vX.Y.Z.zip`) from GitHub Releases rather than copying engine sources:
 - Only modify Bring Engine when it has a **bug, crash, violated contract, or missing general capability** a game cannot reasonably build on its own.
 - **Nothing game-specific** goes into the engine.
+- **Mandatory Engine Async Contract**: Every new async or background subsystem added to core `BringEngine` (e.g., networking, async file/save I/O, audio streaming, background asset loading) MUST follow the **32-bit Generational Handle + Quarantined Background Worker + Native Ring-Buffer Mailbox + Zero-GC Frame Polling + `Cancel`/`Release`/`Stop`** pattern (matching `JobSystem`, `HttpSystem`, and `WebSocketSystem`). Core engine public APIs MUST NEVER expose `Task<T>`, `async`/`await`, or managed callback closures (`Action<T>`).
 - **Never patch** files inside a downloaded `~/.bring/sdk/<tag>/` cache folder — always edit in the `bratyxd/bring-engine` repository and publish a new release.
 
 ---

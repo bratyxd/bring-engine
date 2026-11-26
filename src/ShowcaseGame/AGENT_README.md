@@ -16,6 +16,8 @@ src/<YourGame>/
 │   ├── GameAssets.cs           # Asset bundle loader function pointers (.bpack, .glb, textures, SDF fonts)
 │   ├── GameViewState.cs        # Visual handles (EntityId, SpriteHandle, TextHandle, CameraHandle, EmitterHandle)
 │   └── GameViewSystems.cs      # Scene hooks (OnLoad, OnUnload, OnViewSync) syncing visuals
+├── Services/                   # (Optional) Quarantined background async/await layer for heavy live-ops/SDKs;
+│                               # NEVER touches Simulation/View/GPU directly — communicates via polled mailboxes.
 └── Assets/
     ├── models/*.glb            # First-class glTF 2.0 binary models
     └── Shaders/*.hlsl          # Custom game HLSL shaders (SDL_shadercross conventions)
@@ -50,9 +52,10 @@ src/<YourGame>/
    - Use `JobScheduler` + `JobSystem` (`ParallelFor`, async `ScheduleParallelFor` + `IsComplete`, `CombineDependencies`, `RequestCancel`, per-worker `GetWorkerScratch`) when profiling shows a genuinely heavy SoA loop (hundreds/thousands of independent entities, particles, transforms, spatial/flow grids) or multi-frame background generation (maps, nav grids, chunk meshes).
    - **Do NOT multithread tiny loops** (< ~500–1000 items or < 0.5 ms) — pass a sensible `minParallelCount` so small workloads stay single-threaded inline with zero sync overhead.
    - Keep parallel kernels deterministic (disjoint writes, per-item seeded `DetRng`, zero SDL3/GPU calls, always `RequestCancel` + `Complete` before resetting/disposing arenas). See [`docs/agents/12-multithreading-and-jobs.md`](../../docs/agents/12-multithreading-and-jobs.md).
-10. **Core Networking & Custom Multiplayer (Zero Core Bloat)**:
-   - Use core `HttpSystem` (HTTP/HTTPS), `WebSocketSystem` (`ws://`/`wss://`), `NetWriter`/`NetReader`, and `NetTransportVTable` / `LoopbackTransportSystem` for web APIs, lobbies, and headless multiplayer testing; keep all sockets outside `Simulation/` and always call `ReleaseResponse`/`ReleaseEvent`.
-   - For real-time UDP multiplayer, add only the NuGet your game needs (`LiteNetLib 2.x`, `Backdash` rollback, or `Facepunch.Steamworks`) directly to `<YourGame>.csproj`. See [`docs/agents/16-networking-and-multiplayer.md`](../../docs/agents/16-networking-and-multiplayer.md).
+10. **Two-Zone Async Architecture, Core Networking & Custom Multiplayer (Zero Core Bloat)**:
+   - **Zone 1 (Frame Loops & Simple Async)**: Never use `async`/`await`, `Task<T>`, or managed closures inside `Simulation/` or `View/`. Use core handle + zero-GC frame-polling systems (`JobSystem`, `HttpSystem`, `WebSocketSystem`, `NetWriter`/`NetReader`, `NetTransportVTable` / `LoopbackTransportSystem`) for CPU jobs, simple web calls, WebSockets, and headless multiplayer tests — always call `ReleaseResponse`/`ReleaseEvent` and `Stop`.
+   - **Zone 2 (Heavy Cold-Path Live-Ops & Backend SDKs)**: When a game needs complex multi-step orchestration (auth/JWT refresh, exponential retries, store/IAP, CDN patching, PlayFab/Nakama/EOS SDKs), run standard C# `async`/`await` + `Task` (with `.NET 10` `HttpClient` or SDKs) **strictly inside an isolated `Services/` background layer** with a shutdown `CancellationToken`. Never mutate `GameSimState`, `EngineWorld`, `EngineAllocators`, or SDL3/GPU from background tasks — push plain unmanaged results/snapshots into a thread-safe mailbox polled once per frame on the Logic Thread.
+   - **Real-Time Multiplayer**: Add only the NuGet your game needs (`LiteNetLib 2.x`, `Backdash` rollback, or `Facepunch.Steamworks`) directly to `<YourGame>.csproj`. See [`docs/agents/16-networking-and-multiplayer.md`](../../docs/agents/16-networking-and-multiplayer.md).
 11. **Verify Desktop Publish, Cross-OS Targets, Headless Determinism & GPU Render**:
     ```bash
     # Windows (default local verification)
