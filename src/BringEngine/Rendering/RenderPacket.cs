@@ -99,7 +99,9 @@ internal struct BatchUniformsGpu
 public struct Batch3DCmd
 {
     public int MeshGpuSlot;
+    public uint MeshGpuGen;
     public int TextureGpuSlot;
+    public uint TextureGpuGen;
     public ShaderHandle Shader;
     public MaterialAlphaMode AlphaMode;
     public byte DoubleSided;
@@ -111,6 +113,7 @@ public struct Batch3DCmd
 public struct SpriteBatchCmd
 {
     public int TextureGpuSlot;
+    public uint TextureGpuGen;
     public ShaderHandle Shader;
     public SpriteBlendMode BlendMode;
     public byte DepthTest;
@@ -122,6 +125,7 @@ public struct SpriteBatchCmd
 public struct TextBatchCmd
 {
     public int AtlasTexGpuSlot;
+    public uint AtlasTexGpuGen;
     public ShaderHandle Shader;
     public byte DepthTest;
     public uint BaseInstance;
@@ -132,6 +136,7 @@ public struct TextBatchCmd
 public struct ParticleBatchCmd
 {
     public int TextureGpuSlot;
+    public uint TextureGpuGen;
     public ShaderHandle Shader;
     public ParticleBlendMode BlendMode;
     public uint BaseInstance;

@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using BringEngine.Core.Logging;
 using BringEngine.Core.Math;
@@ -24,6 +25,8 @@ public unsafe struct PlatformWindow
     public nint Window;
     public int Width;
     public int Height;
+    public int LogicalWidth;
+    public int LogicalHeight;
     public int PixelWidth;
     public int PixelHeight;
     public int WindowedWidth;
@@ -59,18 +62,20 @@ public static unsafe class PlatformSystem
         LogState* log = null)
     {
         byte gamepadReady = 1;
-        if (!SDL.Init(SDL.InitFlags.Video | SDL.InitFlags.Events | SDL.InitFlags.Gamepad))
+        SDL.InitFlags initFlags = SDL.InitFlags.Video | SDL.InitFlags.Events | SDL.InitFlags.Gamepad;
+        if (!SDL.InitSubSystem(initFlags))
         {
             // Graceful fallback for restricted headless containers without gamepad support
             gamepadReady = 0;
+            initFlags = SDL.InitFlags.Video | SDL.InitFlags.Events;
             if (log != null)
-                LogSystem.Warn(log, $"SDL_Init with Gamepad failed ({SDL.GetError()}); retrying without Gamepad subsystem");
-            if (!SDL.Init(SDL.InitFlags.Video | SDL.InitFlags.Events))
+                LogSystem.Warn(log, $"SDL_InitSubSystem with Gamepad failed ({SDL.GetError()}); retrying without Gamepad subsystem");
+            if (!SDL.InitSubSystem(initFlags))
             {
                 string err = SDL.GetError();
                 if (log != null)
-                    LogSystem.Error(log, $"SDL_Init failed: {err}");
-                throw new InvalidOperationException($"SDL_Init failed: {err}");
+                    LogSystem.Error(log, $"SDL_InitSubSystem failed: {err}");
+                throw new InvalidOperationException($"SDL_InitSubSystem failed: {err}");
             }
         }
 
@@ -97,7 +102,7 @@ public static unsafe class PlatformSystem
             string err = SDL.GetError();
             if (log != null)
                 LogSystem.Error(log, $"SDL_CreateWindow('{title}', {width}x{height}) failed: {err}");
-            SDL.Quit();
+            SDL.QuitSubSystem(initFlags);
             throw new InvalidOperationException($"SDL_CreateWindow failed: {err}");
         }
 
@@ -107,13 +112,17 @@ public static unsafe class PlatformSystem
             SDL.SetWindowFullscreen(win, true);
         }
 
+        SDL.GetWindowSize(win, out int lw, out int lh);
+        if (lw <= 0) lw = width;
+        if (lh <= 0) lh = height;
+
         SDL.GetWindowSizeInPixels(win, out int pw, out int ph);
-        if (pw <= 0) pw = width;
-        if (ph <= 0) ph = height;
+        if (pw <= 0) pw = lw;
+        if (ph <= 0) ph = lh;
 
         if (log != null)
         {
-            LogSystem.Info(log, $"Platform window initialized: '{title}' mode={(hidden ? "HiddenWindowed" : effectiveMode.ToString())} pixels={pw}x{ph} windowed={width}x{height} gamepad={(gamepadReady != 0 ? "ON" : "OFF")}");
+            LogSystem.Info(log, $"Platform window initialized: '{title}' mode={(hidden ? "HiddenWindowed" : effectiveMode.ToString())} pixels={pw}x{ph} logical={lw}x{lh} windowed={width}x{height} gamepad={(gamepadReady != 0 ? "ON" : "OFF")}");
         }
 
         return new PlatformWindow
@@ -121,6 +130,8 @@ public static unsafe class PlatformSystem
             Window = win,
             Width = pw,
             Height = ph,
+            LogicalWidth = lw,
+            LogicalHeight = lh,
             PixelWidth = pw,
             PixelHeight = ph,
             WindowedWidth = width,
@@ -220,9 +231,32 @@ public static unsafe class PlatformSystem
     public static void ToggleBorderlessFullscreen(ref PlatformWindow win)
         => SetWindowMode(ref win, win.Mode == WindowMode.BorderlessFullscreen ? WindowMode.Windowed : WindowMode.BorderlessFullscreen);
 
+    /// <summary>
+    /// Converts SDL3 logical window coordinates into backing-pixel coordinates matching PixelWidth/PixelHeight
+    /// (1x on standard displays, 1.5x/2x on Windows HiDPI and macOS Retina).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void ScaleLogicalToPixel(
+        float lx, float ly,
+        int logicalW, int logicalH,
+        int pixelW, int pixelH,
+        out float px, out float py)
+    {
+        float sx = (logicalW > 0 && pixelW > 0) ? ((float)pixelW / logicalW) : 1f;
+        float sy = (logicalH > 0 && pixelH > 0) ? ((float)pixelH / logicalH) : 1f;
+        px = lx * sx;
+        py = ly * sy;
+    }
+
     public static void SyncPixelSize(ref PlatformWindow win)
     {
         if (win.Window == nint.Zero) return;
+        SDL.GetWindowSize(win.Window, out int lw, out int lh);
+        if (lw > 0 && lh > 0)
+        {
+            win.LogicalWidth = lw;
+            win.LogicalHeight = lh;
+        }
         SDL.GetWindowSizeInPixels(win.Window, out int pw, out int ph);
         if (pw > 0 && ph > 0 && (pw != win.PixelWidth || ph != win.PixelHeight))
         {
@@ -265,14 +299,24 @@ public static unsafe class PlatformSystem
                 case SDL.EventType.WindowFocusGained:
                     win.Focused = 1;
                     input.SetWindowFocused(true);
+                    if (win.Window != nint.Zero)
+                    {
+                        if (win.MouseLocked != 0)
+                        {
+                            if (!SDL.SetWindowRelativeMouseMode(win.Window, true))
+                                win.MouseLocked = (byte)(SDL.GetWindowRelativeMouseMode(win.Window) ? 1 : 0);
+                        }
+                        else
+                        {
+                            win.MouseLocked = (byte)(SDL.GetWindowRelativeMouseMode(win.Window) ? 1 : 0);
+                        }
+                        input.SetMouseLocked(win.MouseLocked != 0);
+                    }
                     break;
 
                 case SDL.EventType.WindowFocusLost:
                     win.Focused = 0;
-                    input.SetWindowFocused(false);
-                    // Release held keys/mouse buttons while preserving KeysPrev/MouseButtonsPrev so Is*Released fires cleanly
-                    for (int k = 0; k < 8; k++) input.KeysDown[k] = 0;
-                    input.MouseButtonsDown = 0;
+                    InputSystem.ApplyFocusLost(ref input);
                     break;
 
                 case SDL.EventType.WindowMinimized:
@@ -297,10 +341,12 @@ public static unsafe class PlatformSystem
                         win.Height = ph;
                         win.Resized = 1;
                     }
-                    if (win.Mode == WindowMode.Windowed)
+                    SDL.GetWindowSize(win.Window, out int ww, out int wh);
+                    if (ww > 0 && wh > 0)
                     {
-                        SDL.GetWindowSize(win.Window, out int ww, out int wh);
-                        if (ww > 0 && wh > 0)
+                        win.LogicalWidth = ww;
+                        win.LogicalHeight = wh;
+                        if (win.Mode == WindowMode.Windowed)
                         {
                             win.WindowedWidth = ww;
                             win.WindowedHeight = wh;
@@ -322,8 +368,9 @@ public static unsafe class PlatformSystem
                     break;
 
                 case SDL.EventType.MouseMotion:
-                    input.MouseX = ev.Motion.X;
-                    input.MouseY = ev.Motion.Y;
+                    ScaleLogicalToPixel(ev.Motion.X, ev.Motion.Y, win.LogicalWidth, win.LogicalHeight, win.PixelWidth, win.PixelHeight, out float mx, out float my);
+                    input.MouseX = mx;
+                    input.MouseY = my;
                     input.MouseDeltaX += ev.Motion.XRel;
                     input.MouseDeltaY += ev.Motion.YRel;
                     break;
@@ -530,7 +577,10 @@ public static unsafe class PlatformSystem
         }
         if (win.Initialized != 0)
         {
-            SDL.Quit();
+            SDL.InitFlags quitFlags = SDL.InitFlags.Video | SDL.InitFlags.Events;
+            if (win.GamepadSubsystemActive != 0)
+                quitFlags |= SDL.InitFlags.Gamepad;
+            SDL.QuitSubSystem(quitFlags);
             win.Initialized = 0;
             win.GamepadSubsystemActive = 0;
         }

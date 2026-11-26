@@ -34,13 +34,87 @@ namespace BringEngine.Rendering;
 public static unsafe class BatchRenderer
 {
     private static readonly double s_ticksToMs = 1000.0 / Stopwatch.Frequency;
+    private const int MaxInstancesPerCategoryCap = 65536;
+
+    // GPU warning latch bits stored in GpuContext.WarnedCapsMask
+    private const uint GpuWarnGrowInst3D = 1u << 0;
+    private const uint GpuWarnGrowJoints = 1u << 1;
+    private const uint GpuWarnGrowSprites = 1u << 2;
+    private const uint GpuWarnGrowGlyphs = 1u << 3;
+    private const uint GpuWarnGrowParticles = 1u << 4;
+    private const uint GpuWarnGrowTransfer = 1u << 5;
+    private const uint GpuWarnMapTransfer = 1u << 6;
+
+    // Extract warning latch bits (auto-resets whenever LogState* changes; resettable for tests)
+    private const uint ExtractWarnCap3D = 1u << 0;
+    private const uint ExtractWarnCapSprites = 1u << 1;
+    private const uint ExtractWarnCapText = 1u << 2;
+    private const uint ExtractWarnCapParticles = 1u << 3;
+    private const uint ExtractWarnCapParticleBatches = 1u << 4;
+    private const uint ExtractWarnCapShadows = 1u << 5;
+
+    private static long s_warnedExtractLogPtr;
+    private static uint s_warnedExtractCapsMask;
+
+    public static void ResetWarningLatchesForTest()
+    {
+        Volatile.Write(ref s_warnedExtractLogPtr, 0);
+        Volatile.Write(ref s_warnedExtractCapsMask, 0u);
+    }
+
+    private static bool TryLatchExtractWarn(LogState* log, uint bit)
+    {
+        if (log == null) return false;
+        long ptr = (long)(nint)log;
+        if (Volatile.Read(ref s_warnedExtractLogPtr) != ptr)
+        {
+            if (Interlocked.Exchange(ref s_warnedExtractLogPtr, ptr) != ptr)
+                Volatile.Write(ref s_warnedExtractCapsMask, 0u);
+        }
+        uint prev = Interlocked.Or(ref s_warnedExtractCapsMask, bit);
+        return (prev & bit) == 0u;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TryLatchGpuWarn(ref GpuContext gpu, uint bit)
+    {
+        if ((gpu.WarnedCapsMask & bit) != 0u) return false;
+        gpu.WarnedCapsMask |= bit;
+        return true;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct UploadedFrameCounts
+    {
+        public uint Inst3D;
+        public uint Joints;
+        public uint Sprites;
+        public uint Glyphs;
+        public uint Particles;
+
+        public uint Bytes3D;
+        public uint BytesJoints;
+        public uint BytesSprites;
+        public uint BytesGlyphs;
+        public uint BytesParticles;
+
+        public uint Off3D;
+        public uint OffJoints;
+        public uint OffSprites;
+        public uint OffGlyphs;
+        public uint OffParticles;
+
+        public uint TotalBytes;
+    }
 
     private struct Draw3DSortItem
     {
         public ulong SortKey;
         public int OriginalIndex;
         public int MeshGpuSlot;
+        public uint MeshGpuGen;
         public int TextureGpuSlot;
+        public uint TextureGpuGen;
         public ShaderHandle Shader;
         public MaterialAlphaMode AlphaMode;
         public byte DoubleSided;
@@ -51,6 +125,7 @@ public static unsafe class BatchRenderer
     {
         public int TextIndex;
         public int AtlasTexGpuSlot;
+        public uint AtlasTexGpuGen;
         public ShaderHandle Shader;
         public short SortingOrder;
         public byte DepthTest;
@@ -61,6 +136,7 @@ public static unsafe class BatchRenderer
         public ulong SortKey;
         public int OriginalIndex;
         public int TextureGpuSlot;
+        public uint TextureGpuGen;
         public ShaderHandle Shader;
         public SpriteBlendMode BlendMode;
         public byte DepthTest;
@@ -135,34 +211,75 @@ public static unsafe class BatchRenderer
             glyphSlotsPerCam += td.Content.Length * (hasShadow ? 2 : 1);
         }
 
-        bool wantShadows = lighting.ShadowsEnabled != 0 && lighting.SunIntensity > 0.001f && world.RenderComponents.MeshRendererCount > 0;
-        int cap3D = Math.Clamp(world.RenderComponents.MeshRendererCount * (camCount + (wantShadows ? 1 : 0)), 64, 16384);
-        int capSprites = Math.Clamp(spriteSlotsPerCam * camCount, 64, 16384);
-        int minGlyphCap = world.RenderComponents.TextCount > 0 ? 512 : 128;
-        int capGlyphs = Math.Clamp(Math.Max(glyphSlotsPerCam, minGlyphCap) * camCount, 128, 16384);
-        int capParticles = Math.Clamp(world.Particles.ParticleCount * camCount, 64, 16384);
-
         var camSnapshots = packetArena.AllocSlice<RenderCameraSnapshot>(camCount);
-        var allInstances3D = NativeList<Instance3DGpu>.CreateInArena(ref packetArena, cap3D, 64);
-        var allBatches3D = NativeList<Batch3DCmd>.CreateInArena(ref packetArena, Math.Min(cap3D, 4096), 16);
-        var shadowBatches3D = wantShadows
-            ? NativeList<Batch3DCmd>.CreateInArena(ref packetArena, Math.Clamp(world.RenderComponents.MeshRendererCount, 16, 2048), 16)
-            : default;
-        var allSprites = NativeList<SpriteGpuInstance>.CreateInArena(ref packetArena, capSprites, 64);
-        var allSpriteBatches = NativeList<SpriteBatchCmd>.CreateInArena(ref packetArena, Math.Min(capSprites, 2048), 16);
-        var allGlyphs = NativeList<GlyphGpuInstance>.CreateInArena(ref packetArena, capGlyphs, 64);
-        var allTextBatches = NativeList<TextBatchCmd>.CreateInArena(ref packetArena, Math.Max(64, world.RenderComponents.TextCount * camCount), 16);
-        var allParticles = NativeList<ParticleGpuInstance>.CreateInArena(ref packetArena, capParticles, 64);
-        var allParticleBatches = NativeList<ParticleBatchCmd>.CreateInArena(ref packetArena, Math.Max(64, world.Particles.ActiveEmitters * camCount), 16);
 
-        // Snapshot skeletal joint palette into packetArena so Render Thread never aliases Logic Thread's animation buffer
+        // Snapshot skeletal joint palette into packetArena only when it belongs to this exact arena generation
         NativeSlice<Mat4> jointCopy = default;
         int jointLen = world.Animations.FrameJointPalette.Length;
-        if (jointLen > 0 && world.Animations.FrameJointPalette.Ptr != null)
+        bool jointPaletteFresh = jointLen > 0 &&
+                                 world.Animations.FrameJointPalette.Ptr != null &&
+                                 world.Animations.FrameJointPaletteArenaBase == packetArena.BasePtr &&
+                                 world.Animations.FrameJointPaletteArenaReset == packetArena.ResetCount;
+        if (jointPaletteFresh)
         {
-            jointCopy = packetArena.AllocSlice<Mat4>(jointLen, 64, zeroed: false);
-            nuint jBytes = (nuint)(jointLen * sizeof(Mat4));
-            Buffer.MemoryCopy(world.Animations.FrameJointPalette.Ptr, jointCopy.Ptr, jBytes, jBytes);
+            ulong jBytes64 = (ulong)jointLen * (ulong)sizeof(Mat4);
+            if (jBytes64 + 64UL <= packetArena.Remaining)
+            {
+                jointCopy = packetArena.AllocSlice<Mat4>(jointLen, 64, zeroed: false);
+                Buffer.MemoryCopy(world.Animations.FrameJointPalette.Ptr, jointCopy.Ptr, jBytes64, jBytes64);
+            }
+        }
+
+        bool wantShadows = lighting.ShadowsEnabled != 0 && lighting.SunIntensity > 0.001f && world.RenderComponents.MeshRendererCount > 0;
+        int shadowDesired = wantShadows ? Math.Clamp(world.RenderComponents.MeshRendererCount, 0, MaxInstancesPerCategoryCap) : 0;
+        int main3DDesired = (int)Math.Clamp((long)world.RenderComponents.MeshRendererCount * camCount, 0L, MaxInstancesPerCategoryCap);
+        int cap3D = Math.Clamp(main3DDesired + shadowDesired, 64, MaxInstancesPerCategoryCap);
+        int capSprites = (int)Math.Clamp((long)spriteSlotsPerCam * camCount, 64L, MaxInstancesPerCategoryCap);
+        int minGlyphCap = world.RenderComponents.TextCount > 0 ? 512 : 128;
+        int capGlyphs = (int)Math.Clamp((long)Math.Max(glyphSlotsPerCam, minGlyphCap) * camCount, 128L, MaxInstancesPerCategoryCap);
+        int capParticles = (int)Math.Clamp((long)world.Particles.ParticleCount * camCount, 64L, MaxInstancesPerCategoryCap);
+
+        int bat3D = Math.Min(cap3D, 4096);
+        int batShadow = wantShadows ? Math.Clamp(world.RenderComponents.MeshRendererCount, 16, 2048) : 0;
+        int batSprites = Math.Min(capSprites, 2048);
+        int batText = Math.Clamp(Math.Max(64, world.RenderComponents.TextCount * camCount), 64, 4096);
+        int batParticles = Math.Clamp(Math.Max(64, world.Particles.ActiveEmitters * camCount), 64, 4096);
+
+        // Bound packet list allocations cleanly to remaining packetArena space so large scenes never throw LinearArena overflow
+        FitPacketCapsToArenaBudget(
+            packetArena.Remaining,
+            wantShadows,
+            ref cap3D, ref bat3D, ref batShadow,
+            ref capSprites, ref batSprites,
+            ref capGlyphs, ref batText,
+            ref capParticles, ref batParticles);
+
+        var allInstances3D = cap3D > 0 ? NativeList<Instance3DGpu>.CreateInArena(ref packetArena, cap3D, 64) : default;
+        var allBatches3D = bat3D > 0 ? NativeList<Batch3DCmd>.CreateInArena(ref packetArena, bat3D, 16) : default;
+        var shadowBatches3D = (wantShadows && batShadow > 0)
+            ? NativeList<Batch3DCmd>.CreateInArena(ref packetArena, batShadow, 16)
+            : default;
+        var allSprites = capSprites > 0 ? NativeList<SpriteGpuInstance>.CreateInArena(ref packetArena, capSprites, 64) : default;
+        var allSpriteBatches = batSprites > 0 ? NativeList<SpriteBatchCmd>.CreateInArena(ref packetArena, batSprites, 16) : default;
+        var allGlyphs = capGlyphs > 0 ? NativeList<GlyphGpuInstance>.CreateInArena(ref packetArena, capGlyphs, 64) : default;
+        var allTextBatches = batText > 0 ? NativeList<TextBatchCmd>.CreateInArena(ref packetArena, batText, 16) : default;
+        var allParticles = capParticles > 0 ? NativeList<ParticleGpuInstance>.CreateInArena(ref packetArena, capParticles, 64) : default;
+        var allParticleBatches = batParticles > 0 ? NativeList<ParticleBatchCmd>.CreateInArena(ref packetArena, batParticles, 16) : default;
+
+        int availableJointCount = jointCopy.Length;
+
+        // Gather directional shadow casters FIRST with a dedicated reserved share so multi-camera gathering never starves shadows
+        if (wantShadows && allInstances3D.Capacity > 0 && shadowBatches3D.Capacity > 0)
+        {
+            uint sSize = lighting.ShadowMapSize >= 256u ? Math.Min(lighting.ShadowMapSize, 4096u) : 2048u;
+            packet.ShadowMapSize = sSize;
+            packet.ShadowLightViewProj = ComputeDirectionalLightViewProj(in lighting, sSize);
+            int fairShare = Math.Max(64, allInstances3D.Capacity / (camCount + 1));
+            int shadowInstanceLimit = main3DDesired > 0
+                ? Math.Min(allInstances3D.Capacity, Math.Min(shadowDesired, fairShare))
+                : allInstances3D.Capacity;
+            GatherShadowCasters3D(in world, in lighting, availableJointCount, shadowInstanceLimit, ref scratchArena, ref allInstances3D, ref shadowBatches3D, log);
+            packet.ShadowsActive = (byte)(shadowBatches3D.Count > 0 ? 1 : 0);
         }
 
         for (int ci = 0; ci < camCount; ci++)
@@ -182,7 +299,7 @@ public static unsafe class BatchRenderer
 
             // 1A. Gather & Batch 3D Meshes
             snap.Batch3DStart = allBatches3D.Count;
-            GatherAndBatch3D(in shaders, in world, in cam, ref scratchArena, ref allInstances3D, ref allBatches3D, ref stats, log);
+            GatherAndBatch3D(in shaders, in world, in cam, availableJointCount, ref scratchArena, ref allInstances3D, ref allBatches3D, ref stats, log);
             snap.Batch3DCount = allBatches3D.Count - snap.Batch3DStart;
 
             // 1B. Gather & Batch 2D Sprites in 3D/HUD
@@ -199,16 +316,6 @@ public static unsafe class BatchRenderer
             snap.ParticleBatchStart = allParticleBatches.Count;
             GatherAndBatchParticles(in shaders, in world, in cam, ref scratchArena, ref allParticles, ref allParticleBatches, ref stats, log);
             snap.ParticleBatchCount = allParticleBatches.Count - snap.ParticleBatchStart;
-        }
-
-        // Gather directional shadow map casters (grouped by AlphaMode, DoubleSided, Texture, MeshGpuSlot)
-        if (wantShadows)
-        {
-            uint sSize = lighting.ShadowMapSize >= 256u ? Math.Min(lighting.ShadowMapSize, 4096u) : 2048u;
-            packet.ShadowMapSize = sSize;
-            packet.ShadowLightViewProj = ComputeDirectionalLightViewProj(in lighting, sSize);
-            GatherShadowCasters3D(in world, in lighting, ref scratchArena, ref allInstances3D, ref shadowBatches3D, log);
-            packet.ShadowsActive = (byte)(shadowBatches3D.Count > 0 ? 1 : 0);
         }
 
         packet.Cameras = camSnapshots;
@@ -301,6 +408,7 @@ public static unsafe class BatchRenderer
                 PresentSceneColorToSwapchain(in gpu, targetW, targetH);
                 timings.GpuWaitTicks += Stopwatch.GetTimestamp() - presentStart;
             }
+            GpuSystem.FlushDeferredReleases(ref gpu);
             gpu.LastFrameStats = stats;
             return timings;
         }
@@ -313,17 +421,18 @@ public static unsafe class BatchRenderer
             in packet.JointPalette,
             in packet.Sprites,
             in packet.Glyphs,
-            in packet.Particles))
+            in packet.Particles,
+            out UploadedFrameCounts uploaded))
         {
             stats.CopyPasses++;
         }
         long uploadEnd = Stopwatch.GetTimestamp();
         timings.UploadMs = (uploadEnd - uploadStart) * s_ticksToMs;
 
-        uint maxInst3D = gpu.Instance3DBufferBytes / (uint)sizeof(Instance3DGpu);
-        uint maxSprites = gpu.SpriteInstanceBufferBytes / (uint)sizeof(SpriteGpuInstance);
-        uint maxGlyphs = gpu.TextGlyphBufferBytes / (uint)sizeof(GlyphGpuInstance);
-        uint maxParticles = gpu.ParticleInstanceBufferBytes / (uint)sizeof(ParticleGpuInstance);
+        uint maxInst3D = uploaded.Inst3D;
+        uint maxSprites = uploaded.Sprites;
+        uint maxGlyphs = uploaded.Glyphs;
+        uint maxParticles = uploaded.Particles;
 
         // 3. Execute Directional Sun Shadow Depth Pass (before main scene passes)
         long encodeStart = uploadEnd;
@@ -363,6 +472,8 @@ public static unsafe class BatchRenderer
                     MaxDepth = 1f,
                 };
                 SDL.SetGPUViewport(spass, in svp);
+                var sScissor = new SDL.Rect { X = 0, Y = 0, W = (int)sSize, H = (int)sSize };
+                SDL.SetGPUScissor(spass, in sScissor);
 
                 var sfu = new ShadowFrameUniformsGpu { LightViewProj = packet.ShadowLightViewProj };
                 SDL.PushGPUVertexUniformData(cmd, 0, (nint)(&sfu), (uint)sizeof(ShadowFrameUniformsGpu));
@@ -370,15 +481,18 @@ public static unsafe class BatchRenderer
                 nint sBoundPipe = nint.Zero;
                 int sBoundMesh = -1;
                 int sBoundTex = int.MinValue;
+                uint sBoundTexGen = 0u;
                 for (int bi = 0; bi < packet.ShadowBatches3D.Count; bi++)
                 {
                     Batch3DCmd b = packet.ShadowBatches3D[bi];
-                    if ((uint)b.MeshGpuSlot >= (uint)gpu.MaxMeshes || gpu.Meshes[b.MeshGpuSlot].Alive == 0) continue;
+                    if (!IsMeshSlotValid(in gpu, b.MeshGpuSlot, b.MeshGpuGen)) continue;
                     if (b.BaseInstance >= maxInst3D) continue;
                     uint drawInst = Math.Min(b.InstanceCount, maxInst3D - b.BaseInstance);
                     if (drawInst == 0) continue;
 
                     bool isMasked = b.AlphaMode == MaterialAlphaMode.Mask && gpu.ShadowMaskPipeline != nint.Zero;
+                    if (isMasked && b.TextureGpuSlot >= 0 && !IsTextureSlotValid(in gpu, b.TextureGpuSlot, b.TextureGpuGen)) continue;
+
                     nint sPipe = isMasked
                         ? ((b.DoubleSided != 0 && gpu.ShadowMaskPipelineCullNone != nint.Zero) ? gpu.ShadowMaskPipelineCullNone : gpu.ShadowMaskPipeline)
                         : ((b.DoubleSided != 0 && gpu.ShadowPipelineCullNone != nint.Zero) ? gpu.ShadowPipelineCullNone : gpu.ShadowPipeline);
@@ -392,12 +506,14 @@ public static unsafe class BatchRenderer
                         sBoundPipe = sPipe;
                         stats.PipelineBinds++;
                         sBoundTex = int.MinValue;
+                        sBoundTexGen = 0u;
                     }
 
-                    if (isMasked && (b.TextureGpuSlot != sBoundTex || pipeChanged))
+                    if (isMasked && (b.TextureGpuSlot != sBoundTex || b.TextureGpuGen != sBoundTexGen || pipeChanged))
                     {
-                        BindFragmentTexture(spass, in gpu, b.TextureGpuSlot);
+                        BindFragmentTexture(spass, in gpu, b.TextureGpuSlot, b.TextureGpuGen);
                         sBoundTex = b.TextureGpuSlot;
+                        sBoundTexGen = b.TextureGpuGen;
                     }
 
                     if (b.MeshGpuSlot != sBoundMesh)
@@ -427,13 +543,16 @@ public static unsafe class BatchRenderer
         for (int ci = 0; ci < packet.Cameras.Length; ci++)
         {
             ref readonly RenderCameraSnapshot cam = ref packet.Cameras[ci];
-            bool isFullViewport = cam.ViewportRect.X <= 0.001f && cam.ViewportRect.Y <= 0.001f &&
-                                  cam.ViewportRect.Z >= 0.999f && cam.ViewportRect.W >= 0.999f;
+            bool validViewport = TryComputeClampedViewport(cam.ViewportRect, targetW, targetH, out SDL.GPUViewport vp, out SDL.Rect scissor);
+            bool isFullViewport = validViewport && scissor.X == 0 && scissor.Y == 0 && scissor.W == (int)targetW && scissor.H == (int)targetH;
 
             SDL.GPULoadOp colorLoad = (ci == 0 || (cam.ClearFlags == CameraClearFlags.SolidColor && isFullViewport))
                 ? SDL.GPULoadOp.Clear : SDL.GPULoadOp.Load;
             SDL.GPULoadOp depthLoad = (ci == 0 || cam.ClearFlags == CameraClearFlags.SolidColor || cam.ClearFlags == CameraClearFlags.DepthOnly)
                 ? SDL.GPULoadOp.Clear : SDL.GPULoadOp.Load;
+
+            if (!validViewport && colorLoad == SDL.GPULoadOp.Load && depthLoad == SDL.GPULoadOp.Load)
+                continue;
 
             var colorInfo = new SDL.GPUColorTargetInfo
             {
@@ -458,21 +577,20 @@ public static unsafe class BatchRenderer
             nint pass = SDL.BeginGPURenderPass(cmd, (nint)(&colorInfo), 1, in depthInfo);
             stats.RenderPasses++;
 
-            var vp = new SDL.GPUViewport
+            if (!validViewport)
             {
-                X = cam.ViewportRect.X * targetW,
-                Y = cam.ViewportRect.Y * targetH,
-                W = cam.ViewportRect.Z * targetW,
-                H = cam.ViewportRect.W * targetH,
-                MinDepth = 0f,
-                MaxDepth = 1f,
-            };
+                SDL.EndGPURenderPass(pass);
+                continue;
+            }
+
             SDL.SetGPUViewport(pass, in vp);
+            SDL.SetGPUScissor(pass, in scissor);
 
             nint boundPipeline = nint.Zero;
             nint boundStorage0 = nint.Zero;
             int boundMeshSlot = -1;
             int boundTexSlot = int.MinValue;
+            uint boundTexGen = 0u;
             int boundSamplerCount = -1;
             bool quadIndexBound = false;
 
@@ -496,7 +614,8 @@ public static unsafe class BatchRenderer
                 for (int bi = 0; bi < cam.Batch3DCount; bi++)
                 {
                     Batch3DCmd b = packet.Batches3D[cam.Batch3DStart + bi];
-                    if ((uint)b.MeshGpuSlot >= (uint)gpu.MaxMeshes || gpu.Meshes[b.MeshGpuSlot].Alive == 0) continue;
+                    if (!IsMeshSlotValid(in gpu, b.MeshGpuSlot, b.MeshGpuGen)) continue;
+                    if (b.TextureGpuSlot >= 0 && !IsTextureSlotValid(in gpu, b.TextureGpuSlot, b.TextureGpuGen)) continue;
                     if (b.BaseInstance >= maxInst3D) continue;
                     uint drawInst = Math.Min(b.InstanceCount, maxInst3D - b.BaseInstance);
                     if (drawInst == 0) continue;
@@ -511,6 +630,7 @@ public static unsafe class BatchRenderer
                         pipe = (b.DoubleSided != 0 && sSlot->PipelineAlphaBlendCullNone != nint.Zero) ? sSlot->PipelineAlphaBlendCullNone : sSlot->PipelineAlphaBlend;
                     else
                         pipe = (b.DoubleSided != 0 && sSlot->PipelineOpaqueCullNone != nint.Zero) ? sSlot->PipelineOpaqueCullNone : sSlot->PipelineOpaque;
+                    if (pipe == nint.Zero) continue;
 
                     if (pipe != boundPipeline)
                     {
@@ -538,13 +658,14 @@ public static unsafe class BatchRenderer
                     }
 
                     int neededSamplers = sSlot->FragmentSamplerCount;
-                    if (b.TextureGpuSlot != boundTexSlot || neededSamplerChanged(boundSamplerCount, neededSamplers) || passChanged)
+                    if (b.TextureGpuSlot != boundTexSlot || b.TextureGpuGen != boundTexGen || neededSamplerChanged(boundSamplerCount, neededSamplers) || passChanged)
                     {
                         if (neededSamplers >= 2)
-                            BindFragmentTextureAndShadow(pass, in gpu, b.TextureGpuSlot, shadowsRendered);
+                            BindFragmentTextureAndShadow(pass, in gpu, b.TextureGpuSlot, b.TextureGpuGen, shadowsRendered);
                         else if (neededSamplers == 1)
-                            BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
+                            BindFragmentTexture(pass, in gpu, b.TextureGpuSlot, b.TextureGpuGen);
                         boundTexSlot = b.TextureGpuSlot;
+                        boundTexGen = b.TextureGpuGen;
                         boundSamplerCount = neededSamplers;
                         passChanged = true;
                     }
@@ -573,6 +694,7 @@ public static unsafe class BatchRenderer
                 for (int bi = 0; bi < cam.SpriteBatchCount; bi++)
                 {
                     SpriteBatchCmd b = packet.SpriteBatches[cam.SpriteBatchStart + bi];
+                    if (b.TextureGpuSlot >= 0 && !IsTextureSlotValid(in gpu, b.TextureGpuSlot, b.TextureGpuGen)) continue;
                     if (b.BaseInstance >= maxSprites) continue;
                     uint drawInst = Math.Min(b.InstanceCount, maxSprites - b.BaseInstance);
                     if (drawInst == 0) continue;
@@ -583,6 +705,8 @@ public static unsafe class BatchRenderer
 
                     bool passChanged = false;
                     nint pipe = SelectQuadPipeline(sSlot, b.BlendMode == SpriteBlendMode.Additive ? 2 : (b.BlendMode == SpriteBlendMode.AlphaCutout ? 0 : 1), b.DepthTest != 0);
+                    if (pipe == nint.Zero) continue;
+
                     if (pipe != boundPipeline)
                     {
                         SDL.BindGPUGraphicsPipeline(pass, pipe);
@@ -600,10 +724,11 @@ public static unsafe class BatchRenderer
                     int neededSamplers = sSlot->FragmentSamplerCount;
                     if (neededSamplers >= 1)
                     {
-                        if (b.TextureGpuSlot != boundTexSlot || boundSamplerCount != neededSamplers || passChanged)
+                        if (b.TextureGpuSlot != boundTexSlot || b.TextureGpuGen != boundTexGen || boundSamplerCount != neededSamplers || passChanged)
                         {
-                            BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
+                            BindFragmentTexture(pass, in gpu, b.TextureGpuSlot, b.TextureGpuGen);
                             boundTexSlot = b.TextureGpuSlot;
+                            boundTexGen = b.TextureGpuGen;
                             boundSamplerCount = neededSamplers;
                             passChanged = true;
                         }
@@ -611,6 +736,7 @@ public static unsafe class BatchRenderer
                     else if (boundSamplerCount != 0)
                     {
                         boundTexSlot = int.MinValue;
+                        boundTexGen = 0u;
                         boundSamplerCount = 0;
                         passChanged = true;
                     }
@@ -643,6 +769,7 @@ public static unsafe class BatchRenderer
                 for (int bi = 0; bi < cam.ParticleBatchCount; bi++)
                 {
                     ParticleBatchCmd b = packet.ParticleBatches[cam.ParticleBatchStart + bi];
+                    if (b.TextureGpuSlot >= 0 && !IsTextureSlotValid(in gpu, b.TextureGpuSlot, b.TextureGpuGen)) continue;
                     if (b.BaseInstance >= maxParticles) continue;
                     uint drawInst = Math.Min(b.InstanceCount, maxParticles - b.BaseInstance);
                     if (drawInst == 0) continue;
@@ -653,6 +780,8 @@ public static unsafe class BatchRenderer
 
                     bool passChanged = false;
                     nint pipe = b.BlendMode == ParticleBlendMode.Additive ? sSlot->PipelineAdditive : sSlot->PipelineAlphaBlend;
+                    if (pipe == nint.Zero) continue;
+
                     if (pipe != boundPipeline)
                     {
                         SDL.BindGPUGraphicsPipeline(pass, pipe);
@@ -670,10 +799,11 @@ public static unsafe class BatchRenderer
                     int neededSamplers = sSlot->FragmentSamplerCount;
                     if (neededSamplers >= 1)
                     {
-                        if (b.TextureGpuSlot != boundTexSlot || boundSamplerCount != neededSamplers || passChanged)
+                        if (b.TextureGpuSlot != boundTexSlot || b.TextureGpuGen != boundTexGen || boundSamplerCount != neededSamplers || passChanged)
                         {
-                            BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
+                            BindFragmentTexture(pass, in gpu, b.TextureGpuSlot, b.TextureGpuGen);
                             boundTexSlot = b.TextureGpuSlot;
+                            boundTexGen = b.TextureGpuGen;
                             boundSamplerCount = neededSamplers;
                             passChanged = true;
                         }
@@ -681,6 +811,7 @@ public static unsafe class BatchRenderer
                     else if (boundSamplerCount != 0)
                     {
                         boundTexSlot = int.MinValue;
+                        boundTexGen = 0u;
                         boundSamplerCount = 0;
                         passChanged = true;
                     }
@@ -708,6 +839,7 @@ public static unsafe class BatchRenderer
                 for (int bi = 0; bi < cam.TextBatchCount; bi++)
                 {
                     TextBatchCmd b = packet.TextBatches[cam.TextBatchStart + bi];
+                    if (!IsTextureSlotValid(in gpu, b.AtlasTexGpuSlot, b.AtlasTexGpuGen)) continue;
                     if (b.BaseInstance >= maxGlyphs) continue;
                     uint drawInst = Math.Min(b.InstanceCount, maxGlyphs - b.BaseInstance);
                     if (drawInst == 0) continue;
@@ -718,6 +850,8 @@ public static unsafe class BatchRenderer
 
                     bool passChanged = false;
                     nint pipe = b.DepthTest != 0 ? sSlot->PipelineAlphaBlend : sSlot->PipelineOverlayNoDepth;
+                    if (pipe == nint.Zero) continue;
+
                     if (pipe != boundPipeline)
                     {
                         SDL.BindGPUGraphicsPipeline(pass, pipe);
@@ -735,10 +869,11 @@ public static unsafe class BatchRenderer
                     int neededSamplers = sSlot->FragmentSamplerCount;
                     if (neededSamplers >= 1)
                     {
-                        if (b.AtlasTexGpuSlot != boundTexSlot || boundSamplerCount != neededSamplers || passChanged)
+                        if (b.AtlasTexGpuSlot != boundTexSlot || b.AtlasTexGpuGen != boundTexGen || boundSamplerCount != neededSamplers || passChanged)
                         {
-                            BindFragmentTexture(pass, in gpu, b.AtlasTexGpuSlot);
+                            BindFragmentTexture(pass, in gpu, b.AtlasTexGpuSlot, b.AtlasTexGpuGen);
                             boundTexSlot = b.AtlasTexGpuSlot;
+                            boundTexGen = b.AtlasTexGpuGen;
                             boundSamplerCount = neededSamplers;
                             passChanged = true;
                         }
@@ -746,6 +881,7 @@ public static unsafe class BatchRenderer
                     else if (boundSamplerCount != 0)
                     {
                         boundTexSlot = int.MinValue;
+                        boundTexGen = 0u;
                         boundSamplerCount = 0;
                         passChanged = true;
                     }
@@ -813,6 +949,9 @@ public static unsafe class BatchRenderer
             PresentSceneColorToSwapchain(in gpu, targetW, targetH);
             timings.GpuWaitTicks += Stopwatch.GetTimestamp() - presentStart;
         }
+
+        // 6. Safely drain any deferred GPU releases queued during Logic Thread bundle unloads
+        GpuSystem.FlushDeferredReleases(ref gpu);
 
         gpu.LastFrameStats = stats;
         return timings;
@@ -911,7 +1050,239 @@ public static unsafe class BatchRenderer
         }
     }
 
-    private static void GrowStorageBufferIfNeeded(ref GpuContext gpu, ref nint buffer, ref uint currentBytes, uint neededBytes, string label)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsMeshSlotValid(in GpuContext gpu, int slot, uint expectedGen)
+    {
+        if ((uint)slot >= (uint)gpu.MaxMeshes || gpu.Meshes == null || gpu.Meshes[slot].Alive == 0)
+            return false;
+        return gpu.MeshSlotGens == null || gpu.MeshSlotGens[slot] == expectedGen;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsTextureSlotValid(in GpuContext gpu, int slot, uint expectedGen)
+    {
+        if ((uint)slot >= (uint)gpu.MaxTextures || gpu.Textures == null || gpu.Textures[slot].Alive == 0)
+            return false;
+        return gpu.TextureSlotGens == null || gpu.TextureSlotGens[slot] == expectedGen;
+    }
+
+    internal static bool TryComputeClampedViewport(
+        Vec4 viewportRect,
+        uint targetW,
+        uint targetH,
+        out SDL.GPUViewport vp,
+        out SDL.Rect scissor)
+    {
+        vp = default;
+        scissor = default;
+        if (targetW == 0u || targetH == 0u) return false;
+        if (!float.IsFinite(viewportRect.X) || !float.IsFinite(viewportRect.Y) ||
+            !float.IsFinite(viewportRect.Z) || !float.IsFinite(viewportRect.W))
+            return false;
+
+        float x0 = Math.Clamp(viewportRect.X * targetW, 0f, (float)targetW);
+        float y0 = Math.Clamp(viewportRect.Y * targetH, 0f, (float)targetH);
+        float x1 = Math.Clamp((viewportRect.X + viewportRect.Z) * targetW, x0, (float)targetW);
+        float y1 = Math.Clamp((viewportRect.Y + viewportRect.W) * targetH, y0, (float)targetH);
+
+        float w = x1 - x0;
+        float h = y1 - y0;
+        if (w < 1f || h < 1f) return false;
+
+        int sx = Math.Clamp((int)MathF.Floor(x0), 0, (int)targetW);
+        int sy = Math.Clamp((int)MathF.Floor(y0), 0, (int)targetH);
+        int sx1 = Math.Clamp((int)MathF.Ceiling(x1), sx, (int)targetW);
+        int sy1 = Math.Clamp((int)MathF.Ceiling(y1), sy, (int)targetH);
+        int sw = sx1 - sx;
+        int sh = sy1 - sy;
+        if (sw < 1 || sh < 1) return false;
+
+        vp = new SDL.GPUViewport
+        {
+            X = x0,
+            Y = y0,
+            W = w,
+            H = h,
+            MinDepth = 0f,
+            MaxDepth = 1f,
+        };
+        scissor = new SDL.Rect
+        {
+            X = sx,
+            Y = sy,
+            W = sw,
+            H = sh,
+        };
+        return true;
+    }
+
+    private static void FitPacketCapsToArenaBudget(
+        nuint availBytes,
+        bool wantShadows,
+        ref int cap3D, ref int bat3D, ref int batShadow,
+        ref int capSprites, ref int batSprites,
+        ref int capGlyphs, ref int batText,
+        ref int capParticles, ref int batParticles)
+    {
+        const ulong alignSlack = 1024UL;
+        static ulong CalcBytes(int c3D, int b3D, int bSh, int cSp, int bSp, int cGl, int bTx, int cPt, int bPt)
+        {
+            return (ulong)c3D * (ulong)sizeof(Instance3DGpu)
+                 + (ulong)b3D * (ulong)sizeof(Batch3DCmd)
+                 + (ulong)bSh * (ulong)sizeof(Batch3DCmd)
+                 + (ulong)cSp * (ulong)sizeof(SpriteGpuInstance)
+                 + (ulong)bSp * (ulong)sizeof(SpriteBatchCmd)
+                 + (ulong)cGl * (ulong)sizeof(GlyphGpuInstance)
+                 + (ulong)bTx * (ulong)sizeof(TextBatchCmd)
+                 + (ulong)cPt * (ulong)sizeof(ParticleGpuInstance)
+                 + (ulong)bPt * (ulong)sizeof(ParticleBatchCmd)
+                 + alignSlack;
+        }
+
+        ulong budget = availBytes;
+        ulong needed = CalcBytes(cap3D, bat3D, batShadow, capSprites, batSprites, capGlyphs, batText, capParticles, batParticles);
+        if (needed <= budget) return;
+
+        if (budget <= alignSlack)
+        {
+            cap3D = bat3D = batShadow = capSprites = batSprites = capGlyphs = batText = capParticles = batParticles = 0;
+            return;
+        }
+
+        double ratio = (double)(budget - alignSlack) / (double)(needed - alignSlack);
+        for (int iter = 0; iter < 4 && needed > budget; iter++)
+        {
+            cap3D = Math.Max(0, (int)(cap3D * ratio));
+            bat3D = Math.Min(cap3D, Math.Max(0, (int)(bat3D * ratio)));
+            batShadow = wantShadows ? Math.Min(cap3D, Math.Max(0, (int)(batShadow * ratio))) : 0;
+            capSprites = Math.Max(0, (int)(capSprites * ratio));
+            batSprites = Math.Min(capSprites, Math.Max(0, (int)(batSprites * ratio)));
+            capGlyphs = Math.Max(0, (int)(capGlyphs * ratio));
+            batText = Math.Max(0, (int)(batText * ratio));
+            capParticles = Math.Max(0, (int)(capParticles * ratio));
+            batParticles = Math.Max(0, (int)(batParticles * ratio));
+
+            needed = CalcBytes(cap3D, bat3D, batShadow, capSprites, batSprites, capGlyphs, batText, capParticles, batParticles);
+            if (needed <= budget) break;
+            ratio = 0.85;
+        }
+
+        if (needed > budget)
+        {
+            cap3D = bat3D = batShadow = capSprites = batSprites = capGlyphs = batText = capParticles = batParticles = 0;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong AlignUpU64(ulong value, ulong alignment)
+    {
+        ulong mask = alignment - 1UL;
+        return (value + mask) & ~mask;
+    }
+
+    /// <summary>
+    /// Pure element-aligned upload budget calculation bounding all 5 per-frame GPU streams by both
+    /// their individual storage buffer capacities and the shared UploadTransferBuffer capacity.
+    /// </summary>
+    public static UploadedFrameCounts ComputeUploadBudget(
+        int reqInst3D,
+        int reqJoints,
+        int reqSprites,
+        int reqGlyphs,
+        int reqParticles,
+        uint inst3DBufBytes,
+        uint jointBufBytes,
+        uint spriteBufBytes,
+        uint glyphBufBytes,
+        uint particleBufBytes,
+        uint transferBufBytes)
+    {
+        uint sz3D = (uint)sizeof(Instance3DGpu);
+        uint szJ = (uint)sizeof(Mat4);
+        uint szS = (uint)sizeof(SpriteGpuInstance);
+        uint szG = (uint)sizeof(GlyphGpuInstance);
+        uint szP = (uint)sizeof(ParticleGpuInstance);
+
+        uint c3D = reqInst3D > 0 ? Math.Min((uint)reqInst3D, inst3DBufBytes / sz3D) : 0u;
+        uint cJ = reqJoints > 0 ? Math.Min((uint)reqJoints, jointBufBytes / szJ) : 0u;
+        uint cS = reqSprites > 0 ? Math.Min((uint)reqSprites, spriteBufBytes / szS) : 0u;
+        uint cG = reqGlyphs > 0 ? Math.Min((uint)reqGlyphs, glyphBufBytes / szG) : 0u;
+        uint cP = reqParticles > 0 ? Math.Min((uint)reqParticles, particleBufBytes / szP) : 0u;
+
+        ulong tbCap = transferBufBytes;
+        ulong off3D = 0UL;
+        ulong b3D = (ulong)c3D * sz3D;
+        if (b3D > tbCap)
+        {
+            c3D = (uint)(tbCap / sz3D);
+            b3D = (ulong)c3D * sz3D;
+        }
+
+        ulong offJ = AlignUpU64(off3D + b3D, 64UL);
+        ulong remJ = tbCap > offJ ? tbCap - offJ : 0UL;
+        ulong bJ = (ulong)cJ * szJ;
+        if (bJ > remJ)
+        {
+            cJ = (uint)(remJ / szJ);
+            bJ = (ulong)cJ * szJ;
+        }
+
+        ulong offS = AlignUpU64(offJ + bJ, 64UL);
+        ulong remS = tbCap > offS ? tbCap - offS : 0UL;
+        ulong bS = (ulong)cS * szS;
+        if (bS > remS)
+        {
+            cS = (uint)(remS / szS);
+            bS = (ulong)cS * szS;
+        }
+
+        ulong offG = AlignUpU64(offS + bS, 64UL);
+        ulong remG = tbCap > offG ? tbCap - offG : 0UL;
+        ulong bG = (ulong)cG * szG;
+        if (bG > remG)
+        {
+            cG = (uint)(remG / szG);
+            bG = (ulong)cG * szG;
+        }
+
+        ulong offP = AlignUpU64(offG + bG, 64UL);
+        ulong remP = tbCap > offP ? tbCap - offP : 0UL;
+        ulong bP = (ulong)cP * szP;
+        if (bP > remP)
+        {
+            cP = (uint)(remP / szP);
+            bP = (ulong)cP * szP;
+        }
+
+        ulong end = 0UL;
+        if (b3D > 0UL) end = off3D + b3D;
+        if (bJ > 0UL) end = offJ + bJ;
+        if (bS > 0UL) end = offS + bS;
+        if (bG > 0UL) end = offG + bG;
+        if (bP > 0UL) end = offP + bP;
+
+        return new UploadedFrameCounts
+        {
+            Inst3D = c3D,
+            Joints = cJ,
+            Sprites = cS,
+            Glyphs = cG,
+            Particles = cP,
+            Bytes3D = (uint)b3D,
+            BytesJoints = (uint)bJ,
+            BytesSprites = (uint)bS,
+            BytesGlyphs = (uint)bG,
+            BytesParticles = (uint)bP,
+            Off3D = (uint)off3D,
+            OffJoints = (uint)offJ,
+            OffSprites = (uint)offS,
+            OffGlyphs = (uint)offG,
+            OffParticles = (uint)offP,
+            TotalBytes = (uint)end,
+        };
+    }
+
+    private static void GrowStorageBufferIfNeeded(ref GpuContext gpu, ref nint buffer, ref uint currentBytes, uint neededBytes, uint failWarnBit, string label)
     {
         if (neededBytes <= currentBytes) return;
         uint grown = currentBytes > (uint.MaxValue / 2u) ? neededBytes : currentBytes * 2u;
@@ -930,7 +1301,7 @@ public static unsafe class BatchRenderer
             if (gpu.Log != null)
                 LogSystem.Warn(gpu.Log, $"GpuContext dynamically grew {label} buffer to {newBytes} bytes");
         }
-        else if (gpu.Log != null)
+        else if (gpu.Log != null && TryLatchGpuWarn(ref gpu, failWarnBit))
         {
             LogSystem.Warn(gpu.Log, $"GpuContext failed growing {label} buffer to {newBytes} bytes ({SDL.GetError()}); clamping upload to {currentBytes}");
         }
@@ -943,39 +1314,40 @@ public static unsafe class BatchRenderer
         in NativeSlice<Mat4> jointPalette,
         in NativeList<SpriteGpuInstance> sprites,
         in NativeList<GlyphGpuInstance> glyphs,
-        in NativeList<ParticleGpuInstance> particles)
+        in NativeList<ParticleGpuInstance> particles,
+        out UploadedFrameCounts uploaded)
     {
-        uint bytes3D = (uint)(instances3D.Count * sizeof(Instance3DGpu));
-        uint bytesJoints = (uint)(jointPalette.Length * sizeof(Mat4));
-        uint bytesSprites = (uint)(sprites.Count * sizeof(SpriteGpuInstance));
-        uint bytesGlyphs = (uint)(glyphs.Count * sizeof(GlyphGpuInstance));
-        uint bytesParticles = (uint)(particles.Count * sizeof(ParticleGpuInstance));
+        uploaded = default;
 
-        GrowStorageBufferIfNeeded(ref gpu, ref gpu.Instance3DBuffer, ref gpu.Instance3DBufferBytes, bytes3D, "Instance3D");
-        GrowStorageBufferIfNeeded(ref gpu, ref gpu.JointPaletteBuffer, ref gpu.JointPaletteBufferBytes, bytesJoints, "JointPalette");
-        GrowStorageBufferIfNeeded(ref gpu, ref gpu.SpriteInstanceBuffer, ref gpu.SpriteInstanceBufferBytes, bytesSprites, "SpriteInstance");
-        GrowStorageBufferIfNeeded(ref gpu, ref gpu.TextGlyphBuffer, ref gpu.TextGlyphBufferBytes, bytesGlyphs, "TextGlyph");
-        GrowStorageBufferIfNeeded(ref gpu, ref gpu.ParticleInstanceBuffer, ref gpu.ParticleInstanceBufferBytes, bytesParticles, "ParticleInstance");
+        ulong req3D64 = (ulong)Math.Max(0, instances3D.Count) * (ulong)sizeof(Instance3DGpu);
+        ulong reqJ64 = (ulong)Math.Max(0, jointPalette.Length) * (ulong)sizeof(Mat4);
+        ulong reqS64 = (ulong)Math.Max(0, sprites.Count) * (ulong)sizeof(SpriteGpuInstance);
+        ulong reqG64 = (ulong)Math.Max(0, glyphs.Count) * (ulong)sizeof(GlyphGpuInstance);
+        ulong reqP64 = (ulong)Math.Max(0, particles.Count) * (ulong)sizeof(ParticleGpuInstance);
 
-        if (bytes3D > gpu.Instance3DBufferBytes) bytes3D = gpu.Instance3DBufferBytes;
-        if (bytesJoints > gpu.JointPaletteBufferBytes) bytesJoints = gpu.JointPaletteBufferBytes;
-        if (bytesSprites > gpu.SpriteInstanceBufferBytes) bytesSprites = gpu.SpriteInstanceBufferBytes;
-        if (bytesGlyphs > gpu.TextGlyphBufferBytes) bytesGlyphs = gpu.TextGlyphBufferBytes;
-        if (bytesParticles > gpu.ParticleInstanceBufferBytes) bytesParticles = gpu.ParticleInstanceBufferBytes;
+        uint bytes3DReq = req3D64 > uint.MaxValue ? uint.MaxValue : (uint)req3D64;
+        uint bytesJReq = reqJ64 > uint.MaxValue ? uint.MaxValue : (uint)reqJ64;
+        uint bytesSReq = reqS64 > uint.MaxValue ? uint.MaxValue : (uint)reqS64;
+        uint bytesGReq = reqG64 > uint.MaxValue ? uint.MaxValue : (uint)reqG64;
+        uint bytesPReq = reqP64 > uint.MaxValue ? uint.MaxValue : (uint)reqP64;
 
-        uint off3D = 0;
-        uint offJoints = (uint)LinearArena.AlignUp(off3D + bytes3D, 64);
-        uint offSprites = (uint)LinearArena.AlignUp(offJoints + bytesJoints, 64);
-        uint offGlyphs = (uint)LinearArena.AlignUp(offSprites + bytesSprites, 64);
-        uint offParticles = (uint)LinearArena.AlignUp(offGlyphs + bytesGlyphs, 64);
-        uint totalNeeded = offParticles + bytesParticles;
+        GrowStorageBufferIfNeeded(ref gpu, ref gpu.Instance3DBuffer, ref gpu.Instance3DBufferBytes, bytes3DReq, GpuWarnGrowInst3D, "Instance3D");
+        GrowStorageBufferIfNeeded(ref gpu, ref gpu.JointPaletteBuffer, ref gpu.JointPaletteBufferBytes, bytesJReq, GpuWarnGrowJoints, "JointPalette");
+        GrowStorageBufferIfNeeded(ref gpu, ref gpu.SpriteInstanceBuffer, ref gpu.SpriteInstanceBufferBytes, bytesSReq, GpuWarnGrowSprites, "SpriteInstance");
+        GrowStorageBufferIfNeeded(ref gpu, ref gpu.TextGlyphBuffer, ref gpu.TextGlyphBufferBytes, bytesGReq, GpuWarnGrowGlyphs, "TextGlyph");
+        GrowStorageBufferIfNeeded(ref gpu, ref gpu.ParticleInstanceBuffer, ref gpu.ParticleInstanceBufferBytes, bytesPReq, GpuWarnGrowParticles, "ParticleInstance");
 
-        if (totalNeeded == 0) return false;
+        UploadedFrameCounts desired = ComputeUploadBudget(
+            instances3D.Count, jointPalette.Length, sprites.Count, glyphs.Count, particles.Count,
+            gpu.Instance3DBufferBytes, gpu.JointPaletteBufferBytes, gpu.SpriteInstanceBufferBytes, gpu.TextGlyphBufferBytes, gpu.ParticleInstanceBufferBytes,
+            uint.MaxValue);
 
-        if (totalNeeded > gpu.UploadTransferBufferBytes)
+        if (desired.TotalBytes == 0u) return false;
+
+        if (desired.TotalBytes > gpu.UploadTransferBufferBytes)
         {
-            uint grownTb = gpu.UploadTransferBufferBytes > (uint.MaxValue / 2u) ? totalNeeded : gpu.UploadTransferBufferBytes * 2u;
-            uint newTbBytes = Math.Max(totalNeeded, grownTb);
+            uint grownTb = gpu.UploadTransferBufferBytes > (uint.MaxValue / 2u) ? desired.TotalBytes : gpu.UploadTransferBufferBytes * 2u;
+            uint newTbBytes = Math.Max(desired.TotalBytes, grownTb);
             var tbInfo = new SDL.GPUTransferBufferCreateInfo
             {
                 Usage = SDL.GPUTransferBufferUsage.Upload,
@@ -990,52 +1362,67 @@ public static unsafe class BatchRenderer
                 if (gpu.Log != null)
                     LogSystem.Warn(gpu.Log, $"GpuContext dynamically grew UploadTransferBuffer to {newTbBytes} bytes");
             }
-            else
+            else if (gpu.Log != null && TryLatchGpuWarn(ref gpu, GpuWarnGrowTransfer))
             {
-                if (gpu.Log != null)
-                    LogSystem.Warn(gpu.Log, $"GpuContext failed growing UploadTransferBuffer to {newTbBytes} bytes ({SDL.GetError()}); clamping frame upload");
-                uint rem = gpu.UploadTransferBufferBytes;
-                if (bytes3D > rem) bytes3D = (rem / (uint)sizeof(Instance3DGpu)) * (uint)sizeof(Instance3DGpu);
-                offJoints = (uint)LinearArena.AlignUp(off3D + bytes3D, 64);
-                uint remJ = rem > offJoints ? rem - offJoints : 0u;
-                if (bytesJoints > remJ) bytesJoints = (remJ / (uint)sizeof(Mat4)) * (uint)sizeof(Mat4);
-                offSprites = (uint)LinearArena.AlignUp(offJoints + bytesJoints, 64);
-                uint remS = rem > offSprites ? rem - offSprites : 0u;
-                if (bytesSprites > remS) bytesSprites = (remS / (uint)sizeof(SpriteGpuInstance)) * (uint)sizeof(SpriteGpuInstance);
-                offGlyphs = (uint)LinearArena.AlignUp(offSprites + bytesSprites, 64);
-                uint remG = rem > offGlyphs ? rem - offGlyphs : 0u;
-                if (bytesGlyphs > remG) bytesGlyphs = (remG / (uint)sizeof(GlyphGpuInstance)) * (uint)sizeof(GlyphGpuInstance);
-                offParticles = (uint)LinearArena.AlignUp(offGlyphs + bytesGlyphs, 64);
-                uint remP = rem > offParticles ? rem - offParticles : 0u;
-                if (bytesParticles > remP) bytesParticles = (remP / (uint)sizeof(ParticleGpuInstance)) * (uint)sizeof(ParticleGpuInstance);
-                totalNeeded = offParticles + bytesParticles;
-                if (totalNeeded == 0) return false;
+                LogSystem.Warn(gpu.Log, $"GpuContext failed growing UploadTransferBuffer to {newTbBytes} bytes ({SDL.GetError()}); clamping frame upload");
             }
         }
 
-        byte* mapped = (byte*)SDL.MapGPUTransferBuffer(gpu.Device, gpu.UploadTransferBuffer, cycle: true);
-        if (bytes3D > 0) Buffer.MemoryCopy(instances3D.Data, mapped + off3D, bytes3D, bytes3D);
-        if (bytesJoints > 0) Buffer.MemoryCopy(jointPalette.Ptr, mapped + offJoints, bytesJoints, bytesJoints);
-        if (bytesSprites > 0) Buffer.MemoryCopy(sprites.Data, mapped + offSprites, bytesSprites, bytesSprites);
-        if (bytesGlyphs > 0) Buffer.MemoryCopy(glyphs.Data, mapped + offGlyphs, bytesGlyphs, bytesGlyphs);
-        if (bytesParticles > 0) Buffer.MemoryCopy(particles.Data, mapped + offParticles, bytesParticles, bytesParticles);
+        UploadedFrameCounts finalBudget = ComputeUploadBudget(
+            instances3D.Count, jointPalette.Length, sprites.Count, glyphs.Count, particles.Count,
+            gpu.Instance3DBufferBytes, gpu.JointPaletteBufferBytes, gpu.SpriteInstanceBufferBytes, gpu.TextGlyphBufferBytes, gpu.ParticleInstanceBufferBytes,
+            gpu.UploadTransferBufferBytes);
+
+        if (finalBudget.TotalBytes == 0u) return false;
+
+        nint mapRaw = SDL.MapGPUTransferBuffer(gpu.Device, gpu.UploadTransferBuffer, cycle: true);
+        if (mapRaw == nint.Zero)
+        {
+            if (gpu.Log != null && TryLatchGpuWarn(ref gpu, GpuWarnMapTransfer))
+                LogSystem.Error(gpu.Log, $"SDL_MapGPUTransferBuffer failed ({SDL.GetError()}); skipping frame buffer upload");
+            return false;
+        }
+
+        byte* mapped = (byte*)mapRaw;
+        if (finalBudget.Bytes3D > 0u)
+        {
+            Buffer.MemoryCopy(instances3D.Data, mapped + finalBudget.Off3D, finalBudget.Bytes3D, finalBudget.Bytes3D);
+            // If joint palette upload was truncated/clamped, fall back skinned instances to static (-1) without mutating RenderPacket
+            if (finalBudget.Joints < (uint)jointPalette.Length)
+            {
+                Instance3DGpu* dstInst = (Instance3DGpu*)(mapped + finalBudget.Off3D);
+                for (uint i = 0; i < finalBudget.Inst3D; i++)
+                {
+                    if (dstInst[i].Extra.Z >= 0f)
+                        dstInst[i].Extra.Z = -1f;
+                }
+            }
+        }
+        if (finalBudget.BytesJoints > 0u) Buffer.MemoryCopy(jointPalette.Ptr, mapped + finalBudget.OffJoints, finalBudget.BytesJoints, finalBudget.BytesJoints);
+        if (finalBudget.BytesSprites > 0u) Buffer.MemoryCopy(sprites.Data, mapped + finalBudget.OffSprites, finalBudget.BytesSprites, finalBudget.BytesSprites);
+        if (finalBudget.BytesGlyphs > 0u) Buffer.MemoryCopy(glyphs.Data, mapped + finalBudget.OffGlyphs, finalBudget.BytesGlyphs, finalBudget.BytesGlyphs);
+        if (finalBudget.BytesParticles > 0u) Buffer.MemoryCopy(particles.Data, mapped + finalBudget.OffParticles, finalBudget.BytesParticles, finalBudget.BytesParticles);
         SDL.UnmapGPUTransferBuffer(gpu.Device, gpu.UploadTransferBuffer);
 
         nint uploadTb = gpu.UploadTransferBuffer;
         nint copy = SDL.BeginGPUCopyPass(cmd);
+        if (copy == nint.Zero) return false;
+
         void CopySub(nint dstBuf, uint srcOff, uint size)
         {
-            if (size == 0) return;
+            if (size == 0u) return;
             var src = new SDL.GPUTransferBufferLocation { TransferBuffer = uploadTb, Offset = srcOff };
             var dst = new SDL.GPUBufferRegion { Buffer = dstBuf, Offset = 0, Size = size };
             SDL.UploadToGPUBuffer(copy, in src, in dst, cycle: true);
         }
-        CopySub(gpu.Instance3DBuffer, off3D, bytes3D);
-        CopySub(gpu.JointPaletteBuffer, offJoints, bytesJoints);
-        CopySub(gpu.SpriteInstanceBuffer, offSprites, bytesSprites);
-        CopySub(gpu.TextGlyphBuffer, offGlyphs, bytesGlyphs);
-        CopySub(gpu.ParticleInstanceBuffer, offParticles, bytesParticles);
+        CopySub(gpu.Instance3DBuffer, finalBudget.Off3D, finalBudget.Bytes3D);
+        CopySub(gpu.JointPaletteBuffer, finalBudget.OffJoints, finalBudget.BytesJoints);
+        CopySub(gpu.SpriteInstanceBuffer, finalBudget.OffSprites, finalBudget.BytesSprites);
+        CopySub(gpu.TextGlyphBuffer, finalBudget.OffGlyphs, finalBudget.BytesGlyphs);
+        CopySub(gpu.ParticleInstanceBuffer, finalBudget.OffParticles, finalBudget.BytesParticles);
         SDL.EndGPUCopyPass(copy);
+
+        uploaded = finalBudget;
         return true;
     }
 
@@ -1043,6 +1430,7 @@ public static unsafe class BatchRenderer
         in RenderShaderDefaults shaders,
         in EngineWorld world,
         in CameraData cam,
+        int availableJointCount,
         ref LinearArena scratchArena,
         ref NativeList<Instance3DGpu> outInstances,
         ref NativeList<Batch3DCmd> outBatches,
@@ -1082,17 +1470,27 @@ public static unsafe class BatchRenderer
                     : mr.Tint;
 
                 int texSlot = -1;
+                uint texGen = 0u;
                 if (mat != null && mat->BaseColorTexture.IsValid)
                 {
                     TextureAssetData* tex = AssetSystem.TryGetTexture(in world.Assets, mat->BaseColorTexture);
-                    if (tex != null) texSlot = tex->GpuSlot;
+                    if (tex != null)
+                    {
+                        texSlot = tex->GpuSlot;
+                        texGen = tex->GpuSlotGen;
+                    }
                 }
 
                 int jointOff = -1;
-                if (mesh->HasSkinning != 0)
+                if (mesh->HasSkinning != 0 && availableJointCount > 0)
                 {
                     AnimPlayerData* ap = AnimationSystem.TryGetPlayer(in world.Animations, mr.AnimPlayer);
-                    if (ap != null && ap->FrameJointCount > 0) jointOff = ap->FrameJointOffset;
+                    if (ap != null && ap->FrameJointCount > 0 &&
+                        ap->FrameJointOffset >= 0 &&
+                        ap->FrameJointOffset + ap->FrameJointCount <= availableJointCount)
+                    {
+                        jointOff = ap->FrameJointOffset;
+                    }
                 }
 
                 MaterialAlphaMode alphaMode = mat != null ? mat->AlphaMode : MaterialAlphaMode.Opaque;
@@ -1110,7 +1508,9 @@ public static unsafe class BatchRenderer
                     SortKey = key,
                     OriginalIndex = i,
                     MeshGpuSlot = mesh->GpuSlot,
+                    MeshGpuGen = mesh->GpuSlotGen,
                     TextureGpuSlot = texSlot,
+                    TextureGpuGen = texGen,
                     Shader = shader,
                     AlphaMode = alphaMode,
                     DoubleSided = doubleSided,
@@ -1134,7 +1534,7 @@ public static unsafe class BatchRenderer
             {
                 if (outInstances.Count >= outInstances.Capacity || outBatches.Count >= outBatches.Capacity)
                 {
-                    if (log != null)
+                    if (TryLatchExtractWarn(log, ExtractWarnCap3D))
                         LogSystem.Warn(log, $"BatchRenderer.GatherAndBatch3D capacity cap reached (instances={outInstances.Count}/{outInstances.Capacity}, batches={outBatches.Count}/{outBatches.Capacity})");
                     break;
                 }
@@ -1148,7 +1548,9 @@ public static unsafe class BatchRenderer
                        items[idx].DoubleSided == first.DoubleSided &&
                        items[idx].Shader == first.Shader &&
                        items[idx].TextureGpuSlot == first.TextureGpuSlot &&
+                       items[idx].TextureGpuGen == first.TextureGpuGen &&
                        items[idx].MeshGpuSlot == first.MeshGpuSlot &&
+                       items[idx].MeshGpuGen == first.MeshGpuGen &&
                        outInstances.Count < outInstances.Capacity)
                 {
                     outInstances.Add(items[idx].Instance);
@@ -1161,7 +1563,9 @@ public static unsafe class BatchRenderer
                     outBatches.Add(new Batch3DCmd
                     {
                         MeshGpuSlot = first.MeshGpuSlot,
+                        MeshGpuGen = first.MeshGpuGen,
                         TextureGpuSlot = first.TextureGpuSlot,
+                        TextureGpuGen = first.TextureGpuGen,
                         Shader = first.Shader,
                         AlphaMode = first.AlphaMode,
                         DoubleSided = first.DoubleSided,
@@ -1248,19 +1652,25 @@ public static unsafe class BatchRenderer
                 if (sp.FlipY != 0) { uv.Y += uv.W; uv.W = -uv.W; }
 
                 int texSlot = -1;
+                uint texGen = 0u;
                 TextureAssetData* tex = null;
                 if (sp.Texture.IsValid)
                 {
                     tex = AssetSystem.TryGetTexture(in world.Assets, sp.Texture);
-                    if (tex != null) texSlot = tex->GpuSlot;
+                    if (tex != null)
+                    {
+                        texSlot = tex->GpuSlot;
+                        texGen = tex->GpuSlotGen;
+                    }
                 }
 
                 ShaderHandle sh = sp.CustomShader.IsValid ? sp.CustomShader : shaders.Sprite;
+                byte depthTest = sp.DepthTest != 0 ? (byte)1 : (byte)0;
                 uint sortLayerU = (uint)(sp.SortingLayer + 32768);
                 uint orderU = (uint)(sp.OrderInLayer + 32768);
                 ulong key = ((ulong)sortLayerU << 48)
                           | ((ulong)orderU << 32)
-                          | ((ulong)sp.DepthTest << 30)
+                          | ((ulong)depthTest << 30)
                           | ((ulong)sp.BlendMode << 28)
                           | ((ulong)(sh.Raw & 0xFFFu) << 16)
                           | ((ulong)((uint)(texSlot + 1) & 0xFFFFu));
@@ -1287,9 +1697,10 @@ public static unsafe class BatchRenderer
                         SortKey = key,
                         OriginalIndex = i * 9,
                         TextureGpuSlot = texSlot,
+                        TextureGpuGen = texGen,
                         Shader = sh,
                         BlendMode = sp.BlendMode,
-                        DepthTest = sp.DepthTest,
+                        DepthTest = depthTest,
                         Instance = new SpriteGpuInstance
                         {
                             Model = quadMat,
@@ -1301,7 +1712,7 @@ public static unsafe class BatchRenderer
                 }
                 else
                 {
-                    EmitNineSliceSubQuads(in sp, tex, origin, right, up, fwd, uv, cp, key, i * 9, texSlot, sh, ref items);
+                    EmitNineSliceSubQuads(in sp, tex, origin, right, up, fwd, uv, cp, key, i * 9, texSlot, texGen, depthTest, sh, ref items);
                 }
             }
 
@@ -1313,7 +1724,7 @@ public static unsafe class BatchRenderer
             {
                 if (outSprites.Count >= outSprites.Capacity || outBatches.Count >= outBatches.Capacity)
                 {
-                    if (log != null)
+                    if (TryLatchExtractWarn(log, ExtractWarnCapSprites))
                         LogSystem.Warn(log, $"BatchRenderer.GatherAndBatchSprites capacity cap reached (sprites={outSprites.Count}/{outSprites.Capacity}, batches={outBatches.Count}/{outBatches.Capacity})");
                     break;
                 }
@@ -1324,6 +1735,7 @@ public static unsafe class BatchRenderer
 
                 while (idx < items.Count &&
                        items[idx].TextureGpuSlot == first.TextureGpuSlot &&
+                       items[idx].TextureGpuGen == first.TextureGpuGen &&
                        items[idx].Shader == first.Shader &&
                        items[idx].BlendMode == first.BlendMode &&
                        items[idx].DepthTest == first.DepthTest &&
@@ -1339,6 +1751,7 @@ public static unsafe class BatchRenderer
                     outBatches.Add(new SpriteBatchCmd
                     {
                         TextureGpuSlot = first.TextureGpuSlot,
+                        TextureGpuGen = first.TextureGpuGen,
                         Shader = first.Shader,
                         BlendMode = first.BlendMode,
                         DepthTest = first.DepthTest,
@@ -1371,6 +1784,8 @@ public static unsafe class BatchRenderer
         ulong sortKey,
         int baseOrigIdx,
         int texSlot,
+        uint texGen,
+        byte depthTest,
         ShaderHandle sh,
         ref NativeList<SpriteSortItem> items)
     {
@@ -1476,9 +1891,10 @@ public static unsafe class BatchRenderer
                     SortKey = sortKey,
                     OriginalIndex = baseOrigIdx + subIdx++,
                     TextureGpuSlot = texSlot,
+                    TextureGpuGen = texGen,
                     Shader = sh,
                     BlendMode = sp.BlendMode,
-                    DepthTest = sp.DepthTest,
+                    DepthTest = depthTest,
                     Instance = new SpriteGpuInstance
                     {
                         Model = subMat,
@@ -1524,9 +1940,10 @@ public static unsafe class BatchRenderer
                 {
                     TextIndex = i,
                     AtlasTexGpuSlot = atlas->GpuSlot,
+                    AtlasTexGpuGen = atlas->GpuSlotGen,
                     Shader = sh,
                     SortingOrder = td.SortingOrder,
-                    DepthTest = td.DepthTest,
+                    DepthTest = td.DepthTest != 0 ? (byte)1 : (byte)0,
                 });
             }
 
@@ -1538,7 +1955,7 @@ public static unsafe class BatchRenderer
             {
                 if (outGlyphs.Count >= outGlyphs.Capacity || outBatches.Count >= outBatches.Capacity)
                 {
-                    if (log != null)
+                    if (TryLatchExtractWarn(log, ExtractWarnCapText))
                         LogSystem.Warn(log, $"BatchRenderer.GatherAndBatchText capacity cap reached (glyphs={outGlyphs.Count}/{outGlyphs.Capacity}, batches={outBatches.Count}/{outBatches.Capacity})");
                     break;
                 }
@@ -1555,7 +1972,10 @@ public static unsafe class BatchRenderer
                 if (outBatches.Count > batchStart)
                 {
                     ref TextBatchCmd prev = ref outBatches[outBatches.Count - 1];
-                    if (prev.AtlasTexGpuSlot == item.AtlasTexGpuSlot && prev.Shader == item.Shader && prev.DepthTest == item.DepthTest)
+                    if (prev.AtlasTexGpuSlot == item.AtlasTexGpuSlot &&
+                        prev.AtlasTexGpuGen == item.AtlasTexGpuGen &&
+                        prev.Shader == item.Shader &&
+                        prev.DepthTest == item.DepthTest)
                     {
                         prev.InstanceCount += (uint)emitted;
                         stats.GlyphInstances += emitted;
@@ -1568,6 +1988,7 @@ public static unsafe class BatchRenderer
                     outBatches.Add(new TextBatchCmd
                     {
                         AtlasTexGpuSlot = item.AtlasTexGpuSlot,
+                        AtlasTexGpuGen = item.AtlasTexGpuGen,
                         Shader = item.Shader,
                         DepthTest = item.DepthTest,
                         BaseInstance = baseGlyph,
@@ -1632,7 +2053,7 @@ public static unsafe class BatchRenderer
             int avail = outParticles.Capacity - outParticles.Count;
             if (avail <= 0)
             {
-                if (log != null)
+                if (TryLatchExtractWarn(log, ExtractWarnCapParticles))
                     LogSystem.Warn(log, $"BatchRenderer.GatherAndBatchParticles capacity cap reached ({outParticles.Count}/{outParticles.Capacity})");
                 return;
             }
@@ -1651,7 +2072,7 @@ public static unsafe class BatchRenderer
                 running += take;
             }
 
-            if (running < totalVisible && log != null)
+            if (running < totalVisible && TryLatchExtractWarn(log, ExtractWarnCapParticles))
                 LogSystem.Warn(log, $"BatchRenderer.GatherAndBatchParticles capacity cap reached ({baseOut + running}/{outParticles.Capacity})");
             if (running == 0) return;
 
@@ -1689,24 +2110,29 @@ public static unsafe class BatchRenderer
                 if (count <= 0) continue;
                 if (outBatches.Count >= outBatches.Capacity)
                 {
-                    if (log != null)
+                    if (TryLatchExtractWarn(log, ExtractWarnCapParticleBatches))
                         LogSystem.Warn(log, $"BatchRenderer.GatherAndBatchParticles batch cap reached ({outBatches.Count}/{outBatches.Capacity})");
                     break;
                 }
 
                 ref readonly ParticleEmitterData em = ref pt.Emitters[es];
                 int texSlot = -1;
+                uint texGen = 0u;
                 if (em.Texture.IsValid)
                 {
                     TextureAssetData* tex = AssetSystem.TryGetTexture(in world.Assets, em.Texture);
-                    if (tex != null) texSlot = tex->GpuSlot;
+                    if (tex != null)
+                    {
+                        texSlot = tex->GpuSlot;
+                        texGen = tex->GpuSlotGen;
+                    }
                 }
 
                 ShaderHandle sh = em.CustomShader.IsValid ? em.CustomShader : shaders.Particle;
                 if (outBatches.Count > batchStart)
                 {
                     ref ParticleBatchCmd prev = ref outBatches[outBatches.Count - 1];
-                    if (prev.TextureGpuSlot == texSlot && prev.Shader == sh && prev.BlendMode == em.BlendMode)
+                    if (prev.TextureGpuSlot == texSlot && prev.TextureGpuGen == texGen && prev.Shader == sh && prev.BlendMode == em.BlendMode)
                     {
                         prev.InstanceCount += (uint)count;
                         stats.ParticleInstances += count;
@@ -1717,6 +2143,7 @@ public static unsafe class BatchRenderer
                 outBatches.Add(new ParticleBatchCmd
                 {
                     TextureGpuSlot = texSlot,
+                    TextureGpuGen = texGen,
                     Shader = sh,
                     BlendMode = em.BlendMode,
                     BaseInstance = (uint)starts[es],
@@ -1741,9 +2168,12 @@ public static unsafe class BatchRenderer
     public static Mat4 ComputeDirectionalLightViewProj(in SceneLighting lighting, uint shadowMapSize)
     {
         Vec3 sunDir = lighting.SunDirection.Normalized();
-        if (sunDir.LengthSq() < 1e-6f) sunDir = new Vec3(0.45f, 0.85f, 0.35f).Normalized();
+        if (!(sunDir.LengthSq() >= 1e-6f) || !float.IsFinite(sunDir.X) || !float.IsFinite(sunDir.Y) || !float.IsFinite(sunDir.Z))
+            sunDir = new Vec3(0.45f, 0.85f, 0.35f).Normalized();
 
-        float halfExtent = lighting.ShadowDistance > 0.001f ? MathF.Max(lighting.ShadowDistance, 0.25f) : 28f;
+        float halfExtent = (float.IsFinite(lighting.ShadowDistance) && lighting.ShadowDistance > 0.001f)
+            ? MathF.Max(lighting.ShadowDistance, 0.25f)
+            : 28f;
         uint mapSize = shadowMapSize >= 256u ? shadowMapSize : 2048u;
 
         Vec3 refUp = DetMath.Abs(Vec3.Dot(sunDir, Vec3.UnitY)) > 0.98f ? Vec3.UnitZ : Vec3.UnitY;
@@ -1754,32 +2184,42 @@ public static unsafe class BatchRenderer
         // Snap center along light right/up axes to exact shadow texel increments to prevent shimmer
         float texelWorld = (2f * halfExtent) / mapSize;
         Vec3 center = lighting.ShadowCenter;
+        if (!float.IsFinite(center.X) || !float.IsFinite(center.Y) || !float.IsFinite(center.Z))
+            center = Vec3.Zero;
         float sx = MathF.Round(Vec3.Dot(center, right) / texelWorld) * texelWorld;
         float sy = MathF.Round(Vec3.Dot(center, lightUp) / texelWorld) * texelWorld;
         float sz = Vec3.Dot(center, forward);
         Vec3 snappedCenter = right * sx + lightUp * sy + forward * sz;
 
         float pullBack = halfExtent * 2.0f;
+        float nearPlane = MathF.Min(0.5f, pullBack * 0.1f);
         Vec3 eye = snappedCenter + sunDir * pullBack;
         Mat4 lightView = Mat4.CreateLookAt(eye, snappedCenter, lightUp);
-        Mat4 lightProj = Mat4.CreateOrtho(-halfExtent, halfExtent, -halfExtent, halfExtent, 0.5f, pullBack * 2.25f);
+        Mat4 lightProj = Mat4.CreateOrtho(-halfExtent, halfExtent, -halfExtent, halfExtent, nearPlane, pullBack * 2.25f);
         return Mat4.Multiply(in lightProj, in lightView);
     }
 
     private static void GatherShadowCasters3D(
         in EngineWorld world,
         in SceneLighting lighting,
+        int availableJointCount,
+        int instanceLimit,
         ref LinearArena scratchArena,
         ref NativeList<Instance3DGpu> outInstances,
         ref NativeList<Batch3DCmd> outShadowBatches,
         LogState* log = null)
     {
         int count = world.RenderComponents.MeshRendererCount;
-        if (count == 0) return;
+        if (count == 0 || instanceLimit <= 0) return;
 
-        float halfExtent = lighting.ShadowDistance > 0.001f ? MathF.Max(lighting.ShadowDistance, 0.25f) : 28f;
+        int maxOutCount = Math.Min(outInstances.Capacity, outInstances.Count + instanceLimit);
+        float halfExtent = (float.IsFinite(lighting.ShadowDistance) && lighting.ShadowDistance > 0.001f)
+            ? MathF.Max(lighting.ShadowDistance, 0.25f)
+            : 28f;
         float maxRadius = halfExtent * 1.85f;
         Vec3 shadowCenter = lighting.ShadowCenter;
+        if (!float.IsFinite(shadowCenter.X) || !float.IsFinite(shadowCenter.Y) || !float.IsFinite(shadowCenter.Z))
+            shadowCenter = Vec3.Zero;
 
         ArenaMarker mark = scratchArena.SaveMarker();
         try
@@ -1809,20 +2249,30 @@ public static unsafe class BatchRenderer
                 if (distSq > cullR * cullR) continue;
 
                 int jointOff = -1;
-                if (mesh->HasSkinning != 0)
+                if (mesh->HasSkinning != 0 && availableJointCount > 0)
                 {
                     AnimPlayerData* ap = AnimationSystem.TryGetPlayer(in world.Animations, mr.AnimPlayer);
-                    if (ap != null && ap->FrameJointCount > 0) jointOff = ap->FrameJointOffset;
+                    if (ap != null && ap->FrameJointCount > 0 &&
+                        ap->FrameJointOffset >= 0 &&
+                        ap->FrameJointOffset + ap->FrameJointCount <= availableJointCount)
+                    {
+                        jointOff = ap->FrameJointOffset;
+                    }
                 }
 
                 MaterialAlphaMode shadowAlphaMode = (mat != null && mat->AlphaMode == MaterialAlphaMode.Mask)
                     ? MaterialAlphaMode.Mask : MaterialAlphaMode.Opaque;
                 byte doubleSided = (mat != null && mat->DoubleSided != 0) ? (byte)1 : (byte)0;
                 int texSlot = -1;
+                uint texGen = 0u;
                 if (shadowAlphaMode == MaterialAlphaMode.Mask && mat != null && mat->BaseColorTexture.IsValid)
                 {
                     TextureAssetData* tex = AssetSystem.TryGetTexture(in world.Assets, mat->BaseColorTexture);
-                    if (tex != null) texSlot = tex->GpuSlot;
+                    if (tex != null)
+                    {
+                        texSlot = tex->GpuSlot;
+                        texGen = tex->GpuSlotGen;
+                    }
                 }
                 float alphaCutoff = shadowAlphaMode == MaterialAlphaMode.Mask && mat != null ? mat->AlphaCutoff : 0f;
                 float baseAlpha = mat != null ? mat->BaseColorFactor.A * mr.Tint.A : mr.Tint.A;
@@ -1837,7 +2287,9 @@ public static unsafe class BatchRenderer
                     SortKey = key,
                     OriginalIndex = i,
                     MeshGpuSlot = mesh->GpuSlot,
+                    MeshGpuGen = mesh->GpuSlotGen,
                     TextureGpuSlot = texSlot,
+                    TextureGpuGen = texGen,
                     AlphaMode = shadowAlphaMode,
                     DoubleSided = doubleSided,
                     Instance = new Instance3DGpu
@@ -1856,10 +2308,10 @@ public static unsafe class BatchRenderer
             int idx = 0;
             while (idx < items.Count)
             {
-                if (outInstances.Count >= outInstances.Capacity || outShadowBatches.Count >= outShadowBatches.Capacity)
+                if (outInstances.Count >= maxOutCount || outShadowBatches.Count >= outShadowBatches.Capacity)
                 {
-                    if (log != null)
-                        LogSystem.Warn(log, $"BatchRenderer.GatherShadowCasters3D capacity cap reached (instances={outInstances.Count}/{outInstances.Capacity}, shadowBatches={outShadowBatches.Count}/{outShadowBatches.Capacity})");
+                    if (TryLatchExtractWarn(log, ExtractWarnCapShadows))
+                        LogSystem.Warn(log, $"BatchRenderer.GatherShadowCasters3D capacity cap reached (instances={outInstances.Count}/{maxOutCount}, shadowBatches={outShadowBatches.Count}/{outShadowBatches.Capacity})");
                     break;
                 }
 
@@ -1871,8 +2323,10 @@ public static unsafe class BatchRenderer
                        items[idx].AlphaMode == first.AlphaMode &&
                        items[idx].DoubleSided == first.DoubleSided &&
                        items[idx].TextureGpuSlot == first.TextureGpuSlot &&
+                       items[idx].TextureGpuGen == first.TextureGpuGen &&
                        items[idx].MeshGpuSlot == first.MeshGpuSlot &&
-                       outInstances.Count < outInstances.Capacity)
+                       items[idx].MeshGpuGen == first.MeshGpuGen &&
+                       outInstances.Count < maxOutCount)
                 {
                     outInstances.Add(items[idx].Instance);
                     instCount++;
@@ -1884,7 +2338,9 @@ public static unsafe class BatchRenderer
                     outShadowBatches.Add(new Batch3DCmd
                     {
                         MeshGpuSlot = first.MeshGpuSlot,
+                        MeshGpuGen = first.MeshGpuGen,
                         TextureGpuSlot = first.TextureGpuSlot,
+                        TextureGpuGen = first.TextureGpuGen,
                         Shader = ShaderHandle.Invalid,
                         AlphaMode = first.AlphaMode,
                         DoubleSided = first.DoubleSided,
@@ -1901,11 +2357,11 @@ public static unsafe class BatchRenderer
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void BindFragmentTexture(nint pass, in GpuContext gpu, int texSlot)
+    private static void BindFragmentTexture(nint pass, in GpuContext gpu, int texSlot, uint texGen)
     {
         nint tex = gpu.DefaultWhiteTexture;
         nint samp = gpu.SamplerLinearWrap;
-        if (texSlot >= 0 && texSlot < gpu.MaxTextures && gpu.Textures[texSlot].Alive != 0)
+        if (IsTextureSlotValid(in gpu, texSlot, texGen))
         {
             ref GpuTextureSlot gt = ref gpu.Textures[texSlot];
             tex = gt.Texture;
@@ -1917,11 +2373,11 @@ public static unsafe class BatchRenderer
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void BindFragmentTextureAndShadow(nint pass, in GpuContext gpu, int texSlot, bool shadowsRendered)
+    private static void BindFragmentTextureAndShadow(nint pass, in GpuContext gpu, int texSlot, uint texGen, bool shadowsRendered)
     {
         nint tex = gpu.DefaultWhiteTexture;
         nint samp = gpu.SamplerLinearWrap;
-        if (texSlot >= 0 && texSlot < gpu.MaxTextures && gpu.Textures[texSlot].Alive != 0)
+        if (IsTextureSlotValid(in gpu, texSlot, texGen))
         {
             ref GpuTextureSlot gt = ref gpu.Textures[texSlot];
             tex = gt.Texture;
@@ -1995,27 +2451,51 @@ public static unsafe class BatchRenderer
     private static bool Greater3D(in Draw3DSortItem a, ulong pivotKey, int pivotIdx)
         => a.SortKey > pivotKey || (a.SortKey == pivotKey && a.OriginalIndex > pivotIdx);
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int MedianOfThree3D(Draw3DSortItem* arr, int a, int b, int c)
+    {
+        if (Less3D(in arr[a], arr[b].SortKey, arr[b].OriginalIndex))
+        {
+            if (Less3D(in arr[b], arr[c].SortKey, arr[c].OriginalIndex)) return b;
+            return Less3D(in arr[a], arr[c].SortKey, arr[c].OriginalIndex) ? c : a;
+        }
+        if (Less3D(in arr[a], arr[c].SortKey, arr[c].OriginalIndex)) return a;
+        return Less3D(in arr[b], arr[c].SortKey, arr[c].OriginalIndex) ? c : b;
+    }
+
     private static void Sort3DItems(Draw3DSortItem* arr, int lo, int hi)
     {
-        if (lo >= hi) return;
-        int mid = (lo + hi) >> 1;
-        ulong pKey = arr[mid].SortKey;
-        int pIdx = arr[mid].OriginalIndex;
-        int i = lo, j = hi;
-        while (i <= j)
+        while (lo < hi)
         {
-            while (Less3D(in arr[i], pKey, pIdx)) i++;
-            while (Greater3D(in arr[j], pKey, pIdx)) j--;
-            if (i <= j)
+            int mid = lo + ((hi - lo) >> 1);
+            int pPos = MedianOfThree3D(arr, lo, mid, hi);
+            ulong pKey = arr[pPos].SortKey;
+            int pIdx = arr[pPos].OriginalIndex;
+            int i = lo, j = hi;
+            while (i <= j)
             {
-                Draw3DSortItem tmp = arr[i];
-                arr[i] = arr[j];
-                arr[j] = tmp;
-                i++; j--;
+                while (Less3D(in arr[i], pKey, pIdx)) i++;
+                while (Greater3D(in arr[j], pKey, pIdx)) j--;
+                if (i <= j)
+                {
+                    Draw3DSortItem tmp = arr[i];
+                    arr[i] = arr[j];
+                    arr[j] = tmp;
+                    i++;
+                    j--;
+                }
+            }
+            if (j - lo < hi - i)
+            {
+                if (lo < j) Sort3DItems(arr, lo, j);
+                lo = i;
+            }
+            else
+            {
+                if (i < hi) Sort3DItems(arr, i, hi);
+                hi = j;
             }
         }
-        if (lo < j) Sort3DItems(arr, lo, j);
-        if (i < hi) Sort3DItems(arr, i, hi);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -2029,29 +2509,55 @@ public static unsafe class BatchRenderer
         if (c != 0) return c;
         c = a.AtlasTexGpuSlot.CompareTo(b.AtlasTexGpuSlot);
         if (c != 0) return c;
+        c = a.AtlasTexGpuGen.CompareTo(b.AtlasTexGpuGen);
+        if (c != 0) return c;
         return a.TextIndex.CompareTo(b.TextIndex);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int MedianOfThreeText(TextSortItem* arr, int a, int b, int c)
+    {
+        if (CompareTextItem(in arr[a], in arr[b]) < 0)
+        {
+            if (CompareTextItem(in arr[b], in arr[c]) < 0) return b;
+            return CompareTextItem(in arr[a], in arr[c]) < 0 ? c : a;
+        }
+        if (CompareTextItem(in arr[a], in arr[c]) < 0) return a;
+        return CompareTextItem(in arr[b], in arr[c]) < 0 ? c : b;
     }
 
     private static void SortTextItems(TextSortItem* arr, int lo, int hi)
     {
-        if (lo >= hi) return;
-        int mid = (lo + hi) >> 1;
-        TextSortItem pivot = arr[mid];
-        int i = lo, j = hi;
-        while (i <= j)
+        while (lo < hi)
         {
-            while (CompareTextItem(in arr[i], in pivot) < 0) i++;
-            while (CompareTextItem(in arr[j], in pivot) > 0) j--;
-            if (i <= j)
+            int mid = lo + ((hi - lo) >> 1);
+            int pPos = MedianOfThreeText(arr, lo, mid, hi);
+            TextSortItem pivot = arr[pPos];
+            int i = lo, j = hi;
+            while (i <= j)
             {
-                TextSortItem tmp = arr[i];
-                arr[i] = arr[j];
-                arr[j] = tmp;
-                i++; j--;
+                while (CompareTextItem(in arr[i], in pivot) < 0) i++;
+                while (CompareTextItem(in arr[j], in pivot) > 0) j--;
+                if (i <= j)
+                {
+                    TextSortItem tmp = arr[i];
+                    arr[i] = arr[j];
+                    arr[j] = tmp;
+                    i++;
+                    j--;
+                }
+            }
+            if (j - lo < hi - i)
+            {
+                if (lo < j) SortTextItems(arr, lo, j);
+                lo = i;
+            }
+            else
+            {
+                if (i < hi) SortTextItems(arr, i, hi);
+                hi = j;
             }
         }
-        if (lo < j) SortTextItems(arr, lo, j);
-        if (i < hi) SortTextItems(arr, i, hi);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -2062,26 +2568,50 @@ public static unsafe class BatchRenderer
     private static bool GreaterSprite(in SpriteSortItem a, ulong pivotKey, int pivotIdx)
         => a.SortKey > pivotKey || (a.SortKey == pivotKey && a.OriginalIndex > pivotIdx);
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int MedianOfThreeSprite(SpriteSortItem* arr, int a, int b, int c)
+    {
+        if (LessSprite(in arr[a], arr[b].SortKey, arr[b].OriginalIndex))
+        {
+            if (LessSprite(in arr[b], arr[c].SortKey, arr[c].OriginalIndex)) return b;
+            return LessSprite(in arr[a], arr[c].SortKey, arr[c].OriginalIndex) ? c : a;
+        }
+        if (LessSprite(in arr[a], arr[c].SortKey, arr[c].OriginalIndex)) return a;
+        return LessSprite(in arr[b], arr[c].SortKey, arr[c].OriginalIndex) ? c : b;
+    }
+
     private static void SortSpriteItems(SpriteSortItem* arr, int lo, int hi)
     {
-        if (lo >= hi) return;
-        int mid = (lo + hi) >> 1;
-        ulong pKey = arr[mid].SortKey;
-        int pIdx = arr[mid].OriginalIndex;
-        int i = lo, j = hi;
-        while (i <= j)
+        while (lo < hi)
         {
-            while (LessSprite(in arr[i], pKey, pIdx)) i++;
-            while (GreaterSprite(in arr[j], pKey, pIdx)) j--;
-            if (i <= j)
+            int mid = lo + ((hi - lo) >> 1);
+            int pPos = MedianOfThreeSprite(arr, lo, mid, hi);
+            ulong pKey = arr[pPos].SortKey;
+            int pIdx = arr[pPos].OriginalIndex;
+            int i = lo, j = hi;
+            while (i <= j)
             {
-                SpriteSortItem tmp = arr[i];
-                arr[i] = arr[j];
-                arr[j] = tmp;
-                i++; j--;
+                while (LessSprite(in arr[i], pKey, pIdx)) i++;
+                while (GreaterSprite(in arr[j], pKey, pIdx)) j--;
+                if (i <= j)
+                {
+                    SpriteSortItem tmp = arr[i];
+                    arr[i] = arr[j];
+                    arr[j] = tmp;
+                    i++;
+                    j--;
+                }
+            }
+            if (j - lo < hi - i)
+            {
+                if (lo < j) SortSpriteItems(arr, lo, j);
+                lo = i;
+            }
+            else
+            {
+                if (i < hi) SortSpriteItems(arr, i, hi);
+                hi = j;
             }
         }
-        if (lo < j) SortSpriteItems(arr, lo, j);
-        if (i < hi) SortSpriteItems(arr, i, hi);
     }
 }

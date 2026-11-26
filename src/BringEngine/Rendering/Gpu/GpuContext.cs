@@ -1,12 +1,15 @@
 using System;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 using BringEngine.Assets;
 using BringEngine.Assets.Compression;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Logging;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
+using BringEngine.Core.Threading;
 using SDL3;
 using StbImageWriteSharp;
 
@@ -147,14 +150,29 @@ public unsafe struct GpuContext
 
     // Resource pools (allocated in Persistent arena)
     public GpuMeshSlot* Meshes;
+    public uint* MeshSlotGens;
+    public byte* MeshSlotPendingRelease;
     public int MaxMeshes;
 
     public GpuTextureSlot* Textures;
+    public uint* TextureSlotGens;
+    public byte* TextureSlotPendingRelease;
     public int MaxTextures;
 
     public GpuShaderSlot* Shaders;
     public uint* ShaderGens;
     public int MaxShaders;
+
+    // Spinlock-protected deferred GPU release queues (Logic Thread enqueues; Main Thread drains via FlushDeferredReleases)
+    public int* DeferredMeshSlots;
+    public int DeferredMeshCount;
+    public int DeferredMeshCap;
+
+    public int* DeferredTextureSlots;
+    public int DeferredTextureCount;
+    public int DeferredTextureCap;
+
+    public CachePaddedInt DeferredReleaseLock;
 
     // Built-in engine shader handles
     public ShaderHandle BuiltinPbrShader;
@@ -165,12 +183,42 @@ public unsafe struct GpuContext
     public LogState* Log;
     public RenderStats LastFrameStats;
     public SDL.GPUPresentMode ActivePresentMode;
+    public uint WarnedCapsMask;
     public byte VSyncEnabled;
     public byte Initialized;
 }
 
 public static unsafe class GpuSystem
 {
+    /// <summary>
+    /// Initializes a pinned <see cref="GpuContext"/> in-place and automatically binds deferred GPU cleanup hooks onto
+    /// <paramref name="assets"/>. Recommended canonical entry point for all games and tests.
+    /// </summary>
+    public static void Init(
+        GpuContext* ctx,
+        nint window,
+        ref LinearArena persistentArena,
+        ref AssetRegistry assets,
+        bool debugMode = false,
+        int maxMeshes = 1024,
+        int maxTextures = 512,
+        int maxShaders = 64,
+        LogState* log = null)
+    {
+        if (ctx == null) throw new ArgumentNullException(nameof(ctx));
+        *ctx = CreateCore(window, ref persistentArena, debugMode, maxMeshes, maxTextures, maxShaders, log);
+        BindAssetCleanupHooks(ctx, ref assets);
+    }
+
+    /// <summary>
+    /// Creates a <see cref="GpuContext"/> value without binding <paramref name="assets"/> cleanup hooks automatically.
+    /// </summary>
+    /// <remarks>
+    /// Prefer <see cref="Init(GpuContext*, nint, ref LinearArena, ref AssetRegistry, bool, int, int, int, LogState*)"/>
+    /// with a pinned <see cref="GpuContext"/> pointer so asset cleanup hooks are always bound safely.
+    /// If using <see cref="Create"/>, callers must pin the returned struct and call
+    /// <see cref="BindAssetCleanupHooks(GpuContext*, ref AssetRegistry)"/>.
+    /// </remarks>
     public static GpuContext Create(
         nint window,
         ref LinearArena persistentArena,
@@ -181,6 +229,23 @@ public static unsafe class GpuSystem
         int maxShaders = 64,
         LogState* log = null)
     {
+        _ = assets.MaxMeshes;
+        return CreateCore(window, ref persistentArena, debugMode, maxMeshes, maxTextures, maxShaders, log);
+    }
+
+    private static GpuContext CreateCore(
+        nint window,
+        ref LinearArena persistentArena,
+        bool debugMode,
+        int maxMeshes,
+        int maxTextures,
+        int maxShaders,
+        LogState* log)
+    {
+        if (maxMeshes < 1) throw new ArgumentOutOfRangeException(nameof(maxMeshes));
+        if (maxTextures < 1) throw new ArgumentOutOfRangeException(nameof(maxTextures));
+        if (maxShaders < 1) throw new ArgumentOutOfRangeException(nameof(maxShaders));
+
         if (!ShaderCross.Init())
         {
             string err = SDL.GetError();
@@ -216,6 +281,16 @@ public static unsafe class GpuSystem
 
             SDL.GPUTextureFormat swapFmt = SDL.GetGPUSwapchainTextureFormat(device, window);
 
+            uint* meshSlotGens = persistentArena.AllocUninitialized<uint>(maxMeshes, 16);
+            for (int i = 0; i < maxMeshes; i++) meshSlotGens[i] = 1;
+            byte* meshPending = persistentArena.Alloc<byte>(maxMeshes, 16);
+            int* deferredMeshes = persistentArena.AllocUninitialized<int>(maxMeshes, 16);
+
+            uint* texSlotGens = persistentArena.AllocUninitialized<uint>(maxTextures, 16);
+            for (int i = 0; i < maxTextures; i++) texSlotGens[i] = 1;
+            byte* texPending = persistentArena.Alloc<byte>(maxTextures, 16);
+            int* deferredTextures = persistentArena.AllocUninitialized<int>(maxTextures, 16);
+
             uint* shaderGens = persistentArena.AllocUninitialized<uint>(maxShaders, 16);
             for (int i = 0; i < maxShaders; i++) shaderGens[i] = 1;
 
@@ -233,12 +308,23 @@ public static unsafe class GpuSystem
                 DepthFormat = SDL.GPUTextureFormat.D32Float,
                 ShadowMapSupported = (byte)(shadowSupported ? 1 : 0),
                 Meshes = persistentArena.Alloc<GpuMeshSlot>(maxMeshes, 64),
+                MeshSlotGens = meshSlotGens,
+                MeshSlotPendingRelease = meshPending,
                 MaxMeshes = maxMeshes,
                 Textures = persistentArena.Alloc<GpuTextureSlot>(maxTextures, 64),
+                TextureSlotGens = texSlotGens,
+                TextureSlotPendingRelease = texPending,
                 MaxTextures = maxTextures,
                 Shaders = persistentArena.Alloc<GpuShaderSlot>(maxShaders, 64),
                 ShaderGens = shaderGens,
                 MaxShaders = maxShaders,
+                DeferredMeshSlots = deferredMeshes,
+                DeferredMeshCount = 0,
+                DeferredMeshCap = maxMeshes,
+                DeferredTextureSlots = deferredTextures,
+                DeferredTextureCount = 0,
+                DeferredTextureCap = maxTextures,
+                DeferredReleaseLock = default,
                 Log = log,
                 Initialized = 1,
             };
@@ -355,16 +441,120 @@ public static unsafe class GpuSystem
         assets.ReleaseGpuTexture = null;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void AcquireDeferredLock(ref GpuContext ctx)
+    {
+        SpinWait sw = default;
+        while (Interlocked.CompareExchange(ref ctx.DeferredReleaseLock.Value, 1, 0) != 0)
+            sw.SpinOnce();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ReleaseDeferredLock(ref GpuContext ctx)
+    {
+        Volatile.Write(ref ctx.DeferredReleaseLock.Value, 0);
+    }
+
     private static void ReleaseGpuMeshHook(void* ctxPtr, int slot)
     {
         if (ctxPtr == null) return;
-        ReleaseMeshSlot(ref *(GpuContext*)ctxPtr, slot);
+        ref GpuContext ctx = ref *(GpuContext*)ctxPtr;
+        if (ctx.Initialized == 0 || (uint)slot >= (uint)ctx.MaxMeshes) return;
+        if (ctx.DeferredMeshSlots == null || ctx.MeshSlotPendingRelease == null) return;
+
+        AcquireDeferredLock(ref ctx);
+        try
+        {
+            if (ctx.MeshSlotPendingRelease[slot] == 0)
+            {
+                ctx.MeshSlotPendingRelease[slot] = 1;
+                if (ctx.DeferredMeshCount < ctx.DeferredMeshCap)
+                    ctx.DeferredMeshSlots[ctx.DeferredMeshCount++] = slot;
+            }
+        }
+        finally
+        {
+            ReleaseDeferredLock(ref ctx);
+        }
     }
 
     private static void ReleaseGpuTextureHook(void* ctxPtr, int slot)
     {
         if (ctxPtr == null) return;
-        ReleaseTextureSlot(ref *(GpuContext*)ctxPtr, slot);
+        ref GpuContext ctx = ref *(GpuContext*)ctxPtr;
+        if (ctx.Initialized == 0 || (uint)slot >= (uint)ctx.MaxTextures) return;
+        if (ctx.DeferredTextureSlots == null || ctx.TextureSlotPendingRelease == null) return;
+
+        AcquireDeferredLock(ref ctx);
+        try
+        {
+            if (ctx.TextureSlotPendingRelease[slot] == 0)
+            {
+                ctx.TextureSlotPendingRelease[slot] = 1;
+                if (ctx.DeferredTextureCount < ctx.DeferredTextureCap)
+                    ctx.DeferredTextureSlots[ctx.DeferredTextureCount++] = slot;
+            }
+        }
+        finally
+        {
+            ReleaseDeferredLock(ref ctx);
+        }
+    }
+
+    /// <summary>
+    /// Drains all deferred GPU mesh/texture release requests queued by <see cref="AssetSystem.UnloadByBundle"/>
+    /// (safe to enqueue from the Logic Thread) and releases the underlying SDL3_gpu handles on the Main/Render Thread.
+    /// Automatically invoked at the end of <see cref="BatchRenderer.SubmitRenderPacket"/> and inside <see cref="Dispose(ref GpuContext, ref AssetRegistry)"/>.
+    /// </summary>
+    public static void FlushDeferredReleases(ref GpuContext ctx)
+    {
+        if (ctx.Initialized == 0 || ctx.Device == nint.Zero) return;
+
+        int* batch = stackalloc int[64];
+
+        if (ctx.DeferredMeshSlots != null)
+        {
+            while (true)
+            {
+                int count = 0;
+                AcquireDeferredLock(ref ctx);
+                try
+                {
+                    while (ctx.DeferredMeshCount > 0 && count < 64)
+                        batch[count++] = ctx.DeferredMeshSlots[--ctx.DeferredMeshCount];
+                }
+                finally
+                {
+                    ReleaseDeferredLock(ref ctx);
+                }
+
+                if (count == 0) break;
+                for (int i = 0; i < count; i++)
+                    ReleaseMeshSlot(ref ctx, batch[i]);
+            }
+        }
+
+        if (ctx.DeferredTextureSlots != null)
+        {
+            while (true)
+            {
+                int count = 0;
+                AcquireDeferredLock(ref ctx);
+                try
+                {
+                    while (ctx.DeferredTextureCount > 0 && count < 64)
+                        batch[count++] = ctx.DeferredTextureSlots[--ctx.DeferredTextureCount];
+                }
+                finally
+                {
+                    ReleaseDeferredLock(ref ctx);
+                }
+
+                if (count == 0) break;
+                for (int i = 0; i < count; i++)
+                    ReleaseTextureSlot(ref ctx, batch[i]);
+            }
+        }
     }
 
     private static void CreateDefaultSamplersAndBuffers(ref GpuContext ctx)
@@ -379,18 +569,24 @@ public static unsafe class GpuSystem
             AddressModeW = SDL.GPUSamplerAddressMode.Repeat,
         };
         ctx.SamplerLinearWrap = SDL.CreateGPUSampler(ctx.Device, in linWrap);
+        if (ctx.SamplerLinearWrap == nint.Zero)
+            throw new InvalidOperationException($"SDL_CreateGPUSampler(LinearWrap) failed: {SDL.GetError()}");
 
         var linClamp = linWrap;
         linClamp.AddressModeU = SDL.GPUSamplerAddressMode.ClampToEdge;
         linClamp.AddressModeV = SDL.GPUSamplerAddressMode.ClampToEdge;
         linClamp.AddressModeW = SDL.GPUSamplerAddressMode.ClampToEdge;
         ctx.SamplerLinearClamp = SDL.CreateGPUSampler(ctx.Device, in linClamp);
+        if (ctx.SamplerLinearClamp == nint.Zero)
+            throw new InvalidOperationException($"SDL_CreateGPUSampler(LinearClamp) failed: {SDL.GetError()}");
 
         var nearClamp = linClamp;
         nearClamp.MinFilter = SDL.GPUFilter.Nearest;
         nearClamp.MagFilter = SDL.GPUFilter.Nearest;
         nearClamp.MipmapMode = SDL.GPUSamplerMipmapMode.Nearest;
         ctx.SamplerNearestClamp = SDL.CreateGPUSampler(ctx.Device, in nearClamp);
+        if (ctx.SamplerNearestClamp == nint.Zero)
+            throw new InvalidOperationException($"SDL_CreateGPUSampler(NearestClamp) failed: {SDL.GetError()}");
 
         // Allocate reusable 16MB dynamic upload transfer buffer
         ctx.UploadTransferBufferBytes = 16 * 1024 * 1024;
@@ -400,6 +596,8 @@ public static unsafe class GpuSystem
             Size = ctx.UploadTransferBufferBytes,
         };
         ctx.UploadTransferBuffer = SDL.CreateGPUTransferBuffer(ctx.Device, in tbInfo);
+        if (ctx.UploadTransferBuffer == nint.Zero)
+            throw new InvalidOperationException($"SDL_CreateGPUTransferBuffer({ctx.UploadTransferBufferBytes}) failed: {SDL.GetError()}");
 
         // Allocate per-frame storage buffers (grown dynamically on demand in BatchRenderer)
         ctx.Instance3DBufferBytes = 4 * 1024 * 1024;       // 32,768 3D instances
@@ -430,18 +628,29 @@ public static unsafe class GpuSystem
             SampleCount = SDL.GPUSampleCount.SampleCount1,
         };
         ctx.DefaultWhiteTexture = SDL.CreateGPUTexture(ctx.Device, in whiteTexInfo);
+        if (ctx.DefaultWhiteTexture == nint.Zero)
+            throw new InvalidOperationException($"SDL_CreateGPUTexture(DefaultWhite) failed: {SDL.GetError()}");
 
         // Upload QuadIndexBuffer + DefaultWhiteTexture in one startup copy pass
         uint* quadIndices = stackalloc uint[6] { 0, 1, 2, 0, 2, 3 };
         uint whitePixel = 0xFFFF_FFFFu;
 
         nint mapPtr = SDL.MapGPUTransferBuffer(ctx.Device, ctx.UploadTransferBuffer, false);
+        if (mapPtr == nint.Zero)
+            throw new InvalidOperationException($"SDL_MapGPUTransferBuffer(Startup) failed: {SDL.GetError()}");
         Buffer.MemoryCopy(quadIndices, (void*)mapPtr, 24, 24);
         *(uint*)((byte*)mapPtr + 64) = whitePixel;
         SDL.UnmapGPUTransferBuffer(ctx.Device, ctx.UploadTransferBuffer);
 
         nint cmd = SDL.AcquireGPUCommandBuffer(ctx.Device);
+        if (cmd == nint.Zero)
+            throw new InvalidOperationException($"SDL_AcquireGPUCommandBuffer(Startup) failed: {SDL.GetError()}");
         nint copy = SDL.BeginGPUCopyPass(cmd);
+        if (copy == nint.Zero)
+        {
+            SDL.SubmitGPUCommandBuffer(cmd);
+            throw new InvalidOperationException($"SDL_BeginGPUCopyPass(Startup) failed: {SDL.GetError()}");
+        }
 
         var bufSrc = new SDL.GPUTransferBufferLocation { TransferBuffer = ctx.UploadTransferBuffer, Offset = 0 };
         var bufDst = new SDL.GPUBufferRegion { Buffer = ctx.QuadIndexBuffer, Offset = 0, Size = 24 };
@@ -647,14 +856,23 @@ public static unsafe class GpuSystem
     /// </summary>
     public static bool ReadCaptureTextureRgba(ref GpuContext ctx, byte[] dstRgba)
     {
-        if (ctx.CaptureColorTexture == nint.Zero || ctx.CaptureWidth == 0 || ctx.CaptureHeight == 0)
+        if (ctx.Initialized == 0 || ctx.Device == nint.Zero ||
+            ctx.CaptureColorTexture == nint.Zero || ctx.CaptureTransferBuffer == nint.Zero ||
+            ctx.CaptureWidth == 0 || ctx.CaptureHeight == 0)
             return false;
         int w = (int)ctx.CaptureWidth;
         int h = (int)ctx.CaptureHeight;
-        if (dstRgba == null || dstRgba.Length < w * h * 4) return false;
+        long neededBytes = (long)w * h * 4L;
+        if (dstRgba == null || dstRgba.LongLength < neededBytes) return false;
 
         nint cmd = SDL.AcquireGPUCommandBuffer(ctx.Device);
+        if (cmd == nint.Zero) return false;
         nint copy = SDL.BeginGPUCopyPass(cmd);
+        if (copy == nint.Zero)
+        {
+            SDL.SubmitGPUCommandBuffer(cmd);
+            return false;
+        }
         var src = new SDL.GPUTextureRegion
         {
             Texture = ctx.CaptureColorTexture,
@@ -673,11 +891,14 @@ public static unsafe class GpuSystem
         SDL.EndGPUCopyPass(copy);
 
         nint fence = SDL.SubmitGPUCommandBufferAndAcquireFence(cmd);
+        if (fence == nint.Zero) return false;
         nint* fenceArr = stackalloc nint[1] { fence };
         SDL.WaitForGPUFences(ctx.Device, true, (nint)fenceArr, 1);
         SDL.ReleaseGPUFence(ctx.Device, fence);
 
         nint mapped = SDL.MapGPUTransferBuffer(ctx.Device, ctx.CaptureTransferBuffer, false);
+        if (mapped == nint.Zero) return false;
+
         bool isBgra = ctx.SwapchainFormat == SDL.GPUTextureFormat.B8G8R8A8Unorm ||
                       ctx.SwapchainFormat == SDL.GPUTextureFormat.B8G8R8A8UnormSRGB;
 
@@ -723,67 +944,131 @@ public static unsafe class GpuSystem
     public static int EnsureMeshUploaded(ref GpuContext ctx, ref MeshAssetData mesh)
     {
         if (mesh.GpuSlot >= 0) return mesh.GpuSlot;
-        if (mesh.VertexCount <= 0 || mesh.IndexCount <= 0) return -1;
+        if (ctx.Initialized == 0 || ctx.Device == nint.Zero || ctx.Meshes == null) return -1;
+        if (mesh.VertexCount <= 0 || mesh.IndexCount <= 0 || mesh.Vertices == null || mesh.Indices == null) return -1;
+
+        ulong vBytes64 = (ulong)mesh.VertexCount * (ulong)sizeof(Vertex3D);
+        ulong iBytes64 = (ulong)mesh.IndexCount * (ulong)sizeof(uint);
+        if (vBytes64 == 0 || iBytes64 == 0 || vBytes64 > uint.MaxValue || iBytes64 > uint.MaxValue || vBytes64 + iBytes64 > uint.MaxValue)
+            return -1;
 
         int slot = -1;
         for (int i = 0; i < ctx.MaxMeshes; i++)
         {
-            if (ctx.Meshes[i].Alive == 0) { slot = i; break; }
+            if (ctx.Meshes[i].Alive == 0 && (ctx.MeshSlotPendingRelease == null || Volatile.Read(ref ctx.MeshSlotPendingRelease[i]) == 0))
+            {
+                slot = i;
+                break;
+            }
         }
         if (slot < 0) throw new OutOfMemoryException("GpuContext mesh slots exhausted.");
 
-        uint vBytes = (uint)(mesh.VertexCount * sizeof(Vertex3D));
-        uint iBytes = (uint)(mesh.IndexCount * sizeof(uint));
-        nint vb = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.Vertex, vBytes);
-        nint ib = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.Index, iBytes);
+        uint vBytes = (uint)vBytes64;
+        uint iBytes = (uint)iBytes64;
+        nint vb = nint.Zero;
+        nint ib = nint.Zero;
+        nint tb = nint.Zero;
+        bool isMapped = false;
 
-        // One-shot upload transfer
-        var tbInfo = new SDL.GPUTransferBufferCreateInfo { Usage = SDL.GPUTransferBufferUsage.Upload, Size = vBytes + iBytes };
-        nint tb = SDL.CreateGPUTransferBuffer(ctx.Device, in tbInfo);
-        byte* mapped = (byte*)SDL.MapGPUTransferBuffer(ctx.Device, tb, false);
-        Buffer.MemoryCopy(mesh.Vertices, mapped, vBytes, vBytes);
-        Buffer.MemoryCopy(mesh.Indices, mapped + vBytes, iBytes, iBytes);
-        SDL.UnmapGPUTransferBuffer(ctx.Device, tb);
-
-        nint cmd = SDL.AcquireGPUCommandBuffer(ctx.Device);
-        nint copy = SDL.BeginGPUCopyPass(cmd);
-        var vSrc = new SDL.GPUTransferBufferLocation { TransferBuffer = tb, Offset = 0 };
-        var vDst = new SDL.GPUBufferRegion { Buffer = vb, Offset = 0, Size = vBytes };
-        SDL.UploadToGPUBuffer(copy, in vSrc, in vDst, false);
-
-        var iSrc = new SDL.GPUTransferBufferLocation { TransferBuffer = tb, Offset = vBytes };
-        var iDst = new SDL.GPUBufferRegion { Buffer = ib, Offset = 0, Size = iBytes };
-        SDL.UploadToGPUBuffer(copy, in iSrc, in iDst, false);
-        SDL.EndGPUCopyPass(copy);
-        SDL.SubmitGPUCommandBuffer(cmd);
-        SDL.ReleaseGPUTransferBuffer(ctx.Device, tb);
-
-        ctx.Meshes[slot] = new GpuMeshSlot
+        try
         {
-            VertexBuffer = vb,
-            IndexBuffer = ib,
-            IndexCount = (uint)mesh.IndexCount,
-            Alive = 1,
-        };
-        mesh.GpuSlot = slot;
-        return slot;
+            vb = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.Vertex, vBytes);
+            ib = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.Index, iBytes);
+
+            // One-shot upload transfer
+            var tbInfo = new SDL.GPUTransferBufferCreateInfo { Usage = SDL.GPUTransferBufferUsage.Upload, Size = vBytes + iBytes };
+            tb = SDL.CreateGPUTransferBuffer(ctx.Device, in tbInfo);
+            if (tb == nint.Zero)
+                throw new InvalidOperationException($"SDL_CreateGPUTransferBuffer({vBytes + iBytes}) failed for mesh {mesh.Name}: {SDL.GetError()}");
+
+            nint mapRaw = SDL.MapGPUTransferBuffer(ctx.Device, tb, false);
+            if (mapRaw == nint.Zero)
+                throw new InvalidOperationException($"SDL_MapGPUTransferBuffer failed for mesh {mesh.Name}: {SDL.GetError()}");
+            isMapped = true;
+
+            byte* mapped = (byte*)mapRaw;
+            Buffer.MemoryCopy(mesh.Vertices, mapped, vBytes, vBytes);
+            Buffer.MemoryCopy(mesh.Indices, mapped + vBytes, iBytes, iBytes);
+            SDL.UnmapGPUTransferBuffer(ctx.Device, tb);
+            isMapped = false;
+
+            nint cmd = SDL.AcquireGPUCommandBuffer(ctx.Device);
+            if (cmd == nint.Zero)
+                throw new InvalidOperationException($"SDL_AcquireGPUCommandBuffer failed for mesh {mesh.Name}: {SDL.GetError()}");
+            nint copy = SDL.BeginGPUCopyPass(cmd);
+            if (copy == nint.Zero)
+            {
+                SDL.SubmitGPUCommandBuffer(cmd);
+                throw new InvalidOperationException($"SDL_BeginGPUCopyPass failed for mesh {mesh.Name}: {SDL.GetError()}");
+            }
+            var vSrc = new SDL.GPUTransferBufferLocation { TransferBuffer = tb, Offset = 0 };
+            var vDst = new SDL.GPUBufferRegion { Buffer = vb, Offset = 0, Size = vBytes };
+            SDL.UploadToGPUBuffer(copy, in vSrc, in vDst, false);
+
+            var iSrc = new SDL.GPUTransferBufferLocation { TransferBuffer = tb, Offset = vBytes };
+            var iDst = new SDL.GPUBufferRegion { Buffer = ib, Offset = 0, Size = iBytes };
+            SDL.UploadToGPUBuffer(copy, in iSrc, in iDst, false);
+            SDL.EndGPUCopyPass(copy);
+            SDL.SubmitGPUCommandBuffer(cmd);
+            SDL.ReleaseGPUTransferBuffer(ctx.Device, tb);
+            tb = nint.Zero;
+
+            ctx.Meshes[slot] = new GpuMeshSlot
+            {
+                VertexBuffer = vb,
+                IndexBuffer = ib,
+                IndexCount = (uint)mesh.IndexCount,
+                Alive = 1,
+            };
+            mesh.GpuSlot = slot;
+            mesh.GpuSlotGen = ctx.MeshSlotGens != null ? ctx.MeshSlotGens[slot] : 1u;
+            return slot;
+        }
+        catch
+        {
+            if (isMapped && tb != nint.Zero) SDL.UnmapGPUTransferBuffer(ctx.Device, tb);
+            if (tb != nint.Zero) SDL.ReleaseGPUTransferBuffer(ctx.Device, tb);
+            if (vb != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, vb);
+            if (ib != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ib);
+            throw;
+        }
     }
 
     public static int EnsureTextureUploaded(ref GpuContext ctx, ref TextureAssetData tex)
     {
         if (tex.GpuSlot >= 0) return tex.GpuSlot;
+        if (ctx.Initialized == 0 || ctx.Device == nint.Zero || ctx.Textures == null) return -1;
         if (tex.Width <= 0 || tex.Height <= 0 || tex.Pixels == null) return -1;
-
-        int slot = -1;
-        for (int i = 0; i < ctx.MaxTextures; i++)
-        {
-            if (ctx.Textures[i].Alive == 0) { slot = i; break; }
-        }
-        if (slot < 0) throw new OutOfMemoryException("GpuContext texture slots exhausted.");
 
         TexturePixelFormat srcFmt = tex.Format;
         if (srcFmt == TexturePixelFormat.Rgba8 && tex.Channels == 1)
             srcFmt = TexturePixelFormat.R8;
+
+        ulong expectedSrcBytes64 = srcFmt switch
+        {
+            TexturePixelFormat.R8 => (ulong)tex.Width * (ulong)tex.Height,
+            TexturePixelFormat.Bc1Rgba => (((ulong)tex.Width + 3UL) >> 2) * (((ulong)tex.Height + 3UL) >> 2) * 8UL,
+            TexturePixelFormat.Bc3Rgba => (((ulong)tex.Width + 3UL) >> 2) * (((ulong)tex.Height + 3UL) >> 2) * 16UL,
+            _ => (ulong)tex.Width * (ulong)tex.Height * 4UL,
+        };
+        if (expectedSrcBytes64 == 0 || expectedSrcBytes64 > uint.MaxValue) return -1;
+        if (tex.DataBytes < 0 || (tex.DataBytes > 0 && (ulong)tex.DataBytes < expectedSrcBytes64))
+        {
+            if (ctx.Log != null)
+                LogSystem.Error(ctx.Log, $"EnsureTextureUploaded rejected undersized texture {tex.Name} ({tex.Width}x{tex.Height}, {srcFmt}): DataBytes={tex.DataBytes} < expected={expectedSrcBytes64}");
+            return -1;
+        }
+
+        int slot = -1;
+        for (int i = 0; i < ctx.MaxTextures; i++)
+        {
+            if (ctx.Textures[i].Alive == 0 && (ctx.TextureSlotPendingRelease == null || Volatile.Read(ref ctx.TextureSlotPendingRelease[i]) == 0))
+            {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) throw new OutOfMemoryException("GpuContext texture slots exhausted.");
 
         SDL.GPUTextureFormat fmt;
         bool decodeFallbackToRgba = false;
@@ -812,118 +1097,177 @@ public static unsafe class GpuSystem
             fmt = SDL.GPUTextureFormat.R8G8B8A8Unorm;
         }
 
-        var info = new SDL.GPUTextureCreateInfo
-        {
-            Type = SDL.GPUTextureType.TextureType2D,
-            Format = fmt,
-            Usage = SDL.GPUTextureUsageFlags.Sampler,
-            Width = (uint)tex.Width,
-            Height = (uint)tex.Height,
-            LayerCountOrDepth = 1,
-            NumLevels = 1,
-            SampleCount = SDL.GPUSampleCount.SampleCount1,
-        };
-        nint gpuTex = SDL.CreateGPUTexture(ctx.Device, in info);
-        if (gpuTex == nint.Zero)
-        {
-            string err = SDL.GetError();
-            if (ctx.Log != null) LogSystem.Error(ctx.Log, $"SDL_CreateGPUTexture({tex.Width}x{tex.Height}, {fmt}) failed: {err}");
-            throw new InvalidOperationException($"SDL_CreateGPUTexture failed: {err}");
-        }
+        ulong uploadBytes64 = decodeFallbackToRgba
+            ? (ulong)tex.Width * (ulong)tex.Height * 4UL
+            : expectedSrcBytes64;
+        if (uploadBytes64 == 0 || uploadBytes64 > uint.MaxValue) return -1;
+        uint byteSize = (uint)uploadBytes64;
 
-        uint byteSize;
-        if (decodeFallbackToRgba)
-            byteSize = (uint)(tex.Width * tex.Height * 4);
-        else if (tex.DataBytes > 0)
-            byteSize = (uint)tex.DataBytes;
-        else
-            byteSize = (uint)TextureCompressionSystem.CalcByteSize(srcFmt, tex.Width, tex.Height);
+        nint gpuTex = nint.Zero;
+        nint tb = nint.Zero;
+        bool isMapped = false;
 
-        var tbInfo = new SDL.GPUTransferBufferCreateInfo { Usage = SDL.GPUTransferBufferUsage.Upload, Size = byteSize };
-        nint tb = SDL.CreateGPUTransferBuffer(ctx.Device, in tbInfo);
-        if (tb == nint.Zero)
+        try
         {
-            string err = SDL.GetError();
-            SDL.ReleaseGPUTexture(ctx.Device, gpuTex);
-            if (ctx.Log != null) LogSystem.Error(ctx.Log, $"SDL_CreateGPUTransferBuffer({byteSize}) failed for texture {tex.Name}: {err}");
-            throw new InvalidOperationException($"SDL_CreateGPUTransferBuffer failed: {err}");
-        }
-        void* mapped = (void*)SDL.MapGPUTransferBuffer(ctx.Device, tb, false);
-        if (decodeFallbackToRgba)
-        {
-            if (srcFmt == TexturePixelFormat.Bc1Rgba)
-                TextureCompressionSystem.DecodeBc1ToRgba(tex.Pixels, tex.Width, tex.Height, (byte*)mapped);
+            var info = new SDL.GPUTextureCreateInfo
+            {
+                Type = SDL.GPUTextureType.TextureType2D,
+                Format = fmt,
+                Usage = SDL.GPUTextureUsageFlags.Sampler,
+                Width = (uint)tex.Width,
+                Height = (uint)tex.Height,
+                LayerCountOrDepth = 1,
+                NumLevels = 1,
+                SampleCount = SDL.GPUSampleCount.SampleCount1,
+            };
+            gpuTex = SDL.CreateGPUTexture(ctx.Device, in info);
+            if (gpuTex == nint.Zero)
+            {
+                string err = SDL.GetError();
+                if (ctx.Log != null) LogSystem.Error(ctx.Log, $"SDL_CreateGPUTexture({tex.Width}x{tex.Height}, {fmt}) failed: {err}");
+                throw new InvalidOperationException($"SDL_CreateGPUTexture failed: {err}");
+            }
+
+            var tbInfo = new SDL.GPUTransferBufferCreateInfo { Usage = SDL.GPUTransferBufferUsage.Upload, Size = byteSize };
+            tb = SDL.CreateGPUTransferBuffer(ctx.Device, in tbInfo);
+            if (tb == nint.Zero)
+            {
+                string err = SDL.GetError();
+                if (ctx.Log != null) LogSystem.Error(ctx.Log, $"SDL_CreateGPUTransferBuffer({byteSize}) failed for texture {tex.Name}: {err}");
+                throw new InvalidOperationException($"SDL_CreateGPUTransferBuffer failed: {err}");
+            }
+
+            nint mapRaw = SDL.MapGPUTransferBuffer(ctx.Device, tb, false);
+            if (mapRaw == nint.Zero)
+            {
+                string err = SDL.GetError();
+                if (ctx.Log != null) LogSystem.Error(ctx.Log, $"SDL_MapGPUTransferBuffer({byteSize}) failed for texture {tex.Name}: {err}");
+                throw new InvalidOperationException($"SDL_MapGPUTransferBuffer failed: {err}");
+            }
+            isMapped = true;
+
+            void* mapped = (void*)mapRaw;
+            if (decodeFallbackToRgba)
+            {
+                if (srcFmt == TexturePixelFormat.Bc1Rgba)
+                    TextureCompressionSystem.DecodeBc1ToRgba(tex.Pixels, tex.Width, tex.Height, (byte*)mapped);
+                else
+                    TextureCompressionSystem.DecodeBc3ToRgba(tex.Pixels, tex.Width, tex.Height, (byte*)mapped);
+            }
             else
-                TextureCompressionSystem.DecodeBc3ToRgba(tex.Pixels, tex.Width, tex.Height, (byte*)mapped);
-        }
-        else
-        {
-            Buffer.MemoryCopy(tex.Pixels, mapped, byteSize, byteSize);
-        }
-        SDL.UnmapGPUTransferBuffer(ctx.Device, tb);
+            {
+                Buffer.MemoryCopy(tex.Pixels, mapped, byteSize, byteSize);
+            }
+            SDL.UnmapGPUTransferBuffer(ctx.Device, tb);
+            isMapped = false;
 
-        nint cmd = SDL.AcquireGPUCommandBuffer(ctx.Device);
-        nint copy = SDL.BeginGPUCopyPass(cmd);
-        var src = new SDL.GPUTextureTransferInfo
-        {
-            TransferBuffer = tb,
-            Offset = 0,
-            PixelsPerRow = 0,
-            RowsPerLayer = 0,
-        };
-        var dst = new SDL.GPUTextureRegion
-        {
-            Texture = gpuTex,
-            W = (uint)tex.Width,
-            H = (uint)tex.Height,
-            D = 1,
-        };
-        SDL.UploadToGPUTexture(copy, in src, in dst, false);
-        SDL.EndGPUCopyPass(copy);
-        SDL.SubmitGPUCommandBuffer(cmd);
-        SDL.ReleaseGPUTransferBuffer(ctx.Device, tb);
+            nint cmd = SDL.AcquireGPUCommandBuffer(ctx.Device);
+            if (cmd == nint.Zero)
+                throw new InvalidOperationException($"SDL_AcquireGPUCommandBuffer failed for texture {tex.Name}: {SDL.GetError()}");
+            nint copy = SDL.BeginGPUCopyPass(cmd);
+            if (copy == nint.Zero)
+            {
+                SDL.SubmitGPUCommandBuffer(cmd);
+                throw new InvalidOperationException($"SDL_BeginGPUCopyPass failed for texture {tex.Name}: {SDL.GetError()}");
+            }
+            var src = new SDL.GPUTextureTransferInfo
+            {
+                TransferBuffer = tb,
+                Offset = 0,
+                PixelsPerRow = 0,
+                RowsPerLayer = 0,
+            };
+            var dst = new SDL.GPUTextureRegion
+            {
+                Texture = gpuTex,
+                W = (uint)tex.Width,
+                H = (uint)tex.Height,
+                D = 1,
+            };
+            SDL.UploadToGPUTexture(copy, in src, in dst, false);
+            SDL.EndGPUCopyPass(copy);
+            SDL.SubmitGPUCommandBuffer(cmd);
+            SDL.ReleaseGPUTransferBuffer(ctx.Device, tb);
+            tb = nint.Zero;
 
-        ctx.Textures[slot] = new GpuTextureSlot
+            ctx.Textures[slot] = new GpuTextureSlot
+            {
+                Texture = gpuTex,
+                Width = tex.Width,
+                Height = tex.Height,
+                Channels = tex.Channels,
+                ClampEdge = tex.ClampEdge,
+                NearestFilter = tex.NearestFilter,
+                Alive = 1,
+            };
+            tex.GpuSlot = slot;
+            tex.GpuSlotGen = ctx.TextureSlotGens != null ? ctx.TextureSlotGens[slot] : 1u;
+            return slot;
+        }
+        catch
         {
-            Texture = gpuTex,
-            Width = tex.Width,
-            Height = tex.Height,
-            Channels = tex.Channels,
-            ClampEdge = tex.ClampEdge,
-            NearestFilter = tex.NearestFilter,
-            Alive = 1,
-        };
-        tex.GpuSlot = slot;
-        return slot;
+            if (isMapped && tb != nint.Zero) SDL.UnmapGPUTransferBuffer(ctx.Device, tb);
+            if (tb != nint.Zero) SDL.ReleaseGPUTransferBuffer(ctx.Device, tb);
+            if (gpuTex != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, gpuTex);
+            throw;
+        }
     }
 
     public static void ReleaseMeshSlot(ref GpuContext ctx, int slot)
     {
         if (ctx.Initialized == 0 || ctx.Device == nint.Zero || ctx.Meshes == null) return;
-        if ((uint)slot >= (uint)ctx.MaxMeshes || ctx.Meshes[slot].Alive == 0) return;
-        if (ctx.Meshes[slot].VertexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.Meshes[slot].VertexBuffer);
-        if (ctx.Meshes[slot].IndexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.Meshes[slot].IndexBuffer);
-        ctx.Meshes[slot] = default;
+        if ((uint)slot >= (uint)ctx.MaxMeshes) return;
+        if (ctx.Meshes[slot].Alive != 0)
+        {
+            if (ctx.Meshes[slot].VertexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.Meshes[slot].VertexBuffer);
+            if (ctx.Meshes[slot].IndexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.Meshes[slot].IndexBuffer);
+            ctx.Meshes[slot] = default;
+            if (ctx.MeshSlotGens != null)
+                ctx.MeshSlotGens[slot] = HandlePacking.NextGeneration(ctx.MeshSlotGens[slot]);
+        }
+        if (ctx.MeshSlotPendingRelease != null)
+            Volatile.Write(ref ctx.MeshSlotPendingRelease[slot], 0);
     }
 
     public static void ReleaseTextureSlot(ref GpuContext ctx, int slot)
     {
         if (ctx.Initialized == 0 || ctx.Device == nint.Zero || ctx.Textures == null) return;
-        if ((uint)slot >= (uint)ctx.MaxTextures || ctx.Textures[slot].Alive == 0) return;
-        if (ctx.Textures[slot].Texture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.Textures[slot].Texture);
-        ctx.Textures[slot] = default;
+        if ((uint)slot >= (uint)ctx.MaxTextures) return;
+        if (ctx.Textures[slot].Alive != 0)
+        {
+            if (ctx.Textures[slot].Texture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.Textures[slot].Texture);
+            ctx.Textures[slot] = default;
+            if (ctx.TextureSlotGens != null)
+                ctx.TextureSlotGens[slot] = HandlePacking.NextGeneration(ctx.TextureSlotGens[slot]);
+        }
+        if (ctx.TextureSlotPendingRelease != null)
+            Volatile.Write(ref ctx.TextureSlotPendingRelease[slot], 0);
     }
 
+    /// <summary>
+    /// Clears GPU cleanup hooks on <paramref name="assets"/>, resets all live asset GPU slots to -1,
+    /// drains deferred releases, and disposes the SDL3_gpu device. Recommended canonical teardown overload.
+    /// </summary>
     public static void Dispose(ref GpuContext ctx, ref AssetRegistry assets)
     {
         ClearAssetCleanupHooks(ref assets);
-        Dispose(ref ctx);
+        AssetSystem.ResetAllGpuSlots(ref assets);
+        DisposeCore(ref ctx);
     }
 
-    public static void Dispose(ref GpuContext ctx)
+    /// <summary>
+    /// Disposes the SDL3_gpu device without clearing <see cref="AssetRegistry"/> hooks or resetting asset GPU slots.
+    /// </summary>
+    /// <remarks>
+    /// Prefer <see cref="Dispose(ref GpuContext, ref AssetRegistry)"/> so asset hooks are cleared and live asset GPU slots are reset cleanly.
+    /// </remarks>
+    public static void Dispose(ref GpuContext ctx) => DisposeCore(ref ctx);
+
+    private static void DisposeCore(ref GpuContext ctx)
     {
         if (ctx.Initialized == 0 || ctx.Device == nint.Zero) return;
         SDL.WaitForGPUIdle(ctx.Device);
+        FlushDeferredReleases(ref ctx);
 
         for (int i = 0; i < ctx.MaxMeshes; i++) ReleaseMeshSlot(ref ctx, i);
         for (int i = 0; i < ctx.MaxTextures; i++) ReleaseTextureSlot(ref ctx, i);

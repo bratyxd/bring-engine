@@ -94,7 +94,9 @@ float4 PSMain(PSInput input) : SV_Target0
     // Slight inner tightening ensures thin strokes reach full 1.0 alpha instead of looking translucent
     float fillAlpha = smoothstep(edge - aa, edge + aa * 0.50, sdf);
     float outlineEdge = max(0.04, edge - outlineW);
-    float outlineAlpha = outlineW > 0.001 ? smoothstep(outlineEdge - aa, outlineEdge + aa * 0.65, sdf) : fillAlpha;
+    float hasOutline = outlineW > 0.001 ? 1.0 : 0.0;
+    float outlineCov = hasOutline > 0.5 ? smoothstep(outlineEdge - aa, outlineEdge + aa * 0.65, sdf) : 0.0;
+    float outerAlpha = hasOutline > 0.5 ? outlineCov : fillAlpha;
 
     // Optional animated shine band across glyph
     float3 fillRgb = input.FillColor.rgb;
@@ -104,9 +106,11 @@ float4 PSMain(PSInput input) : SV_Target0
         fillRgb += float3(0.75, 0.75, 0.75) * shine;
     }
 
-    // Porter-Duff premultiplied fill-over-outline compositing (prevents OutlineColor.rgb bleed when OutlineColor.a == 0)
+    // Porter-Duff premultiplied fill-over-outline compositing:
+    // Outline coverage is strictly outside fill and disabled when outlineW <= 0.001 so
+    // translucent text/drop shadows never darken against OutlineColor and OutlineColor.a == 0 has zero fringe.
     float fillA = fillAlpha * input.FillColor.a;
-    float outA = outlineAlpha * input.OutlineColor.a;
+    float outA = outlineCov * (1.0 - fillAlpha) * input.OutlineColor.a;
     float3 basePremul = fillRgb * fillA + input.OutlineColor.rgb * outA * (1.0 - fillA);
     float baseAlpha = fillA + outA * (1.0 - fillA);
 
@@ -115,7 +119,7 @@ float4 PSMain(PSInput input) : SV_Target0
     if (glowIntensity > 0.001)
     {
         float glowBand = smoothstep(max(0.02, outlineEdge - 0.32), outlineEdge, sdf);
-        glowAlpha = glowBand * (1.0 - outlineAlpha) * glowIntensity * input.GlowColor.a;
+        glowAlpha = glowBand * (1.0 - outerAlpha) * glowIntensity * input.GlowColor.a;
     }
 
     float finalAlpha = saturate(baseAlpha + glowAlpha * (1.0 - baseAlpha));

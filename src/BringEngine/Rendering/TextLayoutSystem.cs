@@ -54,23 +54,21 @@ public static unsafe class TextLayoutSystem
             return 0;
 
         ReadOnlySpan<byte> utf8 = td.Content.AsUtf8Span();
-        int totalChars = utf8.Length;
-        float visibleCharsF = totalChars * DetMath.Clamp01(td.TypewriterProgress);
-        int visibleCount = (int)MathF.Ceiling(visibleCharsF);
-        if (visibleCount <= 0) return 0;
-        if (visibleCount > totalChars) visibleCount = totalChars;
+        int totalBytes = utf8.Length;
+        if (totalBytes <= 0) return 0;
 
         ArenaMarker mark = scratchArena.SaveMarker();
         try
         {
-            int maxLines = totalChars + 1;
-            LaidChar* laid = scratchArena.AllocUninitialized<LaidChar>(totalChars, 16);
+            int maxLines = totalBytes + 1;
+            LaidChar* laid = scratchArena.AllocUninitialized<LaidChar>(totalBytes, 16);
             int* lineStarts = scratchArena.AllocUninitialized<int>(maxLines, 16);
             int* lineEnds = scratchArena.AllocUninitialized<int>(maxLines, 16);
             float* lineWidths = scratchArena.AllocUninitialized<float>(maxLines, 16);
 
             int laidCount = 0;
             int lineCount = 0;
+            int logicalCharCount = 0;
             float penX = 0f;
             float penY = 0f;
             float lineHeight = font.LineHeight * td.LineSpacing;
@@ -80,20 +78,24 @@ public static unsafe class TextLayoutSystem
             int prevGlyph = -1;
             int lastSpaceLaidIdx = -1;
             float lastSpacePenX = 0f;
+            bool pendingSoftWrap = false;
 
-            for (int c = 0; c < totalChars; c++)
+            for (int c = 0; c < totalBytes; c++)
             {
                 byte ch = utf8[c];
                 if ((ch & 0x80) != 0)
                 {
                     // Collapse multi-byte UTF-8 sequence into a single fallback glyph
-                    while (c + 1 < totalChars && (utf8[c + 1] & 0xC0) == 0x80)
+                    while (c + 1 < totalBytes && (utf8[c + 1] & 0xC0) == 0x80)
                         c++;
                     ch = (byte)'?';
                 }
 
+                int thisCharIdx = logicalCharCount++;
+
                 if (ch == (byte)'\n')
                 {
+                    pendingSoftWrap = false;
                     if (lineCount + 1 < maxLines)
                     {
                         lineEnds[lineCount] = laidCount;
@@ -108,6 +110,25 @@ public static unsafe class TextLayoutSystem
                     continue;
                 }
 
+                if (pendingSoftWrap)
+                {
+                    if (ch == (byte)' ')
+                        continue;
+
+                    pendingSoftWrap = false;
+                    if (lineCount + 1 < maxLines)
+                    {
+                        lineEnds[lineCount] = laidCount;
+                        lineWidths[lineCount] = penX;
+                        lineCount++;
+                        lineStarts[lineCount] = laidCount;
+                    }
+                    penX = 0f;
+                    penY -= lineHeight;
+                    prevGlyph = -1;
+                    lastSpaceLaidIdx = -1;
+                }
+
                 int gi = ch - SdfFontLoader.FirstAscii;
                 if ((uint)gi >= SdfFontLoader.AsciiCount) gi = 0; // fallback space
 
@@ -118,6 +139,16 @@ public static unsafe class TextLayoutSystem
                 // Word wrap check
                 if (penX + gm.Advance > maxLocalWidth && penX > 0f && lineCount + 1 < maxLines)
                 {
+                    if (ch == (byte)' ')
+                    {
+                        // Break after current word instead of backtracking to an earlier space,
+                        // and defer starting the next line until a non-space character actually follows.
+                        pendingSoftWrap = true;
+                        prevGlyph = -1;
+                        lastSpaceLaidIdx = -1;
+                        continue;
+                    }
+
                     if (lastSpaceLaidIdx >= lineStarts[lineCount] && lastSpaceLaidIdx < laidCount)
                     {
                         lineEnds[lineCount] = lastSpaceLaidIdx;
@@ -156,12 +187,6 @@ public static unsafe class TextLayoutSystem
                         prevGlyph = -1;
                         lastSpaceLaidIdx = -1;
                     }
-
-                    if (ch == (byte)' ')
-                    {
-                        prevGlyph = -1;
-                        continue;
-                    }
                 }
 
                 if (ch == (byte)' ')
@@ -170,10 +195,16 @@ public static unsafe class TextLayoutSystem
                     lastSpacePenX = penX;
                 }
 
-                laid[laidCount++] = new LaidChar { GlyphIndex = gi, X = penX, Y = penY, CharIndex = c };
+                laid[laidCount++] = new LaidChar { GlyphIndex = gi, X = penX, Y = penY, CharIndex = thisCharIdx };
                 penX += gm.Advance + td.LetterSpacing;
                 prevGlyph = gi;
             }
+
+            if (logicalCharCount <= 0) return 0;
+            float visibleCharsF = logicalCharCount * DetMath.Clamp01(td.TypewriterProgress);
+            int visibleCount = (int)MathF.Ceiling(visibleCharsF);
+            if (visibleCount <= 0) return 0;
+            if (visibleCount > logicalCharCount) visibleCount = logicalCharCount;
 
             if (lineCount < maxLines)
             {
@@ -255,7 +286,7 @@ public static unsafe class TextLayoutSystem
                 ref GlyphMetrics gm = ref font.AsciiGlyphs[lc.GlyphIndex];
                 if (gm.HasBitmap == 0) continue;
 
-                float charNorm = totalChars > 1 ? (float)lc.CharIndex / (totalChars - 1) : 0f;
+                float charNorm = logicalCharCount > 1 ? (float)lc.CharIndex / (logicalCharCount - 1) : 0f;
                 float charReveal = DetMath.Clamp01(visibleCharsF - lc.CharIndex);
 
                 // Per-character procedural animation offsets

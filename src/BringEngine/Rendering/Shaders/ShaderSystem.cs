@@ -300,6 +300,15 @@ public static unsafe class ShaderSystem
     public static bool ReleaseShader(ref GpuContext ctx, ShaderHandle handle)
     {
         if (ctx.Initialized == 0 || ctx.Device == nint.Zero) return false;
+        if (handle.IsValid && (handle == ctx.BuiltinPbrShader ||
+                               handle == ctx.BuiltinSpriteShader ||
+                               handle == ctx.BuiltinSdfTextShader ||
+                               handle == ctx.BuiltinParticleShader))
+        {
+            if (ctx.Log != null)
+                LogSystem.Warn(ctx.Log, $"ShaderSystem.ReleaseShader refused to release built-in shader {handle}");
+            return false;
+        }
         GpuShaderSlot* s = TryGetShader(in ctx, handle);
         if (s == null) return false;
 

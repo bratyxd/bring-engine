@@ -1,11 +1,13 @@
 using System;
 using System.IO;
 using System.Text;
+using System.Threading;
 using BringEngine.Assets;
 using BringEngine.Assets.Compression;
 using BringEngine.Assets.Fonts;
 using BringEngine.Assets.Gltf;
 using BringEngine.Assets.Textures;
+using BringEngine.Audio;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Logging;
 using BringEngine.Core.Math;
@@ -14,6 +16,7 @@ using BringEngine.Rendering;
 using BringEngine.Rendering.Gpu;
 using BringEngine.Rendering.Platform;
 using BringEngine.Rendering.Shaders;
+using BringEngine.Simulation.Animation;
 using BringEngine.Simulation.Camera;
 using BringEngine.Simulation.Input;
 using BringEngine.Simulation.Particles;
@@ -30,10 +33,20 @@ public static unsafe class RenderTests
         Console.WriteLine("=== Phases 6-7: SDL3_gpu Renderer, Instancing, 3D Sprites, SDF Text & Shaders ===");
         Assert.Run("TextLayoutSystem_WordWrapShadowTypewriterAndAnimZeroGc", &TestTextLayoutHeadless);
         Assert.Run("TextLayoutSystem_WordWrapSkipsLeadingSpace_And_SingleText512Glyphs", &TestTextWordWrapAndGlyphBudget);
+        Assert.Run("TextLayoutSystem_TrailingSpaceWrapAndMultiByteUtf8Typewriter", &TestTextTrailingSpaceAndUtf8Typewriter);
         Assert.Run("BatchRenderer_CapacityCap_CastShadow0_SortingOrder_ShaderGen_DoubleSided", &TestBatchRendererRulesAndCapacityCap);
         Assert.Run("BatchRenderer_ShadowTexelSnapping_And_SmallShadowDistance", &TestShadowSnappingAndDistance);
+        Assert.Run("BatchRenderer_DirectionalLightViewProj_NaNAndSmallShadowDistance", &TestDirectionalLightNaNAndSmallDistance);
+        Assert.Run("BatchRenderer_ComputeUploadBudget_ElementAlignedClamping", &TestComputeUploadBudgetClamping);
+        Assert.Run("BatchRenderer_MultiCamera8200Meshes_NeverStarvesShadows", &TestMultiCameraShadowReservation);
+        Assert.Run("BatchRenderer_WorstCaseSort_256KBStackZeroGc", &TestAntiQuicksort256KBStack);
+        Assert.Run("BatchRenderer_SpriteDepthTestNonBoolean_NormalizedAndMerged", &TestSpriteDepthTestNormalization);
+        Assert.Run("BatchRenderer_WarningLatch_TenFramesLogOnce", &TestExtractWarningLatchLogOnce);
+        Assert.Run("BatchRenderer_StaleFrameJointPalette_FallbackToStaticZeroCopy", &TestStaleFrameJointPaletteGuard);
+        Assert.Run("PlatformSystem_ScaleLogicalToPixel_RetinaMatchesScreenToWorldRay", &TestHiDpiMouseScalingAndRayCorners);
+        Assert.Run("GpuSystem_NullPointersAndInvalidCapture_RejectedCleanly", &TestGpuSystemValidationHeadless);
         Assert.Run("ShaderCross_SpirvAndMslTranspileSmoke_AllBuiltinShaders", &TestSpirvAndMslSmoke);
-        Assert.Run("InputState_FocusLostClearsHeldKeysAndMouseAndFiresRelease", &TestFocusLostInputRelease);
+        Assert.Run("InputState_FocusLostClearsHeldKeysMouseAndGamepadsAndFiresRelease", &TestFocusLostInputRelease);
         if (!headlessOnly)
         {
             Assert.Run("GpuBatchRenderer_Sdl3GpuInstancingSpritesSdfTextParticlesAndPngCapture", &TestGpuRenderEndToEnd);
@@ -41,6 +54,10 @@ public static unsafe class RenderTests
             Assert.Run("GpuResources_Non4x4Bc1Bc3Fallback_BundleUnloadReuse_And_DisposeOrder", &TestGpuNon4x4AndBundleLifecycle);
             Assert.Run("ShaderSystem_ErrorPaths_ReleaseShader_CustomQuadAnd2SamplerShaders", &TestShaderSystemErrorsAndCustomQuadShaders);
             Assert.Run("GpuBuiltinShaders_MaskShadow_DoubleSided_SdfNoBleed_AdditiveNoDepth_BufferGrow", &TestBuiltinShaderFeaturesAndDynamicGrow);
+            Assert.Run("GpuLifecycle_InitHooks_DeferredRelease_StaleGenSkipped_And_DisposeReset", &TestGpuDeferredReleaseAndLifecycle);
+            Assert.Run("GpuSdfText_TranslucentFillNoOutlineDarkening_And_ZeroAlphaOutlineNoFringe", &TestGpuSdfTextTranslucentCompositing);
+            Assert.Run("PlatformSystem_ShutdownDoesNotKillAudioSubsystem", &TestPlatformShutdownPreservesAudio);
+            Assert.Run("GpuShaders_RefuseReleaseBuiltins_And_ViewportClampingScissor", &TestBuiltinShaderProtectionAndViewportScissor);
         }
     }
 
@@ -112,8 +129,7 @@ public static unsafe class RenderTests
 
         var window = PlatformSystem.InitWindow("BringEngine GPU Test", 640, 360, hidden: true);
         GpuContext* gpu = alloc.Persistent.Alloc<GpuContext>(1, 64);
-        *gpu = GpuSystem.Create(window.Window, ref alloc.Persistent, ref world.Assets, debugMode: false);
-        GpuSystem.BindAssetCleanupHooks(gpu, ref world.Assets);
+        GpuSystem.Init(gpu, window.Window, ref alloc.Persistent, ref world.Assets, debugMode: false);
 
         try
         {
@@ -201,7 +217,7 @@ public static unsafe class RenderTests
         finally
         {
             AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
-            GpuSystem.Dispose(ref *gpu);
+            GpuSystem.Dispose(ref *gpu, ref world.Assets);
             PlatformSystem.Shutdown(ref window);
             bundleArena.Dispose();
             alloc.Dispose();
@@ -221,8 +237,7 @@ public static unsafe class RenderTests
         var window = PlatformSystem.InitWindow("BringEngine Shadow Test", 320, 180, hidden: true);
         GpuContext* gpu = alloc.Persistent.Alloc<GpuContext>(1, 64);
         // Enable SDL3_gpu debug validation layer to prove zero D3D12/Vulkan/Metal barrier or binding errors!
-        *gpu = GpuSystem.Create(window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true);
-        GpuSystem.BindAssetCleanupHooks(gpu, ref world.Assets);
+        GpuSystem.Init(gpu, window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true);
 
         try
         {
@@ -374,7 +389,7 @@ public static unsafe class RenderTests
         finally
         {
             AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
-            GpuSystem.Dispose(ref *gpu);
+            GpuSystem.Dispose(ref *gpu, ref world.Assets);
             PlatformSystem.Shutdown(ref window);
             bundleArena.Dispose();
             alloc.Dispose();
@@ -544,7 +559,7 @@ public static unsafe class RenderTests
             Assert.True(packetSmall.Glyphs[3].UvRect.Equals(fontPtr->AsciiGlyphs['B' - 32].UvRect), "Second text glyphs match SortingOrder=2 ('B')");
             Assert.True(packetSmall.Glyphs[7].UvRect.Equals(fontPtr->AsciiGlyphs['Z' - 32].UvRect), "Last text glyph matches SortingOrder=10 ('Z')");
 
-            // 6.1: Capacity cap overflow (> 16,384 meshes and sprites) must terminate cleanly without hanging!
+            // 6.1: Capacity cap overflow on a tight packetArena must truncate cleanly without hanging or throwing!
             for (int i = 3; i < 16600; i++)
             {
                 EntityId me = EntitySystem.Spawn(ref world.Entities);
@@ -558,10 +573,18 @@ public static unsafe class RenderTests
             TransformSystem.PropagateHierarchy(ref world.Transforms);
             CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, 1f / 60f, 1280, 720);
 
-            alloc.BeginFrame();
-            BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref alloc.Frame, ref alloc.Scratch, out RenderPacket packetCap, log: log);
-            Assert.Equal(16384, packetCap.Instances3D.Count, "3D instances capped at 16,384 without hanging");
-            Assert.Equal(16384, packetCap.Sprites.Count, "Sprites capped at 16,384 without hanging");
+            BatchRenderer.ResetWarningLatchesForTest();
+            var tightFrame = LinearArena.Create(512 * 1024);
+            try
+            {
+                BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref tightFrame, ref alloc.Scratch, out RenderPacket packetCap, log: log);
+                Assert.True(packetCap.Instances3D.Count > 0 && packetCap.Instances3D.Count < 16600, $"3D instances truncated cleanly to arena budget ({packetCap.Instances3D.Count})");
+                Assert.True(packetCap.Sprites.Count > 0 && packetCap.Sprites.Count < 16600, $"Sprites truncated cleanly to arena budget ({packetCap.Sprites.Count})");
+            }
+            finally
+            {
+                tightFrame.Dispose();
+            }
 
             LogSystem.Flush(log);
             string logText = ReadAllTextShared(LogSystem.GetFilePath(log));
@@ -672,19 +695,29 @@ public static unsafe class RenderTests
         InputState input = default;
         input.SetKey(KeyCode.W, true);
         input.MouseButtonsDown = 1u;
-        input.BeginFrame(); // W and mouse 0 now in Prev & Down
+        input.SetGamepadConnected(0, true, 1001u);
+        input.SetGamepadButton(0, GamepadButton.South, true);
+        input.SetGamepadAxis(0, GamepadAxis.LeftX, 0.8f);
+        input.SetGamepadAxis(0, GamepadAxis.LeftY, -0.6f);
+        input.SetGamepadAxis(0, GamepadAxis.RightTrigger, 0.9f);
+        input.BeginFrame(); // Key, mouse, and gamepad states now in Prev & Down
 
         Assert.True(input.IsKeyDown(KeyCode.W), "W is initially held");
         Assert.True(input.IsMouseDown(0), "Mouse 0 is initially held");
+        Assert.True(input.IsGamepadButtonDown(GamepadButton.South, 0), "Gamepad South is initially held");
 
-        // Simulate WindowFocusLost clear (matching PlatformSystem.PollEvents)
-        input.SetWindowFocused(false);
-        for (int k = 0; k < 8; k++) input.KeysDown[k] = 0;
-        input.MouseButtonsDown = 0;
+        // Invoke production helper used by PlatformSystem.PollEvents on WindowFocusLost
+        InputSystem.ApplyFocusLost(ref input);
 
         Assert.True(!input.IsWindowFocused && input.WasWindowFocusLost, "Window focus lost recorded");
         Assert.True(!input.IsKeyDown(KeyCode.W) && input.IsKeyReleased(KeyCode.W), "Held key released cleanly on focus lost");
         Assert.True(!input.IsMouseDown(0) && input.IsMouseReleased(0), "Held mouse button released cleanly on focus lost");
+        Assert.True(!input.IsGamepadButtonDown(GamepadButton.South, 0) && input.IsGamepadButtonReleased(GamepadButton.South, 0),
+            "Held gamepad button released cleanly on focus lost");
+        Vec2 stick = input.GetGamepadLeftStick(0, 0f);
+        Assert.Near(0f, stick.X, 1e-5f, "Gamepad left stick X cleared on focus lost");
+        Assert.Near(0f, stick.Y, 1e-5f, "Gamepad left stick Y cleared on focus lost");
+        Assert.Near(0f, input.GetGamepadRightTrigger(0), 1e-5f, "Gamepad right trigger cleared on focus lost");
     }
 
     private static void TestGpuNon4x4AndBundleLifecycle()
@@ -706,8 +739,7 @@ public static unsafe class RenderTests
         var window = PlatformSystem.InitWindow("Non4x4 & Lifecycle Test", 320, 180, hidden: true, log: log);
         Assert.True(window.Mode == WindowMode.Windowed, "Hidden window defaults to Windowed mode");
         GpuContext* gpu = alloc.Persistent.Alloc<GpuContext>(1, 64);
-        *gpu = GpuSystem.Create(window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true, log: log);
-        GpuSystem.BindAssetCleanupHooks(gpu, ref world.Assets);
+        GpuSystem.Init(gpu, window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true, log: log);
 
         try
         {
@@ -750,10 +782,13 @@ public static unsafe class RenderTests
             int slot2 = AssetSystem.TryGetTexture(in world.Assets, tBc3)->GpuSlot;
             Assert.True(slot1 >= 0 && slot2 >= 0, "Non-4x4 BC1 & BC3 uploaded cleanly via RGBA8 fallback");
 
-            // Unload bundle 1 -> GPU texture slots released immediately
+            // Unload bundle 1 -> deferred release enqueues GPU texture slots until FlushDeferredReleases
             AssetSystem.UnloadByBundle(ref world.Assets, b1);
-            Assert.Equal((byte)0, gpu->Textures[slot1].Alive, "Bundle unload released GPU texture slot 1");
-            Assert.Equal((byte)0, gpu->Textures[slot2].Alive, "Bundle unload released GPU texture slot 2");
+            Assert.Equal((byte)1, gpu->Textures[slot1].Alive, "Bundle unload defers GPU texture slot 1 release until FlushDeferredReleases");
+            Assert.Equal((byte)1, gpu->TextureSlotPendingRelease[slot1], "Bundle unload marks GPU texture slot 1 pending release");
+            GpuSystem.FlushDeferredReleases(ref *gpu);
+            Assert.Equal((byte)0, gpu->Textures[slot1].Alive, "FlushDeferredReleases released GPU texture slot 1");
+            Assert.Equal((byte)0, gpu->Textures[slot2].Alive, "FlushDeferredReleases released GPU texture slot 2");
 
             // Reuse slots with bundle 2 and render cleanly
             TextureHandle tReuse = TextureLoader.CreateSolidColor(new Color32(0, 255, 255, 255), ref bundle2Arena, ref world.Assets, b2, StringId.Hash("reuse_tex"));
@@ -807,8 +842,7 @@ public static unsafe class RenderTests
 
         var window = PlatformSystem.InitWindow("Shader Errors & Custom Quads", 320, 180, hidden: true, log: log);
         GpuContext* gpu = alloc.Persistent.Alloc<GpuContext>(1, 64);
-        *gpu = GpuSystem.Create(window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true, maxShaders: 16, log: log);
-        GpuSystem.BindAssetCleanupHooks(gpu, ref world.Assets);
+        GpuSystem.Init(gpu, window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true, maxShaders: 16, log: log);
 
         try
         {
@@ -973,8 +1007,7 @@ public static unsafe class RenderTests
 
         var window = PlatformSystem.InitWindow("Builtin Features & Buffer Grow", 320, 180, hidden: true, log: log);
         GpuContext* gpu = alloc.Persistent.Alloc<GpuContext>(1, 64);
-        *gpu = GpuSystem.Create(window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true, log: log);
-        GpuSystem.BindAssetCleanupHooks(gpu, ref world.Assets);
+        GpuSystem.Init(gpu, window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true, log: log);
 
         try
         {
@@ -1096,5 +1129,848 @@ public static unsafe class RenderTests
         }
 
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after builtin features & dynamic grow test");
+    }
+
+    // ==================== WP-B5 Regression Tests ====================
+
+    private static void TestTextTrailingSpaceAndUtf8Typewriter()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 1 * 1024 * 1024, 1 * 1024 * 1024, 128 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 64, 64);
+        var bundleArena = LinearArena.Create(2 * 1024 * 1024);
+        var bundleId = BundleId.Create(1, 1);
+
+        try
+        {
+            FontHandle fontH = SdfFontLoader.BakeSdfFromSystemOrFile(null, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("r08_font"), 48f, 512, 6);
+            FontAssetData* font = AssetSystem.TryGetFont(in world.Assets, fontH);
+
+            var e = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, e, Vec3.Zero);
+            TransformSystem.PropagateHierarchy(ref world.Transforms);
+            var camH = CameraSystem.CreateOrthographicUI(ref world.Cameras, 1280f, 720f);
+            CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, 1f / 60f, 1280, 720);
+            CameraData* cam = CameraSystem.TryGetPtr(in world.Cameras, camH);
+
+            ref GlyphMetrics gmA = ref font->AsciiGlyphs['A' - SdfFontLoader.FirstAscii];
+            ref GlyphMetrics gmB = ref font->AsciiGlyphs['B' - SdfFontLoader.FirstAscii];
+            ref GlyphMetrics gmSp = ref font->AsciiGlyphs[0];
+            float kernASp = font->AsciiKerning != null ? font->AsciiKerning[('A' - 32) * SdfFontLoader.AsciiCount + 0] : 0f;
+            float kernSpB = font->AsciiKerning != null ? font->AsciiKerning[0 * SdfFontLoader.AsciiCount + ('B' - 32)] : 0f;
+            float widthAB = gmA.Advance + kernASp + gmSp.Advance + kernSpB + gmB.Advance;
+
+            // MaxWidth fits "A B" comfortably, but overflows on the trailing space in "A B "
+            float maxW = widthAB + gmSp.Advance * 0.25f;
+
+            var tdNoTrail = RenderComponentSystem.DefaultHudText(e, fontH, "A B", default);
+            tdNoTrail.FontScale = 1f;
+            tdNoTrail.AlignV = TextAlignmentV.Middle;
+            tdNoTrail.ShadowColor = ColorF.Transparent;
+            tdNoTrail.ShadowOffset = Vec2.Zero;
+            tdNoTrail.MaxWidth = maxW;
+
+            var tdTrail = RenderComponentSystem.DefaultHudText(e, fontH, "A B ", default);
+            tdTrail.FontScale = 1f;
+            tdTrail.AlignV = TextAlignmentV.Middle;
+            tdTrail.ShadowColor = ColorF.Transparent;
+            tdTrail.ShadowOffset = Vec2.Zero;
+            tdTrail.MaxWidth = maxW;
+
+            alloc.BeginFrame();
+            var glyphs1 = NativeList<GlyphGpuInstance>.CreateInArena(ref alloc.Frame, 32);
+            var glyphs2 = NativeList<GlyphGpuInstance>.CreateInArena(ref alloc.Frame, 32);
+            int c1 = TextLayoutSystem.LayoutTextIntoGlyphs(in tdNoTrail, in *font, in world.Transforms, in *cam, ref alloc.Scratch, ref glyphs1);
+            int c2 = TextLayoutSystem.LayoutTextIntoGlyphs(in tdTrail, in *font, in world.Transforms, in *cam, ref alloc.Scratch, ref glyphs2);
+
+            Assert.Equal(2, c1, "\"A B\" emits 2 visible glyphs");
+            Assert.Equal(2, c2, "\"A B \" emits 2 visible glyphs");
+            // Both 'A' and 'B' must stay on the exact same single line (matching baseline Y of "A B")
+            Assert.Near(glyphs1[0].OriginAndPad.Y, glyphs2[0].OriginAndPad.Y, 1e-3f, "\"A B \" keeps 'A' on line 1");
+            Assert.Near(glyphs1[1].OriginAndPad.Y, glyphs2[1].OriginAndPad.Y, 1e-3f, "\"A B \" keeps 'B' on line 1 (no backtrack split)");
+
+            // Multi-byte UTF-8 ("é" = 2 bytes) with TypewriterProgress = 0.5f must emit 1 logical glyph, not 0
+            var tdUtf8 = RenderComponentSystem.DefaultHudText(e, fontH, "\u00E9", default);
+            tdUtf8.ShadowColor = ColorF.Transparent;
+            tdUtf8.ShadowOffset = Vec2.Zero;
+            tdUtf8.TypewriterProgress = 0.5f;
+            var glyphs3 = NativeList<GlyphGpuInstance>.CreateInArena(ref alloc.Frame, 16);
+            int c3 = TextLayoutSystem.LayoutTextIntoGlyphs(in tdUtf8, in *font, in world.Transforms, in *cam, ref alloc.Scratch, ref glyphs3);
+            Assert.Equal(1, c3, "Multi-byte UTF-8 \"é\" with TypewriterProgress=0.5f emits 1 glyph");
+        }
+        finally
+        {
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after RENDER-08 text test");
+    }
+
+    private static void TestDirectionalLightNaNAndSmallDistance()
+    {
+        SceneLighting lit = SceneLighting.Default;
+        lit.SunDirection = new Vec3(float.NaN, float.NaN, float.NaN);
+        lit.ShadowCenter = new Vec3(float.NaN, 0f, float.PositiveInfinity);
+        lit.ShadowDistance = 0.25f;
+
+        Mat4 mNan = BatchRenderer.ComputeDirectionalLightViewProj(in lit, 1024u);
+        Assert.True(
+            float.IsFinite(mNan.C0.X) && float.IsFinite(mNan.C1.Y) && float.IsFinite(mNan.C2.Z) && float.IsFinite(mNan.C3.W) &&
+            float.IsFinite(mNan.C3.X) && float.IsFinite(mNan.C3.Y) && float.IsFinite(mNan.C3.Z),
+            "NaN SunDirection and ShadowCenter still yield a finite LightViewProj matrix");
+
+        lit.SunDirection = new Vec3(0.3f, 0.9f, 0.2f).Normalized();
+        lit.ShadowCenter = new Vec3(1f, 2f, 3f);
+        lit.ShadowDistance = 0.25f;
+        Mat4 mSmall = BatchRenderer.ComputeDirectionalLightViewProj(in lit, 1024u);
+        Vec4 clipCenter = Mat4.TransformVec4(in mSmall, new Vec4(lit.ShadowCenter, 1f));
+        float clipZ = clipCenter.Z / clipCenter.W;
+        Assert.True(float.IsFinite(clipZ) && clipZ > 0.1f && clipZ < 0.9f,
+            $"Small ShadowDistance=0.25f places ShadowCenter clip Z inside (0.1, 0.9), got {clipZ:F4}");
+    }
+
+    private static void TestComputeUploadBudgetClamping()
+    {
+        uint sz3D = (uint)sizeof(Instance3DGpu);       // 128
+        uint szJ = (uint)sizeof(Mat4);                 // 64
+        uint szS = (uint)sizeof(SpriteGpuInstance);    // 112
+        uint szG = (uint)sizeof(GlyphGpuInstance);     // 144
+        uint szP = (uint)sizeof(ParticleGpuInstance);  // 64
+
+        // Transfer buffer fits 3 Instance3D (384 B), 2 Mat4 (128 B, off=384), and 1 Sprite (112 B, off=512 -> end=624)
+        // with 40 extra bytes (< 1 sprite, < 1 glyph) -> trailing glyphs & particles must clamp to 0!
+        uint smallTb = 3u * sz3D + 2u * szJ + 1u * szS + 40u;
+        var b = BatchRenderer.ComputeUploadBudget(
+            reqInst3D: 3, reqJoints: 2, reqSprites: 5, reqGlyphs: 4, reqParticles: 8,
+            inst3DBufBytes: 1024 * 1024, jointBufBytes: 1024 * 1024, spriteBufBytes: 1024 * 1024,
+            glyphBufBytes: 1024 * 1024, particleBufBytes: 1024 * 1024,
+            transferBufBytes: smallTb);
+
+        Assert.Equal(3u, b.Inst3D, "All 3 Instance3D fit");
+        Assert.Equal(2u, b.Joints, "All 2 Joints fit");
+        Assert.Equal(1u, b.Sprites, "Sprites clamped element-aligned to 1");
+        Assert.Equal(0u, b.Glyphs, "Glyphs clamped cleanly to 0 when transfer buffer exhausted");
+        Assert.Equal(0u, b.Particles, "Particles clamped cleanly to 0 when transfer buffer exhausted");
+        Assert.Equal(0u, b.BytesSprites % szS, "Sprite upload bytes strictly element-aligned");
+        Assert.True(b.TotalBytes <= smallTb, $"TotalBytes ({b.TotalBytes}) <= transferBufBytes ({smallTb})");
+        Assert.Equal(0u, b.OffJoints & 63u, "Joint offset 64-byte aligned");
+        Assert.Equal(0u, b.OffSprites & 63u, "Sprite offset 64-byte aligned");
+
+        // Also test clamping purely by storage buffer capacity smaller than request
+        var b2 = BatchRenderer.ComputeUploadBudget(
+            reqInst3D: 100, reqJoints: 50, reqSprites: 20, reqGlyphs: 10, reqParticles: 30,
+            inst3DBufBytes: sz3D * 4 + 17, jointBufBytes: szJ * 3 + 9, spriteBufBytes: szS * 2 + 5,
+            glyphBufBytes: szG * 1 + 11, particleBufBytes: szP * 5 + 3,
+            transferBufBytes: 1024 * 1024);
+        Assert.Equal(4u, b2.Inst3D, "Instance3D clamped to storage buffer element capacity");
+        Assert.Equal(3u, b2.Joints, "Joints clamped to storage buffer element capacity");
+        Assert.Equal(2u, b2.Sprites, "Sprites clamped to storage buffer element capacity");
+        Assert.Equal(1u, b2.Glyphs, "Glyphs clamped to storage buffer element capacity");
+        Assert.Equal(5u, b2.Particles, "Particles clamped to storage buffer element capacity");
+    }
+
+    private static void TestMultiCameraShadowReservation()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(24 * 1024 * 1024, 16 * 1024 * 1024, 8 * 1024 * 1024, 256 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, maxEntities: 9000, maxParticles: 64);
+        world.RenderComponents = RenderComponentTables.Create(ref alloc.Persistent, maxMeshRenderers: 9000, maxSprites: 64, maxTexts: 64);
+        var bundleArena = LinearArena.Create(2 * 1024 * 1024);
+        var bundleId = BundleId.Create(1, 1);
+
+        try
+        {
+            var boxSpec = GlbBuilder.CreateBoxSpec(Vec3.One, ColorF.White);
+            byte[] boxGlb = GlbBuilder.BuildGlb(in boxSpec, includeDemoAnimation: false);
+            GltfHandle boxGltf = GltfLoader.LoadFromMemory(boxGlb, null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("r09_box"));
+            MeshHandle meshH = AssetSystem.TryGetGltf(in world.Assets, boxGltf)->Primitives[0].Mesh;
+            MeshAssetData* meshPtr = AssetSystem.TryGetMesh(in world.Assets, meshH);
+            meshPtr->GpuSlot = 0;
+            meshPtr->GpuSlotGen = 1;
+
+            MaterialHandle matH = AssetSystem.RegisterMaterial(ref world.Assets, new MaterialAssetData
+            {
+                OwnerBundle = bundleId, BaseColorFactor = ColorF.White, AlphaMode = MaterialAlphaMode.Opaque,
+            });
+
+            // 8,200 visible shadow-casting meshes * 2 cameras = 16,400 main instances (previously filled the 16,384 cap and starved shadows!)
+            for (int i = 0; i < 8200; i++)
+            {
+                EntityId e = EntitySystem.Spawn(ref world.Entities);
+                TransformSystem.Add(ref world.Transforms, e, new Vec3((i % 20 - 10) * 0.2f, 0f, (i % 10 - 5) * 0.2f));
+                RenderComponentSystem.AddMeshRenderer(ref world.RenderComponents, e, meshH, matH, default, ColorF.White, 1u, AnimPlayerHandle.Invalid);
+            }
+
+            CameraSystem.CreatePerspective(ref world.Cameras, new Vec3(0f, 3f, 12f), Vec3.Zero, depthOrder: 0);
+            CameraSystem.CreatePerspective(ref world.Cameras, new Vec3(0f, 4f, 14f), Vec3.Zero, depthOrder: 1);
+            TransformSystem.PropagateHierarchy(ref world.Transforms);
+            CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, 1f / 60f, 1280, 720);
+
+            var shaders = new RenderShaderDefaults { Pbr = ShaderHandle.Create(1, 1) };
+            alloc.BeginFrame();
+            BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref alloc.Frame, ref alloc.Scratch, out RenderPacket packet);
+
+            Assert.Equal((byte)1, packet.ShadowsActive, "Shadows remain active with 2 cameras + 8,200 meshes");
+            Assert.True(packet.ShadowBatches3D.Count > 0, $"ShadowBatches3D populated ({packet.ShadowBatches3D.Count})");
+            Assert.Equal(2, packet.Cameras.Length, "Both cameras extracted");
+            Assert.True(packet.Cameras[0].Batch3DCount > 0 && packet.Cameras[1].Batch3DCount > 0, "Both cameras rendered 3D batches");
+            Assert.Equal(8200 * 3, packet.Instances3D.Count, "All 8,200 shadow casters + 2x 8,200 camera instances fit under raised 65,536 cap");
+        }
+        finally
+        {
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after RENDER-09 multi-camera shadow test");
+    }
+
+    private static void TestAntiQuicksort256KBStack()
+    {
+        Exception? threadEx = null;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                NativeMemoryTracker.ResetStatsForTest();
+                var alloc = EngineAllocators.Create(28 * 1024 * 1024, 16 * 1024 * 1024, 8 * 1024 * 1024, 256 * 1024);
+                var world = EngineWorld.Create(ref alloc.Persistent, maxEntities: 17000, maxParticles: 64);
+                world.RenderComponents = RenderComponentTables.Create(ref alloc.Persistent, maxMeshRenderers: 17000, maxSprites: 17000, maxTexts: 64);
+                var bundleArena = LinearArena.Create(2 * 1024 * 1024);
+                var bundleId = BundleId.Create(1, 1);
+
+                try
+                {
+                    var boxSpec = GlbBuilder.CreateBoxSpec(Vec3.One, ColorF.White);
+                    byte[] boxGlb = GlbBuilder.BuildGlb(in boxSpec, includeDemoAnimation: false);
+                    GltfHandle boxGltf = GltfLoader.LoadFromMemory(boxGlb, null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("qsort_box"));
+                    MeshHandle meshH = AssetSystem.TryGetGltf(in world.Assets, boxGltf)->Primitives[0].Mesh;
+                    AssetSystem.TryGetMesh(in world.Assets, meshH)->GpuSlot = 0;
+
+                    TextureHandle texH = TextureLoader.CreateSolidColor(Color32.White, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("qsort_tex"));
+                    AssetSystem.TryGetTexture(in world.Assets, texH)->GpuSlot = 0;
+
+                    MaterialHandle mat0 = AssetSystem.RegisterMaterial(ref world.Assets, new MaterialAssetData { OwnerBundle = bundleId, AlphaMode = MaterialAlphaMode.Opaque });
+                    MaterialHandle mat1 = AssetSystem.RegisterMaterial(ref world.Assets, new MaterialAssetData { OwnerBundle = bundleId, AlphaMode = MaterialAlphaMode.Blend });
+
+                    const int N = 16384;
+                    for (int i = 0; i < N; i++)
+                    {
+                        EntityId e = EntitySystem.Spawn(ref world.Entities);
+                        TransformSystem.Add(ref world.Transforms, e, Vec3.Zero);
+                        // Alternating / anti-quicksort pattern across keys
+                        MaterialHandle mh = ((i & 1) == 0) ? mat1 : mat0;
+                        RenderComponentSystem.AddMeshRenderer(ref world.RenderComponents, e, meshH, mh, default, ColorF.White, 1u, AnimPlayerHandle.Invalid);
+                        short layer = (short)((i & 1) == 0 ? (N - i) % 1024 : (i % 1024));
+                        RenderComponentSystem.AddSprite(ref world.RenderComponents, new SpriteData
+                        {
+                            Entity = e, Texture = texH, Size = Vec2.One, Color = ColorF.White,
+                            SortingLayer = layer, OrderInLayer = (short)(N - i), LayerMask = 1u, Visible = 1,
+                        });
+                    }
+
+                    CameraSystem.CreatePerspective(ref world.Cameras, new Vec3(0f, 2f, 10f), Vec3.Zero);
+                    TransformSystem.PropagateHierarchy(ref world.Transforms);
+                    CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, 1f / 60f, 1280, 720);
+
+                    var shaders = new RenderShaderDefaults { Pbr = ShaderHandle.Create(1, 1), Sprite = ShaderHandle.Create(2, 1) };
+                    SceneLighting lit = SceneLighting.Default;
+                    lit.ShadowsEnabled = 0;
+
+                    // Warmup + Zero-GC check on 256KB stack thread
+                    alloc.BeginFrame();
+                    BatchRenderer.ExtractRenderPacket(in shaders, in world, in lit, ref alloc.Frame, ref alloc.Scratch, out RenderPacket pWarm);
+                    Assert.Equal(N, pWarm.Instances3D.Count, "All 16,384 meshes sorted and extracted on 256KB stack");
+                    Assert.Equal(N, pWarm.Sprites.Count, "All 16,384 sprites sorted and extracted on 256KB stack");
+                    Assert.Equal(2, pWarm.Batches3D.Count, "Sorted opaque + blend meshes merge into exactly 2 batches");
+
+                    long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+                    alloc.BeginFrame();
+                    BatchRenderer.ExtractRenderPacket(in shaders, in world, in lit, ref alloc.Frame, ref alloc.Scratch, out RenderPacket p2);
+                    long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+                    Assert.Equal(0L, gcAfter - gcBefore, "Worst-case 16,384 sort allocates 0 GC bytes");
+                    Assert.Equal(2, p2.Batches3D.Count, "Second pass sorted cleanly");
+                }
+                finally
+                {
+                    bundleArena.Dispose();
+                    alloc.Dispose();
+                }
+                Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after 256KB stack sort test");
+            }
+            catch (Exception ex)
+            {
+                threadEx = ex;
+            }
+        }, maxStackSize: 256 * 1024);
+
+        t.Start();
+        t.Join();
+        if (threadEx != null)
+            throw new Exception($"Anti-quicksort 256KB stack thread failed: {threadEx.Message}", threadEx);
+    }
+
+    private static void TestSpriteDepthTestNormalization()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 2 * 1024 * 1024, 1 * 1024 * 1024, 128 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 64, 64);
+        var bundleArena = LinearArena.Create(512 * 1024);
+        var bundleId = BundleId.Create(1, 1);
+
+        try
+        {
+            TextureHandle texH = TextureLoader.CreateSolidColor(Color32.White, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("dt_tex"));
+            AssetSystem.TryGetTexture(in world.Assets, texH)->GpuSlot = 0;
+            AssetSystem.TryGetTexture(in world.Assets, texH)->GpuSlotGen = 1;
+
+            EntityId e1 = EntitySystem.Spawn(ref world.Entities);
+            EntityId e2 = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, e1, new Vec3(-1f, 0f, 0f));
+            TransformSystem.Add(ref world.Transforms, e2, new Vec3(1f, 0f, 0f));
+
+            RenderComponentSystem.AddSprite(ref world.RenderComponents, new SpriteData
+            {
+                Entity = e1, Texture = texH, Size = Vec2.One, Color = ColorF.White,
+                SortingLayer = 0, OrderInLayer = 0, BlendMode = SpriteBlendMode.AlphaBlend, DepthTest = 1, LayerMask = 1u, Visible = 1,
+            });
+            RenderComponentSystem.AddSprite(ref world.RenderComponents, new SpriteData
+            {
+                Entity = e2, Texture = texH, Size = Vec2.One, Color = ColorF.White,
+                SortingLayer = 0, OrderInLayer = 0, BlendMode = SpriteBlendMode.AlphaBlend, DepthTest = 255, LayerMask = 1u, Visible = 1,
+            });
+
+            CameraSystem.CreatePerspective(ref world.Cameras, new Vec3(0f, 0f, 5f), Vec3.Zero);
+            TransformSystem.PropagateHierarchy(ref world.Transforms);
+            CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, 1f / 60f, 1280, 720);
+
+            var shaders = new RenderShaderDefaults { Sprite = ShaderHandle.Create(2, 1) };
+            alloc.BeginFrame();
+            BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref alloc.Frame, ref alloc.Scratch, out RenderPacket pkt);
+
+            Assert.Equal(1, pkt.SpriteBatches.Count, "DepthTest=1 and DepthTest=255 merge into 1 SpriteBatchCmd");
+            Assert.Equal(2u, pkt.SpriteBatches[0].InstanceCount, "Merged batch contains both sprites");
+            Assert.Equal((byte)1, pkt.SpriteBatches[0].DepthTest, "Normalized DepthTest is 1");
+        }
+        finally
+        {
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after RENDER-13 test");
+    }
+
+    private static void TestExtractWarningLatchLogOnce()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string logDir = Path.Combine(AppContext.BaseDirectory, "test_render_logs_latch");
+        if (Directory.Exists(logDir)) Directory.Delete(logDir, recursive: true);
+
+        var alloc = EngineAllocators.Create(8 * 1024 * 1024, 1 * 1024 * 1024, 2 * 1024 * 1024, 256 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, maxEntities: 2048, maxParticles: 64);
+        world.RenderComponents = RenderComponentTables.Create(ref alloc.Persistent, maxMeshRenderers: 2048, maxSprites: 64, maxTexts: 64);
+        LogState* log = alloc.Persistent.Alloc<LogState>(1, 64);
+        LogSystem.Start(log, ref alloc.Persistent, directoryOverride: logDir, minLevel: LogLevel.Warn, hookExceptions: false);
+        var bundleArena = LinearArena.Create(1 * 1024 * 1024);
+        var bundleId = BundleId.Create(1, 1);
+        var tinyFrame = LinearArena.Create(32 * 1024);
+
+        try
+        {
+            var boxSpec = GlbBuilder.CreateBoxSpec(Vec3.One, ColorF.White);
+            byte[] boxGlb = GlbBuilder.BuildGlb(in boxSpec, includeDemoAnimation: false);
+            GltfHandle boxGltf = GltfLoader.LoadFromMemory(boxGlb, null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("latch_box"));
+            MeshHandle meshH = AssetSystem.TryGetGltf(in world.Assets, boxGltf)->Primitives[0].Mesh;
+            AssetSystem.TryGetMesh(in world.Assets, meshH)->GpuSlot = 0;
+
+            MaterialHandle matH = AssetSystem.RegisterMaterial(ref world.Assets, new MaterialAssetData { OwnerBundle = bundleId });
+            for (int i = 0; i < 1000; i++)
+            {
+                EntityId e = EntitySystem.Spawn(ref world.Entities);
+                TransformSystem.Add(ref world.Transforms, e, Vec3.Zero);
+                int mr = RenderComponentSystem.AddMeshRenderer(ref world.RenderComponents, e, meshH, matH, default, ColorF.White, 1u, AnimPlayerHandle.Invalid);
+                world.RenderComponents.MeshRenderers[mr].CastShadow = 0;
+            }
+            CameraSystem.CreatePerspective(ref world.Cameras, new Vec3(0f, 2f, 10f), Vec3.Zero);
+            TransformSystem.PropagateHierarchy(ref world.Transforms);
+            CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, 1f / 60f, 1280, 720);
+
+            var shaders = new RenderShaderDefaults { Pbr = ShaderHandle.Create(1, 1) };
+            SceneLighting lit = SceneLighting.Default;
+            lit.ShadowsEnabled = 0;
+
+            BatchRenderer.ResetWarningLatchesForTest();
+            long loggedBefore = Volatile.Read(ref log->TotalLogged.Value);
+            for (int f = 0; f < 10; f++)
+            {
+                tinyFrame.Reset();
+                BatchRenderer.ExtractRenderPacket(in shaders, in world, in lit, ref tinyFrame, ref alloc.Scratch, out _, log: log);
+            }
+            long loggedDelta = Volatile.Read(ref log->TotalLogged.Value) - loggedBefore;
+            Assert.Equal(1L, loggedDelta, $"10 consecutive cap-hit frames must log [WARN] exactly once, got {loggedDelta}");
+        }
+        finally
+        {
+            LogSystem.Stop(log);
+            tinyFrame.Dispose();
+            bundleArena.Dispose();
+            alloc.Dispose();
+            if (Directory.Exists(logDir)) Directory.Delete(logDir, recursive: true);
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after XMOD-07 warning latch test");
+    }
+
+    private static void TestStaleFrameJointPaletteGuard()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 256 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 256, 64);
+        var bundleArena = LinearArena.Create(2 * 1024 * 1024);
+        var bundleId = BundleId.Create(1, 1);
+
+        try
+        {
+            var heroSpec = GlbBuilder.CreateHeroMechSpec(ColorF.Blue, ColorF.Cyan);
+            byte[] heroGlb = GlbBuilder.BuildGlb(in heroSpec, includeDemoAnimation: true);
+            GltfHandle heroGltf = GltfLoader.LoadFromMemory(heroGlb, null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("xmod10_hero"));
+            GltfModelAssetData* model = AssetSystem.TryGetGltf(in world.Assets, heroGltf);
+            for (int p = 0; p < model->PrimitiveCount; p++)
+            {
+                MeshAssetData* mp = AssetSystem.TryGetMesh(in world.Assets, model->Primitives[p].Mesh);
+                if (mp != null) { mp->GpuSlot = p; mp->GpuSlotGen = 1; }
+            }
+
+            GltfLoader.Instantiate(ref world, ref alloc.Scratch, heroGltf, Vec3.Zero, Quat.Identity, Vec3.One);
+            CameraSystem.CreatePerspective(ref world.Cameras, new Vec3(0f, 2f, 8f), Vec3.Zero);
+            TransformSystem.PropagateHierarchy(ref world.Transforms);
+            CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, 1f / 60f, 1280, 720);
+
+            var shaders = new RenderShaderDefaults { Pbr = ShaderHandle.Create(1, 1) };
+
+            // Frame 1: Step animations into alloc.Frame -> JointPalette must be fresh and copied
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref world.Animations, 1f / 60f, ref alloc.Frame, ref alloc.Scratch);
+            BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref alloc.Frame, ref alloc.Scratch, out RenderPacket pFresh);
+            Assert.True(pFresh.JointPalette.Length > 0, "Frame 1 with StepAll copies fresh JointPalette");
+
+            // Frame 2: Reset alloc.Frame WITHOUT stepping AnimationSystem -> stale palette MUST NOT be copied!
+            alloc.Frame.Reset();
+            BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref alloc.Frame, ref alloc.Scratch, out RenderPacket pStale);
+            Assert.Equal(0, pStale.JointPalette.Length, "Frame 2 without StepAll returns empty JointPalette (no stale alias)");
+            Assert.True(pStale.Instances3D.Count > 0, "Skinned meshes still extract cleanly as static fallback");
+            for (int i = 0; i < pStale.Instances3D.Count; i++)
+                Assert.True(pStale.Instances3D[i].Extra.Z < 0f, "Stale joint palette forces jointOffset = -1 static fallback");
+        }
+        finally
+        {
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after XMOD-10 stale joint palette test");
+    }
+
+    private static void TestHiDpiMouseScalingAndRayCorners()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 512 * 1024, 512 * 1024, 64 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 32, 32);
+
+        try
+        {
+            CameraHandle camH = CameraSystem.CreatePerspective(ref world.Cameras, new Vec3(0f, 3f, 8f), Vec3.Zero, 60f);
+            CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, 1f / 60f, 1280f, 720f);
+            CameraData* cam = CameraSystem.TryGetPtr(in world.Cameras, camH);
+
+            int logicalW = 1280, logicalH = 720;
+            (float lx, float ly)[] samplePoints =
+            {
+                (0f, 0f),
+                (logicalW, 0f),
+                (0f, logicalH),
+                (logicalW, logicalH),
+                (logicalW * 0.5f, logicalH * 0.5f),
+                (320f, 180f),
+            };
+
+            (int pw, int ph, string label)[] scales =
+            {
+                (1280, 720, "1x"),
+                (1920, 1080, "1.5x"),
+                (2560, 1440, "2x Retina"),
+            };
+
+            foreach (var (lx, ly) in samplePoints)
+            {
+                Ray refRay = CameraSystem.ScreenToWorldRay(in *cam, lx, ly, logicalW, logicalH);
+                foreach (var (pw, ph, label) in scales)
+                {
+                    PlatformSystem.ScaleLogicalToPixel(lx, ly, logicalW, logicalH, pw, ph, out float px, out float py);
+                    Ray scaledRay = CameraSystem.ScreenToWorldRay(in *cam, px, py, pw, ph);
+                    Assert.Near(refRay.Direction.X, scaledRay.Direction.X, 1e-4f, $"{label} ray dir.X matches at ({lx},{ly})");
+                    Assert.Near(refRay.Direction.Y, scaledRay.Direction.Y, 1e-4f, $"{label} ray dir.Y matches at ({lx},{ly})");
+                    Assert.Near(refRay.Direction.Z, scaledRay.Direction.Z, 1e-4f, $"{label} ray dir.Z matches at ({lx},{ly})");
+                }
+            }
+        }
+        finally
+        {
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after RENDER-04 HiDPI mouse scaling test");
+    }
+
+    private static void TestGpuSystemValidationHeadless()
+    {
+        GpuContext dummyCtx = default;
+        dummyCtx.Initialized = 1;
+        dummyCtx.Device = (nint)1; // non-zero sentinel for validation checks (returns -1 / false before any SDL call)
+        dummyCtx.MaxMeshes = 4;
+        dummyCtx.MaxTextures = 4;
+        GpuMeshSlot* mSlots = stackalloc GpuMeshSlot[4];
+        GpuTextureSlot* tSlots = stackalloc GpuTextureSlot[4];
+        dummyCtx.Meshes = mSlots;
+        dummyCtx.Textures = tSlots;
+
+        var nullMesh = new MeshAssetData { GpuSlot = -1, VertexCount = 3, IndexCount = 3, Vertices = null, Indices = null };
+        Assert.Equal(-1, GpuSystem.EnsureMeshUploaded(ref dummyCtx, ref nullMesh), "Null vertex/index pointers rejected with -1");
+
+        byte* tinyBuf = stackalloc byte[4];
+        var underTex = new TextureAssetData
+        {
+            GpuSlot = -1, Width = 16, Height = 16, Format = TexturePixelFormat.Rgba8, Channels = 4,
+            Pixels = tinyBuf, DataBytes = 4, // needs 16*16*4 = 1024
+        };
+        Assert.Equal(-1, GpuSystem.EnsureTextureUploaded(ref dummyCtx, ref underTex), "Undersized TextureAssetData.DataBytes rejected with -1");
+
+        dummyCtx.CaptureColorTexture = (nint)1;
+        dummyCtx.CaptureTransferBuffer = nint.Zero;
+        dummyCtx.CaptureWidth = 4;
+        dummyCtx.CaptureHeight = 4;
+        byte[] dst = new byte[4 * 4 * 4];
+        Assert.True(!GpuSystem.ReadCaptureTextureRgba(ref dummyCtx, dst), "ReadCaptureTextureRgba with CaptureTransferBuffer==0 returns false");
+    }
+
+    private static void TestGpuDeferredReleaseAndLifecycle()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(8 * 1024 * 1024, 4 * 1024 * 1024, 4 * 1024 * 1024, 256 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 128, 64);
+        var b1Arena = LinearArena.Create(2 * 1024 * 1024);
+        var b2Arena = LinearArena.Create(2 * 1024 * 1024);
+        var b1 = BundleId.Create(1, 1);
+        var b2 = BundleId.Create(2, 1);
+
+        var window = PlatformSystem.InitWindow("Deferred Release & Lifecycle Test", 320, 180, hidden: true);
+        GpuContext* gpu = alloc.Persistent.Alloc<GpuContext>(1, 64);
+        GpuSystem.Init(gpu, window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true);
+
+        try
+        {
+            // RENDER-05: GpuSystem.Init binds non-null cleanup hooks automatically
+            Assert.True(world.Assets.GpuContextPtr == gpu && world.Assets.ReleaseGpuMesh != null && world.Assets.ReleaseGpuTexture != null,
+                "GpuSystem.Init automatically binds non-null AssetRegistry cleanup hooks");
+
+            // RENDER-06: Live GPU validation checks
+            var nullMesh = new MeshAssetData { GpuSlot = -1, VertexCount = 3, IndexCount = 3, Vertices = null, Indices = null };
+            Assert.Equal(-1, GpuSystem.EnsureMeshUploaded(ref *gpu, ref nullMesh), "Live GPU rejects null mesh pointers");
+            byte* smallBuf = stackalloc byte[8];
+            var underTex = new TextureAssetData { GpuSlot = -1, Width = 8, Height = 8, Format = TexturePixelFormat.Rgba8, Channels = 4, Pixels = smallBuf, DataBytes = 8 };
+            Assert.Equal(-1, GpuSystem.EnsureTextureUploaded(ref *gpu, ref underTex), "Live GPU rejects undersized tex.DataBytes");
+            Assert.True(!GpuSystem.ReadCaptureTextureRgba(ref *gpu, new byte[64]), "ReadCaptureTextureRgba returns false before EnsureCaptureTarget");
+
+            ShaderSystem.CompileBuiltinShaders(ref *gpu);
+
+            var boxSpec = GlbBuilder.CreateBoxSpec(Vec3.One, ColorF.White);
+            byte[] boxGlb = GlbBuilder.BuildGlb(in boxSpec, includeDemoAnimation: false);
+            GltfHandle gltf1 = GltfLoader.LoadFromMemory(boxGlb, null, ref b1Arena, ref alloc.Scratch, ref world.Assets, ref world.Animations, b1, StringId.Hash("def_box1"));
+            MeshHandle mesh1 = AssetSystem.TryGetGltf(in world.Assets, gltf1)->Primitives[0].Mesh;
+            TextureHandle tex1 = TextureLoader.CreateSolidColor(Color32.White, ref b1Arena, ref world.Assets, b1, StringId.Hash("def_tex1"));
+            MaterialHandle mat1 = AssetSystem.RegisterMaterial(ref world.Assets, new MaterialAssetData
+            {
+                OwnerBundle = b1, BaseColorFactor = ColorF.White, BaseColorTexture = tex1, AlphaMode = MaterialAlphaMode.Opaque,
+            });
+
+            EntityId e1 = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, e1, Vec3.Zero);
+            RenderComponentSystem.AddMeshRenderer(ref world.RenderComponents, e1, mesh1, mat1, default, ColorF.White, 1u, AnimPlayerHandle.Invalid);
+            CameraSystem.CreatePerspective(ref world.Cameras, new Vec3(0f, 1.5f, 4f), Vec3.Zero);
+
+            BatchRenderer.UploadPendingAssets(ref *gpu, ref world);
+            int meshSlot = AssetSystem.TryGetMesh(in world.Assets, mesh1)->GpuSlot;
+            uint meshGen = AssetSystem.TryGetMesh(in world.Assets, mesh1)->GpuSlotGen;
+            int texSlot = AssetSystem.TryGetTexture(in world.Assets, tex1)->GpuSlot;
+            uint texGen = AssetSystem.TryGetTexture(in world.Assets, tex1)->GpuSlotGen;
+            Assert.True(meshSlot >= 0 && meshGen > 0u && texSlot >= 0 && texGen > 0u, "Mesh and texture uploaded with valid slot generations");
+
+            // Extract RenderPacket holding (meshSlot, meshGen) and (texSlot, texGen)
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 1f / 60f, 320, 180);
+            var shaders = GpuSystem.GetBuiltinShaders(in *gpu);
+            BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref alloc.Frame, ref alloc.Scratch, out RenderPacket packet);
+
+            // Unload bundle 1 WHILE packet is still pending submission!
+            AssetSystem.UnloadByBundle(ref world.Assets, b1);
+            Assert.Equal((byte)1, gpu->Meshes[meshSlot].Alive, "Mesh GPU slot stays intact until FlushDeferredReleases");
+            Assert.Equal((byte)1, gpu->Textures[texSlot].Alive, "Texture GPU slot stays intact until FlushDeferredReleases");
+            Assert.Equal((byte)1, gpu->MeshSlotPendingRelease[meshSlot], "Mesh slot marked pending release");
+            Assert.Equal((byte)1, gpu->TextureSlotPendingRelease[texSlot], "Texture slot marked pending release");
+
+            // Submitting the in-flight packet renders safely AND flushes deferred releases at the end!
+            GpuSystem.EnsureCaptureTarget(ref *gpu, 320, 180);
+            BatchRenderer.SubmitRenderPacket(ref *gpu, in packet, captureToOffscreen: true, measureGpuWithFence: true);
+            Assert.True(gpu->LastFrameStats.DrawCalls >= 1, "In-flight RenderPacket rendered cleanly before deferred flush");
+            Assert.Equal((byte)0, gpu->Meshes[meshSlot].Alive, "SubmitRenderPacket flushed deferred mesh release");
+            Assert.Equal((byte)0, gpu->Textures[texSlot].Alive, "SubmitRenderPacket flushed deferred texture release");
+            Assert.True(gpu->MeshSlotGens[meshSlot] != meshGen, "Mesh slot generation bumped after release");
+            Assert.True(gpu->TextureSlotGens[texSlot] != texGen, "Texture slot generation bumped after release");
+
+            // Re-submitting the stale packet MUST skip stale MeshGpuGen/TextureGpuGen safely (0 draw calls, 0 validation errors)
+            BatchRenderer.SubmitRenderPacket(ref *gpu, in packet, captureToOffscreen: true, measureGpuWithFence: true);
+            Assert.Equal(0, gpu->LastFrameStats.DrawCalls, "Stale MeshGpuGen/TextureGpuGen batches skipped safely");
+            Assert.Equal(0, gpu->LastFrameStats.ShadowDrawCalls, "Stale shadow batches skipped safely");
+
+            // Upload bundle 2 asset, then call 2-arg Dispose -> verifies hooks cleared + GpuSlot reset to -1 + safe post-zero UnloadByBundle
+            TextureHandle tex2 = TextureLoader.CreateSolidColor(Color32.White, ref b2Arena, ref world.Assets, b2, StringId.Hash("def_tex2"));
+            BatchRenderer.UploadPendingAssets(ref *gpu, ref world);
+            Assert.True(AssetSystem.TryGetTexture(in world.Assets, tex2)->GpuSlot >= 0, "Bundle 2 texture uploaded");
+
+            GpuSystem.Dispose(ref *gpu, ref world.Assets);
+            Assert.True(world.Assets.GpuContextPtr == null && world.Assets.ReleaseGpuMesh == null && world.Assets.ReleaseGpuTexture == null,
+                "2-arg Dispose cleared AssetRegistry hooks");
+            Assert.Equal(-1, AssetSystem.TryGetTexture(in world.Assets, tex2)->GpuSlot, "2-arg Dispose reset live asset GpuSlot to -1");
+            Assert.Equal(0u, AssetSystem.TryGetTexture(in world.Assets, tex2)->GpuSlotGen, "2-arg Dispose reset live asset GpuSlotGen to 0");
+
+            // Zeroing GpuContext memory and calling UnloadByBundle must not dereference dangling pointer or crash
+            *gpu = default;
+            AssetSystem.UnloadByBundle(ref world.Assets, b2);
+        }
+        finally
+        {
+            AssetSystem.UnloadByBundle(ref world.Assets, b1);
+            AssetSystem.UnloadByBundle(ref world.Assets, b2);
+            GpuSystem.Dispose(ref *gpu, ref world.Assets);
+            PlatformSystem.Shutdown(ref window);
+            b1Arena.Dispose();
+            b2Arena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after XMOD-01 / RENDER-05 / RENDER-06 GPU lifecycle test");
+    }
+
+    private static void TestGpuSdfTextTranslucentCompositing()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 256 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 64, 64);
+        var bundleArena = LinearArena.Create(2 * 1024 * 1024);
+        var bundleId = BundleId.Create(1, 1);
+
+        var window = PlatformSystem.InitWindow("SDF Translucent Compositing Test", 320, 180, hidden: true);
+        GpuContext* gpu = alloc.Persistent.Alloc<GpuContext>(1, 64);
+        GpuSystem.Init(gpu, window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true);
+
+        try
+        {
+            ShaderSystem.CompileBuiltinShaders(ref *gpu);
+            FontHandle fontH = SdfFontLoader.BakeSdfFromSystemOrFile(null, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("r01_font"), 64f, 512, 8);
+
+            const int W = 320, H = 180;
+            CameraHandle camH = CameraSystem.CreateOrthographicUI(ref world.Cameras, W, H);
+            CameraData* cam = CameraSystem.TryGetPtr(in world.Cameras, camH);
+            cam->ClearFlags = CameraClearFlags.SolidColor;
+            cam->ClearColor = new ColorF(0f, 0f, 1f, 1f); // Solid pure blue background (0, 0, 255)
+
+            // Part 1: Translucent white SDF text (alpha=0.5, OutlineWidth=0, OutlineColor=Black) over pure blue ->
+            // interior pixels MUST blend to 0.5*White + 0.5*Blue = (128, 128, 255), NOT darkened to (~128, ~128, ~191)!
+            EntityId te = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, te, new Vec3(W * 0.5f, H * 0.5f, 0f));
+            var td = RenderComponentSystem.DefaultHudText(te, fontH, "MMM", default);
+            td.FontScale = 2.0f;
+            td.AlignH = TextAlignmentH.Center;
+            td.AlignV = TextAlignmentV.Middle;
+            td.Color = new ColorF(1f, 1f, 1f, 0.5f);
+            td.SecondaryColor = new ColorF(1f, 1f, 1f, 0.5f);
+            td.OutlineWidth = 0f;
+            td.OutlineColor = new ColorF(0f, 0f, 0f, 1f); // Black outline with width 0 must NOT darken fill!
+            td.ShadowColor = ColorF.Transparent;
+            td.ShadowOffset = Vec2.Zero;
+            TextHandle th = RenderComponentSystem.AddText(ref world.RenderComponents, in td);
+
+            byte[] rgba = new byte[W * H * 4];
+            GpuSystem.EnsureCaptureTarget(ref *gpu, W, H);
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 1f / 60f, W, H);
+            BatchRenderer.RenderFrame(ref *gpu, ref world, ref alloc, SceneLighting.Default, captureToOffscreen: true);
+            Assert.True(GpuSystem.ReadCaptureTextureRgba(ref *gpu, rgba), "Read translucent SDF capture");
+
+            int bestR = 0, bestG = 0, bestB = 0;
+            for (int i = 0; i < W * H; i++)
+            {
+                int r = rgba[i * 4 + 0];
+                int g = rgba[i * 4 + 1];
+                int b = rgba[i * 4 + 2];
+                if (r > bestR)
+                {
+                    bestR = r;
+                    bestG = g;
+                    bestB = b;
+                }
+            }
+            bool isSrgb = gpu->SwapchainFormat == SDL.GPUTextureFormat.B8G8R8A8UnormSRGB ||
+                          gpu->SwapchainFormat == SDL.GPUTextureFormat.R8G8B8A8UnormSRGB;
+            int minRg = isSrgb ? 160 : 100;
+            int maxRg = isSrgb ? 215 : 155;
+            Assert.True(bestR >= minRg && bestR <= maxRg && bestG >= minRg && bestG <= maxRg && bestB >= 240,
+                $"Translucent white (a=0.5) over blue must blend cleanly without black outline darkening (srgb={isSrgb}), got ({bestR},{bestG},{bestB})");
+
+            // Part 2: OutlineWidth=0.25 with OutlineColor=(1,0,0,0) over solid green (0,128,0) -> zero red fringe!
+            cam->ClearColor = new ColorF(0f, 0.5f, 0f, 1f);
+            TextData* tdPtr = RenderComponentSystem.TryGetText(in world.RenderComponents, th);
+            tdPtr->Color = ColorF.White;
+            tdPtr->SecondaryColor = ColorF.White;
+            tdPtr->OutlineWidth = 0.25f;
+            tdPtr->OutlineColor = new ColorF(1f, 0f, 0f, 0f); // Transparent red
+
+            alloc.BeginFrame();
+            BatchRenderer.RenderFrame(ref *gpu, ref world, ref alloc, SceneLighting.Default, captureToOffscreen: true);
+            Assert.True(GpuSystem.ReadCaptureTextureRgba(ref *gpu, rgba), "Read zero-alpha outline capture");
+
+            int maxRedExcess = 0;
+            for (int i = 0; i < W * H; i++)
+            {
+                int r = rgba[i * 4 + 0];
+                int b = rgba[i * 4 + 2];
+                // Fill is white (r == b) and background is green (r == 0, b == 0), so r - b detects any red outline fringe!
+                int excess = r - b;
+                if (excess > maxRedExcess) maxRedExcess = excess;
+            }
+            Assert.True(maxRedExcess <= 8, $"OutlineColor.a == 0 must produce zero red fringe (max R-B excess={maxRedExcess})");
+        }
+        finally
+        {
+            AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
+            GpuSystem.Dispose(ref *gpu, ref world.Assets);
+            PlatformSystem.Shutdown(ref window);
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after RENDER-01 SDF translucent test");
+    }
+
+    private static void TestPlatformShutdownPreservesAudio()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 512 * 1024, 512 * 1024, 128 * 1024);
+
+        AudioState* audio = null;
+        PlatformWindow window = default;
+        try
+        {
+            AudioConfig cfg = AudioConfig.Default;
+            cfg.HeadlessFallback = 1;
+            audio = AudioSystem.Start(ref alloc.Persistent, in cfg);
+            Assert.Equal((byte)1, audio->Active, "AudioSystem started");
+
+            DecodedPcmData sine = WavDecoder.GenerateSineWave(440f, 0.25f, cfg.SampleRate, 0.5f, 1);
+            AudioClipHandle clip = AudioSystem.CreateClipFromDecoded(audio, ref sine, StringId.Hash("r03_sine"));
+            Assert.True(clip.IsValid, "Sine clip created");
+            AudioVoiceHandle voice = AudioSystem.Play(audio, clip, AudioPlayParams.Looping(AudioBus.Sfx, 1f));
+            Assert.True(voice.IsValid, "Looping voice started");
+
+            // Init and shutdown hidden PlatformWindow BEFORE stopping AudioSystem
+            window = PlatformSystem.InitWindow("RENDER-03 Audio Isolation Test", 160, 120, hidden: true);
+            PlatformSystem.Shutdown(ref window);
+
+            // AudioSystem must remain active and continue mixing cleanly after PlatformSystem.Shutdown!
+            Assert.Equal((byte)1, Volatile.Read(ref audio->Active), "AudioSystem remains active after PlatformSystem.Shutdown");
+            float* mixBuf = stackalloc float[256 * 2];
+            AudioSystem.RenderMixFrames(audio, mixBuf, 256);
+            float maxAbs = 0f;
+            for (int i = 0; i < 256 * 2; i++)
+            {
+                float a = DetMath.Abs(mixBuf[i]);
+                if (a > maxAbs) maxAbs = a;
+            }
+            Assert.True(maxAbs > 0.05f, $"AudioSystem continues mixing cleanly after PlatformSystem.Shutdown (peak={maxAbs:F3})");
+        }
+        finally
+        {
+            if (window.Initialized != 0) PlatformSystem.Shutdown(ref window);
+            if (audio != null) AudioSystem.Stop(audio);
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after RENDER-03 audio isolation test");
+    }
+
+    private static void TestBuiltinShaderProtectionAndViewportScissor()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 256 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 64, 64);
+        var bundleArena = LinearArena.Create(1 * 1024 * 1024);
+        var bundleId = BundleId.Create(1, 1);
+
+        const int W = 320, H = 180;
+        var window = PlatformSystem.InitWindow("Builtins & Scissor Test", W, H, hidden: true);
+        GpuContext* gpu = alloc.Persistent.Alloc<GpuContext>(1, 64);
+        GpuSystem.Init(gpu, window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true);
+
+        try
+        {
+            ShaderSystem.CompileBuiltinShaders(ref *gpu);
+
+            // RENDER-07: Refusing to release all 4 built-in shaders
+            Assert.True(!ShaderSystem.ReleaseShader(ref *gpu, gpu->BuiltinPbrShader), "ReleaseShader refuses BuiltinPbrShader");
+            Assert.True(!ShaderSystem.ReleaseShader(ref *gpu, gpu->BuiltinSpriteShader), "ReleaseShader refuses BuiltinSpriteShader");
+            Assert.True(!ShaderSystem.ReleaseShader(ref *gpu, gpu->BuiltinSdfTextShader), "ReleaseShader refuses BuiltinSdfTextShader");
+            Assert.True(!ShaderSystem.ReleaseShader(ref *gpu, gpu->BuiltinParticleShader), "ReleaseShader refuses BuiltinParticleShader");
+            Assert.True(ShaderSystem.TryGetShader(in *gpu, gpu->BuiltinSpriteShader) != null, "BuiltinSpriteShader remains alive");
+
+            // RENDER-10: Camera 0 with ViewportRect = Vec4.Zero (clears full screen black, skips invalid viewport draw)
+            // + Camera 1 with sub-viewport (0.5, 0, 0.5, 1) drawing a huge red sprite spanning beyond viewport bounds ->
+            // scissor MUST clip red strictly to right half [W/2 .. W)!
+            CameraHandle cam0 = CameraSystem.CreateOrthographicUI(ref world.Cameras, W, H, depthOrder: 0, layerMask: 1u << 30);
+            CameraData* c0 = CameraSystem.TryGetPtr(in world.Cameras, cam0);
+            c0->ViewportRect = Vec4.Zero;
+            c0->ClearFlags = CameraClearFlags.SolidColor;
+            c0->ClearColor = new ColorF(0f, 0f, 0f, 1f);
+
+            CameraHandle cam1 = CameraSystem.CreateOrthographicUI(ref world.Cameras, W, H, depthOrder: 1, layerMask: 1u << 31);
+            CameraData* c1 = CameraSystem.TryGetPtr(in world.Cameras, cam1);
+            c1->ViewportRect = new Vec4(0.5f, 0f, 0.5f, 1f);
+            c1->ClearFlags = CameraClearFlags.None;
+
+            TextureHandle whiteH = TextureLoader.CreateSolidColor(Color32.White, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("r10_white"));
+            EntityId se = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, se, new Vec3(W * 0.5f, H * 0.5f, 0f));
+            RenderComponentSystem.AddSprite(ref world.RenderComponents, new SpriteData
+            {
+                Entity = se, Texture = whiteH, Size = new Vec2(W * 2f, H * 2f), Pivot = new Vec2(0.5f, 0.5f),
+                Color = new ColorF(1f, 0f, 0f, 1f), BlendMode = SpriteBlendMode.AlphaBlend,
+                DepthTest = 0, LayerMask = 1u << 31, Visible = 1,
+            });
+
+            byte[] rgba = new byte[W * H * 4];
+            GpuSystem.EnsureCaptureTarget(ref *gpu, W, H);
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 1f / 60f, W, H);
+            BatchRenderer.RenderFrame(ref *gpu, ref world, ref alloc, SceneLighting.Default, captureToOffscreen: true);
+            Assert.True(GpuSystem.ReadCaptureTextureRgba(ref *gpu, rgba), "Read scissor-clipped capture");
+
+            int leftOff = ((H / 2) * W + (W / 4)) * 4;
+            int rightOff = ((H / 2) * W + (3 * W / 4)) * 4;
+            Assert.True(rgba[leftOff + 0] < 15 && rgba[leftOff + 1] < 15 && rgba[leftOff + 2] < 15,
+                $"Left half outside sub-viewport must remain black via scissor, got ({rgba[leftOff]},{rgba[leftOff + 1]},{rgba[leftOff + 2]})");
+            Assert.True(rgba[rightOff + 0] > 200 && rgba[rightOff + 1] < 15 && rgba[rightOff + 2] < 15,
+                $"Right half inside sub-viewport must be bright red, got ({rgba[rightOff]},{rgba[rightOff + 1]},{rgba[rightOff + 2]})");
+        }
+        finally
+        {
+            AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
+            GpuSystem.Dispose(ref *gpu, ref world.Assets);
+            PlatformSystem.Shutdown(ref window);
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after RENDER-07 / RENDER-10 GPU test");
     }
 }
