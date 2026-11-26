@@ -1,12 +1,14 @@
+using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text;
 using BringEngine.Core.Math;
 
 namespace BringEngine.Simulation.Input;
 
 /// <summary>
 /// Platform-agnostic SDL3 scancode constants so simulation code stays 100% decoupled from SDL3.
-/// Matches SDL_Scancode numeric values.
+/// Matches SDL_Scancode (USB HID) numeric values.
 /// </summary>
 public enum KeyCode : int
 {
@@ -16,11 +18,20 @@ public enum KeyCode : int
     Q = 20, R = 21, S = 22, T = 23, U = 24, V = 25, W = 26, X = 27,
     Y = 28, Z = 29,
     Num1 = 30, Num2 = 31, Num3 = 32, Num4 = 33, Num5 = 34,
+    Num6 = 35, Num7 = 36, Num8 = 37, Num9 = 38, Num0 = 39,
     Return = 40, Escape = 41, Backspace = 42, Tab = 43, Space = 44,
+    Minus = 45, Equals = 46, LeftBracket = 47, RightBracket = 48, Backslash = 49,
+    Semicolon = 51, Apostrophe = 52, Grave = 53, Comma = 54, Period = 55, Slash = 56, CapsLock = 57,
     F1 = 58, F2 = 59, F3 = 60, F4 = 61, F5 = 62, F6 = 63,
     F7 = 64, F8 = 65, F9 = 66, F10 = 67, F11 = 68, F12 = 69,
+    PrintScreen = 70, ScrollLock = 71, Pause = 72,
+    Insert = 73, Home = 74, PageUp = 75, Delete = 76, End = 77, PageDown = 78,
     Right = 79, Left = 80, Down = 81, Up = 82,
-    LeftShift = 225, LeftCtrl = 224,
+    KpDivide = 84, KpMultiply = 85, KpMinus = 86, KpPlus = 87, KpEnter = 88,
+    Kp1 = 89, Kp2 = 90, Kp3 = 91, Kp4 = 92, Kp5 = 93,
+    Kp6 = 94, Kp7 = 95, Kp8 = 96, Kp9 = 97, Kp0 = 98, KpPeriod = 99,
+    LeftCtrl = 224, LeftShift = 225, LeftAlt = 226, LeftSuper = 227,
+    RightCtrl = 228, RightShift = 229, RightAlt = 230, RightSuper = 231,
 }
 
 /// <summary>
@@ -215,6 +226,17 @@ public unsafe struct InputState
     public byte ConnectedGamepadCount;
     public byte QuitRequested;
 
+    // Zero-GC per-frame UTF-8 text input buffer (populated when PlatformSystem.StartTextInput is active)
+    public const int MaxTextInputBytes = 64;
+    public fixed byte TextInputUtf8[MaxTextInputBytes];
+    public byte TextInputLength;
+
+    // Window focus, minimize & cursor lock state (0-initialized defaults = focused, visible, unlocked — headless-test friendly)
+    public byte WindowUnfocused;
+    public byte WindowUnfocusedPrev;
+    public byte WindowMinimized;
+    public byte MouseLocked;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void BeginFrame()
     {
@@ -224,6 +246,8 @@ public unsafe struct InputState
         MouseDeltaX = 0f;
         MouseDeltaY = 0f;
         MouseWheelY = 0f;
+        TextInputLength = 0;
+        WindowUnfocusedPrev = WindowUnfocused;
         Gamepad0.BeginFrame();
         Gamepad1.BeginFrame();
         Gamepad2.BeginFrame();
@@ -279,6 +303,125 @@ public unsafe struct InputState
     {
         uint bit = 1u << buttonIndex;
         return (MouseButtonsDown & bit) != 0 && (MouseButtonsPrev & bit) == 0;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IsMouseReleased(int buttonIndex)
+    {
+        uint bit = 1u << buttonIndex;
+        return (MouseButtonsDown & bit) == 0 && (MouseButtonsPrev & bit) != 0;
+    }
+
+    public readonly bool IsWindowFocused => WindowUnfocused == 0;
+    public readonly bool WasWindowFocusLost => WindowUnfocused != 0 && WindowUnfocusedPrev == 0;
+    public readonly bool WasWindowFocusGained => WindowUnfocused == 0 && WindowUnfocusedPrev != 0;
+    public readonly bool IsWindowMinimized => WindowMinimized != 0;
+    public readonly bool IsMouseLocked => MouseLocked != 0;
+    public readonly bool HasTextInput => TextInputLength > 0;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SetWindowFocused(bool focused) => WindowUnfocused = (byte)(focused ? 0 : 1);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SetWindowMinimized(bool minimized) => WindowMinimized = (byte)(minimized ? 1 : 0);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SetMouseLocked(bool locked) => MouseLocked = (byte)(locked ? 1 : 0);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void ClearTextInput() => TextInputLength = 0;
+
+    /// <summary>
+    /// Appends a null-terminated UTF-8 string into this frame's fixed text input buffer (0 GC).
+    /// </summary>
+    public void AppendTextInputUtf8(byte* utf8NullTerminated)
+    {
+        if (utf8NullTerminated == null) return;
+        int len = TextInputLength;
+        for (int i = 0; utf8NullTerminated[i] != 0 && len < MaxTextInputBytes; i++)
+            TextInputUtf8[len++] = utf8NullTerminated[i];
+        TextInputLength = (byte)len;
+    }
+
+    /// <summary>
+    /// Appends raw UTF-8 bytes into this frame's fixed text input buffer (0 GC; useful in headless tests).
+    /// </summary>
+    public void AppendTextInputUtf8(ReadOnlySpan<byte> utf8Bytes)
+    {
+        int len = TextInputLength;
+        int avail = MaxTextInputBytes - len;
+        if (avail <= 0 || utf8Bytes.IsEmpty) return;
+        int copy = utf8Bytes.Length < avail ? utf8Bytes.Length : avail;
+        for (int i = 0; i < copy; i++)
+            TextInputUtf8[len + i] = utf8Bytes[i];
+        TextInputLength = (byte)(len + copy);
+    }
+
+    /// <summary>
+    /// Encodes UTF-16 text into this frame's fixed UTF-8 text input buffer (0 GC; useful in headless tests).
+    /// </summary>
+    public void AppendTextInput(ReadOnlySpan<char> text)
+    {
+        if (text.IsEmpty) return;
+        int len = TextInputLength;
+        int avail = MaxTextInputBytes - len;
+        if (avail <= 0) return;
+
+        fixed (byte* dstBase = TextInputUtf8)
+        {
+            Span<byte> dst = new Span<byte>(dstBase + len, avail);
+            if (Encoding.UTF8.TryGetBytes(text, dst, out int written))
+            {
+                TextInputLength = (byte)(len + written);
+                return;
+            }
+
+            // Partial fit fallback (append char-by-char until buffer full, zero GC)
+            Span<byte> tmp = stackalloc byte[4];
+            for (int i = 0; i < text.Length; i++)
+            {
+                ReadOnlySpan<char> slice = text.Slice(i, 1);
+                if (char.IsHighSurrogate(text[i]) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+                {
+                    slice = text.Slice(i, 2);
+                    i++;
+                }
+                int b = Encoding.UTF8.GetBytes(slice, tmp);
+                if (len + b > MaxTextInputBytes) break;
+                for (int k = 0; k < b; k++) dstBase[len++] = tmp[k];
+            }
+            TextInputLength = (byte)len;
+        }
+    }
+
+    /// <summary>
+    /// Copies this frame's UTF-8 text input bytes into caller's span with 0 GC allocations.
+    /// </summary>
+    public readonly int CopyTextInputUtf8(Span<byte> destination)
+    {
+        int len = TextInputLength;
+        if (len == 0 || destination.IsEmpty) return 0;
+        int copy = len < destination.Length ? len : destination.Length;
+        fixed (byte* src = TextInputUtf8)
+        {
+            for (int i = 0; i < copy; i++)
+                destination[i] = src[i];
+        }
+        return copy;
+    }
+
+    /// <summary>
+    /// Decodes this frame's UTF-8 text input into caller's char span with 0 GC allocations.
+    /// </summary>
+    public readonly int CopyTextInputChars(Span<char> destination)
+    {
+        int len = TextInputLength;
+        if (len == 0 || destination.IsEmpty) return 0;
+        fixed (byte* src = TextInputUtf8)
+        fixed (char* dst = destination)
+        {
+            return Encoding.UTF8.GetChars(src, len, dst, destination.Length);
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -50,6 +50,7 @@ public struct GpuShaderSlot
     public nint PipelineAdditive;
     public nint PipelineOverlayNoDepth;
     public ShaderVertexLayout Layout;
+    public byte FragmentSamplerCount;
     public byte Alive;
 }
 
@@ -60,6 +61,7 @@ public struct GpuShaderSlot
 public struct RenderStats
 {
     public int DrawCalls;
+    public int ShadowDrawCalls;  // Directional shadow pass instanced draw calls
     public int SetPassCalls;     // Unity-equivalent SetPass calls (pipeline or shader/material state transitions)
     public int PipelineBinds;
     public int RenderPasses;
@@ -89,6 +91,14 @@ public unsafe struct GpuContext
     public nint DepthTexture;
     public uint DepthWidth;
     public uint DepthHeight;
+
+    // Directional sun shadow map resources (D32Float DepthStencilTarget | Sampler)
+    public nint ShadowDepthTexture;
+    public uint ShadowMapSize;
+    public nint ShadowVertexShader;
+    public nint ShadowFragmentShader;
+    public nint ShadowPipeline;
+    public byte ShadowMapSupported;
 
     // Offscreen scene color target (decouples GPU render work from swapchain VSync Present wait)
     public nint SceneColorTexture;
@@ -178,12 +188,19 @@ public static unsafe class GpuSystem
         uint* shaderGens = persistentArena.AllocUninitialized<uint>(maxShaders, 16);
         for (int i = 0; i < maxShaders; i++) shaderGens[i] = 1;
 
+        bool shadowSupported = SDL.GPUTextureSupportsFormat(
+            device,
+            SDL.GPUTextureFormat.D32Float,
+            SDL.GPUTextureType.TextureType2D,
+            SDL.GPUTextureUsageFlags.DepthStencilTarget | SDL.GPUTextureUsageFlags.Sampler);
+
         var ctx = new GpuContext
         {
             Device = device,
             Window = window,
             SwapchainFormat = swapFmt,
             DepthFormat = SDL.GPUTextureFormat.D32Float,
+            ShadowMapSupported = (byte)(shadowSupported ? 1 : 0),
             Meshes = persistentArena.Alloc<GpuMeshSlot>(maxMeshes, 64),
             MaxMeshes = maxMeshes,
             Textures = persistentArena.Alloc<GpuTextureSlot>(maxTextures, 64),
@@ -391,6 +408,39 @@ public static unsafe class GpuSystem
         ctx.DepthHeight = height;
     }
 
+    public static bool EnsureShadowMapTexture(ref GpuContext ctx, uint size)
+    {
+        if (ctx.ShadowMapSupported == 0 || ctx.Device == nint.Zero) return false;
+        if (size < 256u) size = 256u;
+        if (size > 4096u) size = 4096u;
+        if (ctx.ShadowDepthTexture != nint.Zero && ctx.ShadowMapSize == size)
+            return true;
+
+        if (ctx.ShadowDepthTexture != nint.Zero)
+        {
+            SDL.ReleaseGPUTexture(ctx.Device, ctx.ShadowDepthTexture);
+            ctx.ShadowDepthTexture = nint.Zero;
+            ctx.ShadowMapSize = 0;
+        }
+
+        var info = new SDL.GPUTextureCreateInfo
+        {
+            Type = SDL.GPUTextureType.TextureType2D,
+            Format = ctx.DepthFormat,
+            Usage = SDL.GPUTextureUsageFlags.DepthStencilTarget | SDL.GPUTextureUsageFlags.Sampler,
+            Width = size,
+            Height = size,
+            LayerCountOrDepth = 1,
+            NumLevels = 1,
+            SampleCount = SDL.GPUSampleCount.SampleCount1,
+        };
+        nint tex = SDL.CreateGPUTexture(ctx.Device, in info);
+        if (tex == nint.Zero) return false;
+        ctx.ShadowDepthTexture = tex;
+        ctx.ShadowMapSize = size;
+        return true;
+    }
+
     public static void EnsureSceneColorTarget(ref GpuContext ctx, uint width, uint height)
     {
         if (width == 0 || height == 0) return;
@@ -448,11 +498,16 @@ public static unsafe class GpuSystem
     }
 
     /// <summary>
-    /// Downloads CaptureColorTexture from the GPU and writes a PNG file to disk (for visual verification!).
+    /// Downloads CaptureColorTexture from the GPU into a caller-provided RGBA8 byte buffer (length >= CaptureWidth * CaptureHeight * 4).
+    /// Useful for deterministic visual verification & screenshot export.
     /// </summary>
-    public static void SaveCaptureTextureToPng(ref GpuContext ctx, string outputPath)
+    public static bool ReadCaptureTextureRgba(ref GpuContext ctx, byte[] dstRgba)
     {
-        if (ctx.CaptureColorTexture == nint.Zero) return;
+        if (ctx.CaptureColorTexture == nint.Zero || ctx.CaptureWidth == 0 || ctx.CaptureHeight == 0)
+            return false;
+        int w = (int)ctx.CaptureWidth;
+        int h = (int)ctx.CaptureHeight;
+        if (dstRgba == null || dstRgba.Length < w * h * 4) return false;
 
         nint cmd = SDL.AcquireGPUCommandBuffer(ctx.Device);
         nint copy = SDL.BeginGPUCopyPass(cmd);
@@ -479,10 +534,6 @@ public static unsafe class GpuSystem
         SDL.ReleaseGPUFence(ctx.Device, fence);
 
         nint mapped = SDL.MapGPUTransferBuffer(ctx.Device, ctx.CaptureTransferBuffer, false);
-        int w = (int)ctx.CaptureWidth;
-        int h = (int)ctx.CaptureHeight;
-        int byteCount = w * h * 4;
-        byte[] rgba = new byte[byteCount];
         bool isBgra = ctx.SwapchainFormat == SDL.GPUTextureFormat.B8G8R8A8Unorm ||
                       ctx.SwapchainFormat == SDL.GPUTextureFormat.B8G8R8A8UnormSRGB;
 
@@ -492,20 +543,33 @@ public static unsafe class GpuSystem
             int o = i * 4;
             if (isBgra)
             {
-                rgba[o + 0] = srcPtr[o + 2];
-                rgba[o + 1] = srcPtr[o + 1];
-                rgba[o + 2] = srcPtr[o + 0];
-                rgba[o + 3] = 255;
+                dstRgba[o + 0] = srcPtr[o + 2];
+                dstRgba[o + 1] = srcPtr[o + 1];
+                dstRgba[o + 2] = srcPtr[o + 0];
+                dstRgba[o + 3] = 255;
             }
             else
             {
-                rgba[o + 0] = srcPtr[o + 0];
-                rgba[o + 1] = srcPtr[o + 1];
-                rgba[o + 2] = srcPtr[o + 2];
-                rgba[o + 3] = 255;
+                dstRgba[o + 0] = srcPtr[o + 0];
+                dstRgba[o + 1] = srcPtr[o + 1];
+                dstRgba[o + 2] = srcPtr[o + 2];
+                dstRgba[o + 3] = 255;
             }
         }
         SDL.UnmapGPUTransferBuffer(ctx.Device, ctx.CaptureTransferBuffer);
+        return true;
+    }
+
+    /// <summary>
+    /// Downloads CaptureColorTexture from the GPU and writes a PNG file to disk (for visual verification!).
+    /// </summary>
+    public static void SaveCaptureTextureToPng(ref GpuContext ctx, string outputPath)
+    {
+        if (ctx.CaptureColorTexture == nint.Zero) return;
+        int w = (int)ctx.CaptureWidth;
+        int h = (int)ctx.CaptureHeight;
+        byte[] rgba = new byte[w * h * 4];
+        if (!ReadCaptureTextureRgba(ref ctx, rgba)) return;
 
         using var fs = File.Create(outputPath);
         var writer = new ImageWriter();
@@ -715,6 +779,10 @@ public static unsafe class GpuSystem
             s = default;
         }
 
+        if (ctx.ShadowPipeline != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, ctx.ShadowPipeline);
+        if (ctx.ShadowVertexShader != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, ctx.ShadowVertexShader);
+        if (ctx.ShadowFragmentShader != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, ctx.ShadowFragmentShader);
+        if (ctx.ShadowDepthTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.ShadowDepthTexture);
         if (ctx.DepthTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.DepthTexture);
         if (ctx.SceneColorTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.SceneColorTexture);
         if (ctx.CaptureColorTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.CaptureColorTexture);

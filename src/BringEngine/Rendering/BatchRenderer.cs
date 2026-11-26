@@ -111,7 +111,8 @@ public static unsafe class BatchRenderer
         int spriteSlotsPerCam = 0;
         for (int si = 0; si < world.RenderComponents.SpriteCount; si++)
             spriteSlotsPerCam += world.RenderComponents.Sprites[si].DrawMode == SpriteDrawMode.Simple ? 1 : 9;
-        int cap3D = Math.Clamp(world.RenderComponents.MeshRendererCount * camCount, 64, 16384);
+        bool wantShadows = lighting.ShadowsEnabled != 0 && lighting.SunIntensity > 0.001f && world.RenderComponents.MeshRendererCount > 0;
+        int cap3D = Math.Clamp(world.RenderComponents.MeshRendererCount * (camCount + (wantShadows ? 1 : 0)), 64, 16384);
         int capSprites = Math.Clamp(spriteSlotsPerCam * camCount, 64, 16384);
         int capGlyphs = Math.Clamp(world.RenderComponents.TextCount * 192 * camCount, 128, 16384);
         int capParticles = Math.Clamp(world.Particles.ParticleCount * camCount, 64, 16384);
@@ -119,6 +120,9 @@ public static unsafe class BatchRenderer
         var camSnapshots = packetArena.AllocSlice<RenderCameraSnapshot>(camCount);
         var allInstances3D = NativeList<Instance3DGpu>.CreateInArena(ref packetArena, cap3D, 64);
         var allBatches3D = NativeList<Batch3DCmd>.CreateInArena(ref packetArena, Math.Min(cap3D, 4096), 16);
+        var shadowBatches3D = wantShadows
+            ? NativeList<Batch3DCmd>.CreateInArena(ref packetArena, Math.Clamp(world.RenderComponents.MeshRendererCount, 16, 2048), 16)
+            : default;
         var allSprites = NativeList<SpriteGpuInstance>.CreateInArena(ref packetArena, capSprites, 64);
         var allSpriteBatches = NativeList<SpriteBatchCmd>.CreateInArena(ref packetArena, Math.Min(capSprites, 2048), 16);
         var allGlyphs = NativeList<GlyphGpuInstance>.CreateInArena(ref packetArena, capGlyphs, 64);
@@ -172,9 +176,20 @@ public static unsafe class BatchRenderer
             snap.ParticleBatchCount = allParticleBatches.Count - snap.ParticleBatchStart;
         }
 
+        // Gather directional shadow map casters (grouped strictly by MeshGpuSlot for minimal shadow draw calls)
+        if (wantShadows)
+        {
+            uint sSize = lighting.ShadowMapSize >= 256u ? Math.Min(lighting.ShadowMapSize, 4096u) : 2048u;
+            packet.ShadowMapSize = sSize;
+            packet.ShadowLightViewProj = ComputeDirectionalLightViewProj(in lighting, sSize);
+            GatherShadowCasters3D(in world, in lighting, ref scratchArena, ref allInstances3D, ref shadowBatches3D);
+            packet.ShadowsActive = (byte)(shadowBatches3D.Count > 0 ? 1 : 0);
+        }
+
         packet.Cameras = camSnapshots;
         packet.Instances3D = allInstances3D;
         packet.Batches3D = allBatches3D;
+        packet.ShadowBatches3D = shadowBatches3D;
         packet.JointPalette = jointCopy;
         packet.Sprites = allSprites;
         packet.SpriteBatches = allSpriteBatches;
@@ -272,11 +287,82 @@ public static unsafe class BatchRenderer
         long uploadEnd = Stopwatch.GetTimestamp();
         timings.UploadMs = (uploadEnd - uploadStart) * s_ticksToMs;
 
-        // 3. Execute RenderPass per camera in DepthOrder (pipeline bound BEFORE storage/texture resources!)
+        // 3. Execute Directional Sun Shadow Depth Pass (before main scene passes)
         long encodeStart = uploadEnd;
         nint* vStorage3D = stackalloc nint[2] { gpu.Instance3DBuffer, gpu.JointPaletteBuffer };
         nint quadIndexBuf = gpu.QuadIndexBuffer;
 
+        bool shadowsRendered = false;
+        if (packet.ShadowsActive != 0 &&
+            packet.ShadowBatches3D.Count > 0 &&
+            gpu.ShadowMapSupported != 0 &&
+            gpu.ShadowPipeline != nint.Zero)
+        {
+            uint sSize = packet.ShadowMapSize >= 256u ? packet.ShadowMapSize : 2048u;
+            if (GpuSystem.EnsureShadowMapTexture(ref gpu, sSize))
+            {
+                var shadowDepthInfo = new SDL.GPUDepthStencilTargetInfo
+                {
+                    Texture = gpu.ShadowDepthTexture,
+                    ClearDepth = 1.0f,
+                    LoadOp = SDL.GPULoadOp.Clear,
+                    StoreOp = SDL.GPUStoreOp.Store,
+                    StencilLoadOp = SDL.GPULoadOp.DontCare,
+                    StencilStoreOp = SDL.GPUStoreOp.DontCare,
+                    Cycle = 1,
+                };
+
+                nint spass = SDL.BeginGPURenderPass(cmd, nint.Zero, 0, in shadowDepthInfo);
+                stats.RenderPasses++;
+
+                var svp = new SDL.GPUViewport
+                {
+                    X = 0f,
+                    Y = 0f,
+                    W = sSize,
+                    H = sSize,
+                    MinDepth = 0f,
+                    MaxDepth = 1f,
+                };
+                SDL.SetGPUViewport(spass, in svp);
+
+                SDL.BindGPUGraphicsPipeline(spass, gpu.ShadowPipeline);
+                stats.PipelineBinds++;
+                SDL.BindGPUVertexStorageBuffers(spass, 0, new ReadOnlySpan<nint>(vStorage3D, 2), 2);
+
+                var sfu = new ShadowFrameUniformsGpu { LightViewProj = packet.ShadowLightViewProj };
+                SDL.PushGPUVertexUniformData(cmd, 0, (nint)(&sfu), (uint)sizeof(ShadowFrameUniformsGpu));
+
+                int sBoundMesh = -1;
+                for (int bi = 0; bi < packet.ShadowBatches3D.Count; bi++)
+                {
+                    Batch3DCmd b = packet.ShadowBatches3D[bi];
+                    if ((uint)b.MeshGpuSlot >= (uint)gpu.MaxMeshes || gpu.Meshes[b.MeshGpuSlot].Alive == 0) continue;
+
+                    if (b.MeshGpuSlot != sBoundMesh)
+                    {
+                        ref GpuMeshSlot gm = ref gpu.Meshes[b.MeshGpuSlot];
+                        var vbBind = new SDL.GPUBufferBinding { Buffer = gm.VertexBuffer, Offset = 0 };
+                        var ibBind = new SDL.GPUBufferBinding { Buffer = gm.IndexBuffer, Offset = 0 };
+                        SDL.BindGPUVertexBuffers(spass, 0, (nint)(&vbBind), 1);
+                        SDL.BindGPUIndexBuffer(spass, in ibBind, SDL.GPUIndexElementSize.IndexElementSize32Bit);
+                        sBoundMesh = b.MeshGpuSlot;
+                    }
+
+                    var bu = new BatchUniformsGpu { BaseInstance = b.BaseInstance };
+                    SDL.PushGPUVertexUniformData(cmd, 1, (nint)(&bu), (uint)sizeof(BatchUniformsGpu));
+
+                    uint idxCount = gpu.Meshes[b.MeshGpuSlot].IndexCount;
+                    SDL.DrawGPUIndexedPrimitives(spass, idxCount, b.InstanceCount, 0, 0, 0);
+                    stats.ShadowDrawCalls++;
+                }
+
+                SDL.EndGPURenderPass(spass);
+                shadowsRendered = true;
+            }
+        }
+
+        // 4. Execute RenderPass per camera in DepthOrder (pipeline bound BEFORE storage/texture resources!)
         for (int ci = 0; ci < packet.Cameras.Length; ci++)
         {
             ref readonly RenderCameraSnapshot cam = ref packet.Cameras[ci];
@@ -338,10 +424,11 @@ public static unsafe class BatchRenderer
             // --- Draw 3D Instanced Batches ---
             if (cam.Batch3DCount > 0)
             {
-                var fu = BuildFrameUniforms(in cam, in packet.Lighting, packet.WorldTotalTime);
+                var fu = BuildFrameUniforms(in cam, in packet, shadowsRendered ? gpu.ShadowMapSize : 0u);
                 SDL.PushGPUVertexUniformData(cmd, 0, (nint)(&fu), (uint)sizeof(FrameUniformsGpu));
                 SDL.PushGPUFragmentUniformData(cmd, 0, (nint)(&fu), (uint)sizeof(FrameUniformsGpu));
 
+                int boundSamplerCount = -1;
                 for (int bi = 0; bi < cam.Batch3DCount; bi++)
                 {
                     Batch3DCmd b = packet.Batches3D[cam.Batch3DStart + bi];
@@ -378,10 +465,15 @@ public static unsafe class BatchRenderer
                         quadIndexBound = false;
                     }
 
-                    if (b.TextureGpuSlot != boundTexSlot || passChanged)
+                    int neededSamplers = sSlot->FragmentSamplerCount;
+                    if (b.TextureGpuSlot != boundTexSlot || neededSamplerChanged(boundSamplerCount, neededSamplers) || passChanged)
                     {
-                        BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
+                        if (neededSamplers >= 2)
+                            BindFragmentTextureAndShadow(pass, in gpu, b.TextureGpuSlot, shadowsRendered);
+                        else if (neededSamplers == 1)
+                            BindFragmentTexture(pass, in gpu, b.TextureGpuSlot);
                         boundTexSlot = b.TextureGpuSlot;
+                        boundSamplerCount = neededSamplers;
                         passChanged = true;
                     }
                     if (passChanged) stats.SetPassCalls++;
@@ -1277,6 +1369,138 @@ public static unsafe class BatchRenderer
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool neededSamplerChanged(int prevCount, int nextCount) => prevCount != nextCount;
+
+    /// <summary>
+    /// Computes a texel-snapped right-handed orthographic LightViewProj matrix ([0, 1] clip Z)
+    /// centered around lighting.ShadowCenter along lighting.SunDirection.
+    /// </summary>
+    public static Mat4 ComputeDirectionalLightViewProj(in SceneLighting lighting, uint shadowMapSize)
+    {
+        Vec3 sunDir = lighting.SunDirection.Normalized();
+        if (sunDir.LengthSq() < 1e-6f) sunDir = new Vec3(0.45f, 0.85f, 0.35f).Normalized();
+
+        float halfExtent = lighting.ShadowDistance > 1f ? lighting.ShadowDistance : 28f;
+        uint mapSize = shadowMapSize >= 256u ? shadowMapSize : 2048u;
+
+        Vec3 refUp = DetMath.Abs(Vec3.Dot(sunDir, Vec3.UnitY)) > 0.98f ? Vec3.UnitZ : Vec3.UnitY;
+        Vec3 forward = -sunDir;
+        Vec3 right = Vec3.Cross(forward, refUp).Normalized();
+        Vec3 lightUp = Vec3.Cross(right, forward);
+
+        // Snap center along light right/up axes to exact shadow texel increments to prevent shimmer
+        float texelWorld = (2f * halfExtent) / mapSize;
+        Vec3 center = lighting.ShadowCenter;
+        float sx = MathF.Floor(Vec3.Dot(center, right) / texelWorld) * texelWorld;
+        float sy = MathF.Floor(Vec3.Dot(center, lightUp) / texelWorld) * texelWorld;
+        float sz = Vec3.Dot(center, forward);
+        Vec3 snappedCenter = right * sx + lightUp * sy + forward * sz;
+
+        float pullBack = halfExtent * 2.0f;
+        Vec3 eye = snappedCenter + sunDir * pullBack;
+        Mat4 lightView = Mat4.CreateLookAt(eye, snappedCenter, lightUp);
+        Mat4 lightProj = Mat4.CreateOrtho(-halfExtent, halfExtent, -halfExtent, halfExtent, 0.5f, pullBack * 2.25f);
+        return Mat4.Multiply(in lightProj, in lightView);
+    }
+
+    private static void GatherShadowCasters3D(
+        in EngineWorld world,
+        in SceneLighting lighting,
+        ref LinearArena scratchArena,
+        ref NativeList<Instance3DGpu> outInstances,
+        ref NativeList<Batch3DCmd> outShadowBatches)
+    {
+        int count = world.RenderComponents.MeshRendererCount;
+        if (count == 0) return;
+
+        float halfExtent = lighting.ShadowDistance > 1f ? lighting.ShadowDistance : 28f;
+        float maxRadius = halfExtent * 1.85f;
+        float maxRadiusSq = maxRadius * maxRadius;
+        Vec3 shadowCenter = lighting.ShadowCenter;
+
+        ArenaMarker mark = scratchArena.SaveMarker();
+        try
+        {
+            var items = NativeList<Draw3DSortItem>.CreateInArena(ref scratchArena, count, 64);
+
+            for (int i = 0; i < count; i++)
+            {
+                ref MeshRendererData mr = ref world.RenderComponents.MeshRenderers[i];
+                if (mr.Visible == 0) continue;
+
+                MeshAssetData* mesh = AssetSystem.TryGetMesh(in world.Assets, mr.Mesh);
+                if (mesh == null || mesh->GpuSlot < 0) continue;
+
+                MaterialAssetData* mat = AssetSystem.TryGetMaterial(in world.Assets, mr.Material);
+                if (mat != null && mat->AlphaMode == MaterialAlphaMode.Blend) continue; // Transparent meshes do not cast opaque depth shadows
+
+                int td = TransformSystem.GetDenseIndex(in world.Transforms, mr.Entity);
+                if (td < 0) continue;
+                Mat4 worldMat = world.Transforms.WorldMatrix[td];
+
+                Bounds3 wb = mesh->LocalBounds.Transform(in worldMat);
+                Vec3 objCenter = (wb.Min + wb.Max) * 0.5f;
+                float objRadius = (wb.Max - wb.Min).Length() * 0.5f;
+                float distSq = Vec3.DistanceSq(objCenter, shadowCenter);
+                float cullR = maxRadius + objRadius;
+                if (distSq > cullR * cullR) continue;
+
+                int jointOff = -1;
+                if (mesh->HasSkinning != 0 && (uint)mr.AnimPlayerIndex < (uint)world.Animations.PlayerCount)
+                    jointOff = world.Animations.Players[mr.AnimPlayerIndex].FrameJointOffset;
+
+                items.Add(new Draw3DSortItem
+                {
+                    SortKey = (ulong)(uint)mesh->GpuSlot,
+                    OriginalIndex = i,
+                    MeshGpuSlot = mesh->GpuSlot,
+                    Instance = new Instance3DGpu
+                    {
+                        Model = worldMat,
+                        Extra = new Vec4(0f, 0f, jointOff, 0f),
+                    },
+                });
+            }
+
+            if (items.Count == 0) return;
+
+            Sort3DItems(items.Data, 0, items.Count - 1);
+
+            int idx = 0;
+            while (idx < items.Count)
+            {
+                int meshSlot = items[idx].MeshGpuSlot;
+                uint baseInst = (uint)outInstances.Count;
+                uint instCount = 0;
+
+                while (idx < items.Count && items[idx].MeshGpuSlot == meshSlot && outInstances.Count < outInstances.Capacity)
+                {
+                    outInstances.Add(items[idx].Instance);
+                    instCount++;
+                    idx++;
+                }
+
+                if (instCount > 0 && outShadowBatches.Count < outShadowBatches.Capacity)
+                {
+                    outShadowBatches.Add(new Batch3DCmd
+                    {
+                        MeshGpuSlot = meshSlot,
+                        TextureGpuSlot = -1,
+                        Shader = ShaderHandle.Invalid,
+                        AlphaMode = MaterialAlphaMode.Opaque,
+                        BaseInstance = baseInst,
+                        InstanceCount = instCount,
+                    });
+                }
+            }
+        }
+        finally
+        {
+            scratchArena.Rollback(mark);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void BindFragmentTexture(nint pass, in GpuContext gpu, int texSlot)
     {
         nint tex = gpu.DefaultWhiteTexture;
@@ -1293,6 +1517,29 @@ public static unsafe class BatchRenderer
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void BindFragmentTextureAndShadow(nint pass, in GpuContext gpu, int texSlot, bool shadowsRendered)
+    {
+        nint tex = gpu.DefaultWhiteTexture;
+        nint samp = gpu.SamplerLinearWrap;
+        if (texSlot >= 0 && texSlot < gpu.MaxTextures && gpu.Textures[texSlot].Alive != 0)
+        {
+            ref GpuTextureSlot gt = ref gpu.Textures[texSlot];
+            tex = gt.Texture;
+            if (gt.NearestFilter != 0) samp = gpu.SamplerNearestClamp;
+            else if (gt.ClampEdge != 0) samp = gpu.SamplerLinearClamp;
+        }
+
+        SDL.GPUTextureSamplerBinding* bindings = stackalloc SDL.GPUTextureSamplerBinding[2];
+        bindings[0] = new SDL.GPUTextureSamplerBinding { Texture = tex, Sampler = samp };
+        bindings[1] = new SDL.GPUTextureSamplerBinding
+        {
+            Texture = (shadowsRendered && gpu.ShadowDepthTexture != nint.Zero) ? gpu.ShadowDepthTexture : gpu.DefaultWhiteTexture,
+            Sampler = gpu.SamplerNearestClamp,
+        };
+        SDL.BindGPUFragmentSamplers(pass, 0, (nint)bindings, 2);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static nint SelectQuadPipeline(GpuShaderSlot* s, int blendMode, bool depthTest)
     {
         if (!depthTest) return s->PipelineOverlayNoDepth;
@@ -1304,24 +1551,36 @@ public static unsafe class BatchRenderer
         };
     }
 
-    private static FrameUniformsGpu BuildFrameUniforms(in RenderCameraSnapshot cam, in SceneLighting l, float time) => new FrameUniformsGpu
+    private static FrameUniformsGpu BuildFrameUniforms(in RenderCameraSnapshot cam, in RenderPacket packet, uint activeShadowMapSize)
     {
-        ViewProj = cam.ViewProjMatrix,
-        CameraPosTime = new Vec4(cam.ShakenPosition, time),
-        SunDirIntensity = new Vec4(l.SunDirection, l.SunIntensity),
-        SunColor = l.SunColor,
-        AmbientSky = l.AmbientSky,
-        AmbientGround = l.AmbientGround,
-        FogColorDensity = new Vec4(l.FogColor.R, l.FogColor.G, l.FogColor.B, l.FogDensity),
-        PointLightPos0 = l.PointLightPos0,
-        PointLightPos1 = l.PointLightPos1,
-        PointLightPos2 = l.PointLightPos2,
-        PointLightPos3 = l.PointLightPos3,
-        PointLightColor0 = l.PointLightColor0,
-        PointLightColor1 = l.PointLightColor1,
-        PointLightColor2 = l.PointLightColor2,
-        PointLightColor3 = l.PointLightColor3,
-    };
+        ref readonly SceneLighting l = ref packet.Lighting;
+        bool hasShadow = activeShadowMapSize > 0u && l.ShadowsEnabled != 0;
+        float bias = l.ShadowBias > 0f ? l.ShadowBias : 0.0018f;
+        float strength = hasShadow ? DetMath.Clamp01(l.ShadowStrength > 0f ? l.ShadowStrength : 0.72f) : 0f;
+        float invMap = hasShadow ? (1f / activeShadowMapSize) : 0f;
+        float normalBias = l.ShadowNormalBias >= 0f ? l.ShadowNormalBias : 0.04f;
+
+        return new FrameUniformsGpu
+        {
+            ViewProj = cam.ViewProjMatrix,
+            CameraPosTime = new Vec4(cam.ShakenPosition, packet.WorldTotalTime),
+            SunDirIntensity = new Vec4(l.SunDirection, l.SunIntensity),
+            SunColor = l.SunColor,
+            AmbientSky = l.AmbientSky,
+            AmbientGround = l.AmbientGround,
+            FogColorDensity = new Vec4(l.FogColor.R, l.FogColor.G, l.FogColor.B, l.FogDensity),
+            PointLightPos0 = l.PointLightPos0,
+            PointLightPos1 = l.PointLightPos1,
+            PointLightPos2 = l.PointLightPos2,
+            PointLightPos3 = l.PointLightPos3,
+            PointLightColor0 = l.PointLightColor0,
+            PointLightColor1 = l.PointLightColor1,
+            PointLightColor2 = l.PointLightColor2,
+            PointLightColor3 = l.PointLightColor3,
+            LightViewProj = hasShadow ? packet.ShadowLightViewProj : Mat4.Identity,
+            ShadowParams = new Vec4(bias, strength, invMap, normalBias),
+        };
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool Less3D(in Draw3DSortItem a, ulong pivotKey, int pivotIdx)

@@ -35,6 +35,11 @@ public unsafe struct PlatformWindow
     public byte GamepadSubsystemActive;
     public byte Closed;
     public byte Resized;
+    public byte Focused;
+    public byte Minimized;
+    public byte MouseLocked;
+    public byte CursorHidden;
+    public byte TextInputActive;
 }
 
 public static unsafe class PlatformSystem
@@ -104,7 +109,67 @@ public static unsafe class PlatformSystem
             Mode = effectiveMode,
             Initialized = 1,
             GamepadSubsystemActive = gamepadReady,
+            Focused = 1,
+            Minimized = 0,
+            MouseLocked = 0,
+            CursorHidden = 0,
+            TextInputActive = 0,
         };
+    }
+
+    /// <summary>
+    /// Locks or unlocks the mouse cursor to the window in relative-motion mode (FPS / 3D orbit cameras).
+    /// While locked, cursor is hidden and MouseDeltaX / MouseDeltaY report raw relative deltas.
+    /// Main Thread ONLY.
+    /// </summary>
+    public static bool SetMouseLock(ref PlatformWindow win, bool locked)
+    {
+        if (win.Window == nint.Zero) return false;
+        bool ok = SDL.SetWindowRelativeMouseMode(win.Window, locked);
+        if (ok)
+            win.MouseLocked = (byte)(locked ? 1 : 0);
+        return ok;
+    }
+
+    /// <summary>
+    /// Shows or hides the OS mouse cursor (for custom software cursors or clean fullscreen gameplay).
+    /// Main Thread ONLY.
+    /// </summary>
+    public static bool SetCursorVisible(ref PlatformWindow win, bool visible)
+    {
+        bool ok = visible ? SDL.ShowCursor() : SDL.HideCursor();
+        if (ok)
+            win.CursorHidden = (byte)(visible ? 0 : 1);
+        return ok;
+    }
+
+    /// <summary>
+    /// Shows or hides the OS mouse cursor directly (Main Thread ONLY).
+    /// </summary>
+    public static bool SetCursorVisible(bool visible) => visible ? SDL.ShowCursor() : SDL.HideCursor();
+
+    /// <summary>
+    /// Enables OS/IME Unicode text input events for the window (populates InputState.TextInputUtf8 each frame).
+    /// Call when a text field / chat box / lobby code input gains focus. Main Thread ONLY.
+    /// </summary>
+    public static bool StartTextInput(ref PlatformWindow win)
+    {
+        if (win.Window == nint.Zero) return false;
+        bool ok = SDL.StartTextInput(win.Window);
+        if (ok) win.TextInputActive = 1;
+        return ok;
+    }
+
+    /// <summary>
+    /// Disables OS/IME Unicode text input events for the window when leaving a text field.
+    /// Main Thread ONLY.
+    /// </summary>
+    public static bool StopTextInput(ref PlatformWindow win)
+    {
+        if (win.Window == nint.Zero) return false;
+        bool ok = SDL.StopTextInput(win.Window);
+        win.TextInputActive = 0;
+        return ok;
     }
 
     /// <summary>
@@ -162,6 +227,9 @@ public static unsafe class PlatformSystem
     {
         input.BeginFrame();
         win.Resized = 0;
+        input.SetWindowFocused(win.Focused != 0);
+        input.SetWindowMinimized(win.Minimized != 0);
+        input.SetMouseLocked(win.MouseLocked != 0);
 
         while (SDL.PollEvent(out SDL.Event ev))
         {
@@ -172,6 +240,27 @@ public static unsafe class PlatformSystem
                 case SDL.EventType.WindowCloseRequested:
                     win.Closed = 1;
                     input.QuitRequested = 1;
+                    break;
+
+                case SDL.EventType.WindowFocusGained:
+                    win.Focused = 1;
+                    input.SetWindowFocused(true);
+                    break;
+
+                case SDL.EventType.WindowFocusLost:
+                    win.Focused = 0;
+                    input.SetWindowFocused(false);
+                    break;
+
+                case SDL.EventType.WindowMinimized:
+                    win.Minimized = 1;
+                    input.SetWindowMinimized(true);
+                    break;
+
+                case SDL.EventType.WindowRestored:
+                case SDL.EventType.WindowMaximized:
+                    win.Minimized = 0;
+                    input.SetWindowMinimized(false);
                     break;
 
                 case SDL.EventType.WindowResized:
@@ -193,6 +282,11 @@ public static unsafe class PlatformSystem
 
                 case SDL.EventType.KeyUp:
                     input.SetKey((int)ev.Key.Scancode, false);
+                    break;
+
+                case SDL.EventType.TextInput:
+                    if (ev.Text.Text != nint.Zero)
+                        input.AppendTextInputUtf8((byte*)ev.Text.Text);
                     break;
 
                 case SDL.EventType.MouseMotion:

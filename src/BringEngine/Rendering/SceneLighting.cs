@@ -21,6 +21,15 @@ public struct SceneLighting
     public Vec4 PointLightPos0, PointLightPos1, PointLightPos2, PointLightPos3;
     public Vec4 PointLightColor0, PointLightColor1, PointLightColor2, PointLightColor3;
 
+    // Directional Sun Shadow Mapping (orthographic PCF soft shadows)
+    public Vec3 ShadowCenter;       // World-space center of the shadow frustum (default: origin)
+    public float ShadowDistance;    // Half-extent of shadow ortho box in world units (default: 28 => 56x56m coverage)
+    public float ShadowBias;        // Depth comparison bias (default: 0.0018)
+    public float ShadowNormalBias;  // World-space normal offset to eliminate shadow acne on slopes (default: 0.04)
+    public float ShadowStrength;    // Shadow darkening intensity [0..1] (default: 0.72)
+    public uint ShadowMapSize;      // Shadow depth map resolution: 512..4096 (default: 2048)
+    public byte ShadowsEnabled;     // 1 = enabled (default), 0 = disabled
+
     public static SceneLighting Default => new SceneLighting
     {
         SunDirection = new Vec3(0.45f, 0.85f, 0.35f).Normalized(),
@@ -30,6 +39,13 @@ public struct SceneLighting
         AmbientGround = new ColorF(0.10f, 0.09f, 0.14f, 1f),
         FogColor = new ColorF(0.06f, 0.08f, 0.14f, 1f),
         FogDensity = 0.012f,
+        ShadowCenter = Vec3.Zero,
+        ShadowDistance = 28f,
+        ShadowBias = 0.0018f,
+        ShadowNormalBias = 0.04f,
+        ShadowStrength = 0.72f,
+        ShadowMapSize = 2048u,
+        ShadowsEnabled = 1,
     };
 
     public void SetPointLight(int index, Vec3 pos, float radius, ColorF color, float intensity)

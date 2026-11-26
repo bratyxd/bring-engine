@@ -427,3 +427,45 @@ public readonly struct SaveOpHandle : IEquatable<SaveOpHandle>
     public static bool operator !=(SaveOpHandle a, SaveOpHandle b) => a.Raw != b.Raw;
     public override string ToString() => IsValid ? $"SaveOp({Index}:g{Generation})" : "SaveOp(Invalid)";
 }
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct AudioClipHandle : IEquatable<AudioClipHandle>
+{
+    public readonly uint Raw;
+    public static readonly AudioClipHandle Invalid = default;
+    public bool IsValid => Raw != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public AudioClipHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static AudioClipHandle Create(uint index, uint generation) => new AudioClipHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(AudioClipHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is AudioClipHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(AudioClipHandle a, AudioClipHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(AudioClipHandle a, AudioClipHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"AudioClip({Index}:g{Generation})" : "AudioClip(Invalid)";
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct AudioVoiceHandle : IEquatable<AudioVoiceHandle>
+{
+    public readonly uint Raw;
+    public static readonly AudioVoiceHandle Invalid = default;
+    public bool IsValid => Raw != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public AudioVoiceHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static AudioVoiceHandle Create(uint index, uint generation) => new AudioVoiceHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(AudioVoiceHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is AudioVoiceHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(AudioVoiceHandle a, AudioVoiceHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(AudioVoiceHandle a, AudioVoiceHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"AudioVoice({Index}:g{Generation})" : "AudioVoice(Invalid)";
+}

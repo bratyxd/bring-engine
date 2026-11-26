@@ -45,6 +45,14 @@ internal struct FrameUniformsGpu
     public Vec4 FogColorDensity;
     public Vec4 PointLightPos0, PointLightPos1, PointLightPos2, PointLightPos3;
     public Vec4 PointLightColor0, PointLightColor1, PointLightColor2, PointLightColor3;
+    public Mat4 LightViewProj;
+    public Vec4 ShadowParams; // x = bias, y = strength (0 = disabled), z = invMapSize, w = normalBias
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct ShadowFrameUniformsGpu
+{
+    public Mat4 LightViewProj;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -164,6 +172,10 @@ public struct RenderPacket
     public NativeSlice<RenderCameraSnapshot> Cameras;
     public NativeList<Instance3DGpu> Instances3D;
     public NativeList<Batch3DCmd> Batches3D;
+    public NativeList<Batch3DCmd> ShadowBatches3D; // Shadow caster batches referencing Instances3D
+    public Mat4 ShadowLightViewProj;
+    public uint ShadowMapSize;
+    public byte ShadowsActive;
     public NativeSlice<Mat4> JointPalette;
     public NativeList<SpriteGpuInstance> Sprites;
     public NativeList<SpriteBatchCmd> SpriteBatches;

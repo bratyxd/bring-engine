@@ -9,7 +9,7 @@
 
 1. **NO OOP — Pure Data + Static Systems**
    - NEVER use class inheritance, `virtual`, `override`, `abstract`, or interface dispatch in engine or game code.
-   - Store all state in `[StructLayout(LayoutKind.Sequential)]` `unmanaged struct` tables (SoA / dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`, `HttpRequestHandle`, `WebSocketHandle`, `LogFileHandle`, `SaveOpHandle`).
+   - Store all state in `[StructLayout(LayoutKind.Sequential)]` `unmanaged struct` tables (SoA / dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`, `HttpRequestHandle`, `WebSocketHandle`, `LogFileHandle`, `SaveOpHandle`, `AudioClipHandle`, `AudioVoiceHandle`).
    - Put behavior in `public static unsafe class <Feature>System` methods and use unmanaged function pointers (`delegate*<...>`) for callbacks.
 
 2. **Desktop CoreCLR (.NET 10) + Self-Contained ReadyToRun — Windows, Linux (Steam Deck), macOS**
@@ -22,7 +22,8 @@
 
 4. **Strict Simulation vs. View Split, Gamepads, 2-Thread Pipeline & Borderless Full Window**
    - **Simulation** (`*.Simulation.*`): Deterministic fixed-timestep (`Fix32`/`FixVec3`, `DetRng`), ZERO SDL3 or GPU calls, headless-testable.
-   - **Input (`InputState`)**: Keyboard, mouse, and up to **4 SDL3 gamepads** (Xbox / PlayStation / Nintendo / Steam Deck back paddles & touchpad, radial deadzone, `GetMoveAxis()`, Main-Thread `PlatformSystem.RumbleGamepad`).
+   - **Input (`InputState`) & Platform (`PlatformSystem`)**: Full keyboard scancodes, mouse (`IsMousePressed`/`Down`/`Released`, relative mouse lock `SetMouseLock`, `SetCursorVisible`), zero-GC UTF-8 text input (`StartTextInput`/`StopTextInput`), window focus/minimize state (`IsWindowFocused`, `WasWindowFocusLost`, `IsWindowMinimized`), and up to **4 SDL3 gamepads** (Xbox / PlayStation / Nintendo / Steam Deck back paddles & touchpad, radial deadzone, `GetMoveAxis()`, Main-Thread `PlatformSystem.RumbleGamepad`).
+   - **Audio (`BringEngine.Audio.AudioSystem`)**: Zero-dependency SDL3 `SDL_AudioStream` software mixer on its own dedicated `BringEngine.AudioMixer` thread (0 GC playback, WAV + `.bpack` RawBlob loading, `Master`/`Music`/`Sfx`/`Ui` volume & mute buses, pitch/pan/loop/voice-stealing, headless CI fallback). See [`docs/agents/19-audio.md`](docs/agents/19-audio.md).
    - **View (`*.View.*` / `BringEngine.Rendering.*`)**: Reads simulation state & `SimEvent`s; never mutates gameplay truth.
    - **2-Thread Pipeline (`EnginePipelineSystem`)**: Logic Thread (Frame `N`) runs concurrently with Main/Render Thread (Frame `N-1`). All SDL3 window/event/swapchain/rumble calls stay on the Main Thread.
    - **Two-Zone Async Architecture (Mandatory for Engine & Games)**:
@@ -43,11 +44,12 @@
 - `BringEngine.sln` & `Directory.Build.props` — Solution and Desktop CoreCLR (`.NET 10`) build settings.
 - `src/BringEngine/` — Core Engine Library (`net10.0`):
   - `Core/` — `Memory/` (`LinearArena`, `PoolAllocator<T>`, `FreeListAllocator`, `EngineAllocators`, native containers, `FixedString*`, `StringId`), `Logging/` (`LogSystem`, zero-GC UTF-8 `[InterpolatedStringHandler]`, rolling files), `Storage/` (`PlatformPaths`, `SaveSystem`, atomic `.tmp`/`.bak` `BSAV` + Raw JSON + `SaveChunkWriter`/`SaveChunkReader`), `Profiling/` (`FrameProfiler`, `ProfilerSystem`), `Threading/` (`EnginePipelineSystem`, `JobSystem`), `Handles/`, `Math/` (`Fix32/64`, `FixVec2/3`, `DetMath`, `DetRng`, `Vec/Quat/Mat4`).
+  - `Audio/` — `WavDecoder` (8/16/24/32-bit PCM & IEEE Float WAV + procedural wave helpers), `AudioSystem` (dedicated `BringEngine.AudioMixer` thread, SDL3 `SDL_AudioStream`, 4 volume/mute buses, pitch/pan/loop/stealing, headless fallback).
   - `Networking/` — Zero-dependency `.NET 10` BCL networking (`HttpSystem`, `WebSocketSystem`), zero-GC binary `NetWriter`/`NetReader`/`NetHash.Crc32`, pluggable `NetTransportVTable`, and deterministic `LoopbackTransportSystem`.
   - `Simulation/` — `EntityTable`, `TransformTable`, `EngineWorld`, `CameraTable`, `InputState`, `TweenTable`, `AnimationTable`, `ParticleTable`, `RenderComponentTables`, `SceneManager`.
   - `Assets/` — `AssetRegistry`, `BundleManager`, `Compression/` (BC1/BC3 `BRTX`, LZ4/Brotli, `BGLB`), `Atlases/` (`AtlasPacker`), `Packing/` (`AssetPackBuilder` / `AssetPackLoader`), `TextureLoader`, `SdfFontLoader`, `GltfLoader`, `GlbBuilder`.
-  - `Rendering/` — `SdlPlatform`, `FramePacer`, `GpuContext`, `ShaderSystem` (`SDL_shadercross`), `SceneLighting`, `TextLayoutSystem`, `RenderPacket`, `BatchRenderer`, `ProfilerOverlay`.
-  - `Shaders/` — Built-in HLSL shaders (`pbr_mesh.hlsl`, `sprite_3d.hlsl`, `sdf_text.hlsl`, `particle.hlsl`).
+  - `Rendering/` — `SdlPlatform`, `FramePacer`, `GpuContext`, `ShaderSystem` (`SDL_shadercross`), `SceneLighting` (incl. directional shadow mapping), `TextLayoutSystem`, `RenderPacket`, `BatchRenderer`, `ProfilerOverlay`.
+  - `Shaders/` — Built-in HLSL shaders (`pbr_mesh.hlsl`, `shadow_depth.hlsl`, `sprite_3d.hlsl`, `sdf_text.hlsl`, `particle.hlsl`).
 - `tools/BringPacker/` — CoreCLR CLI bundler for `.bpack` bundles and `--verify-no-loose-textures`.
 - `src/ShowcaseGame/` — Canonical reference game (**"Bring Arena"**).
 - `tests/BringEngine.Tests/` — CoreCLR engine test suite (run on GitHub Actions CI only).
@@ -68,9 +70,9 @@
 |---|---|---|
 | 01 | [`01-memory-and-allocators.md`](docs/agents/01-memory-and-allocators.md) | `EngineAllocators`, `LinearArena`, `PoolAllocator<T>`, `NativeSparseSet`, `NativeHashMap`, leak tracking |
 | 02 | [`02-deterministic-math-and-data.md`](docs/agents/02-deterministic-math-and-data.md) | `Fix32`/`FixVec3`, `DetMath`, `DetRng`, generational handles, coordinate conventions |
-| 03 | [`03-ecs-world-and-systems.md`](docs/agents/03-ecs-world-and-systems.md) | `EntityTable`, `TransformTable`, keyboard/mouse & **SDL3 Gamepad / Steam Deck input & rumble** |
+| 03 | [`03-ecs-world-and-systems.md`](docs/agents/03-ecs-world-and-systems.md) | `EntityTable`, `TransformTable`, full keyboard/mouse/lock/focus/text input & **SDL3 Gamepad / Steam Deck input & rumble** |
 | 04 | [`04-scenes-and-asset-bundles.md`](docs/agents/04-scenes-and-asset-bundles.md) | Ref-counted `BundleManager` and Unity-like `SceneManager` (`Single` vs. `Additive`) |
-| 05 | [`05-gltf-and-3d-rendering.md`](docs/agents/05-gltf-and-3d-rendering.md) | `GltfLoader` (`.glb`/`.gltf`), `GlbBuilder`, instanced PBR batching, skeletal skinning |
+| 05 | [`05-gltf-and-3d-rendering.md`](docs/agents/05-gltf-and-3d-rendering.md) | `GltfLoader` (`.glb`/`.gltf`), `GlbBuilder`, instanced PBR batching, skeletal skinning, **directional sun shadow mapping (3×3 PCF)** |
 | 06 | [`06-2d-sprites-in-3d-and-batching.md`](docs/agents/06-2d-sprites-in-3d-and-batching.md) | 2D sprites in 3D/HUD, GPU batching rules, custom HLSL conventions |
 | 07 | [`07-text-fonts-and-text-effects.md`](docs/agents/07-text-fonts-and-text-effects.md) | `SdfFontLoader`, world & HUD SDF `TextData`, per-character effects |
 | 08 | [`08-tweening-and-animation.md`](docs/agents/08-tweening-and-animation.md) | `TweenSystem` (31 curves, pointer binding, chaining), skeletal & sprite animation |
@@ -82,6 +84,7 @@
 | 16 | [`16-networking-and-multiplayer.md`](docs/agents/16-networking-and-multiplayer.md) | Lean core `HttpSystem`, `WebSocketSystem`, zero-GC `NetWriter`/`NetReader`, `NetTransportVTable`, `LoopbackTransport`, and game-level multiplayer (`LiteNetLib`, `Backdash`, `Facepunch.Steamworks`) |
 | 17 | [`17-logging.md`](docs/agents/17-logging.md) | Zero-GC core `LogSystem`, unified OS paths (`PlatformPaths`), `LogFileHandle`, 10k-line FIFO trimming, and selective logging discipline |
 | 18 | [`18-save-system.md`](docs/agents/18-save-system.md) | Crash-safe atomic `SaveSystem` (`.tmp`/`.bak`, CRC32 recovery, LZ4/Brotli), Raw JSON vs. `BSAV`+JSON vs. versioned binary `SaveChunks` |
+| 19 | [`19-audio.md`](docs/agents/19-audio.md) | Zero-GC core `AudioSystem` (SDL3 `SDL_AudioStream`, dedicated mixer thread, WAV/`.bpack`, `Master`/`Music`/`Sfx`/`Ui` buses, pitch/pan/loop, headless fallback) |
 
 ---
 

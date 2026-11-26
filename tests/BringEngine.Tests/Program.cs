@@ -17,6 +17,7 @@ public static class Program
         CoreTests.RunAll();
         LoggingTests.RunAll();
         SaveSystemTests.RunAll();
+        AudioTests.RunAll();
         JobSystemTests.RunAll();
         NetworkingTests.RunAll();
         SimulationTests.RunAll();

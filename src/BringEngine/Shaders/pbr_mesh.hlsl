@@ -2,8 +2,8 @@
 
 // Bring Engine — Built-in 3D PBR Instanced & Skinned Shader (SDL3_gpu / SDL_shadercross)
 // Vertex space0: StorageBuffers (Instances t0, JointPalette t1)
-// Vertex space1: UniformBuffer (FrameUniforms b0)
-// Fragment space2: Sampler s0 + Texture t0
+// Vertex space1: UniformBuffer (FrameUniforms b0, BatchUniforms b1)
+// Fragment space2: Sampler s0 + Texture t0 (Albedo), Sampler s1 + Texture t1 (ShadowMap)
 // Fragment space3: UniformBuffer (FrameUniforms b0)
 
 struct Instance3D
@@ -29,6 +29,8 @@ cbuffer FrameUniformsVS : register(b0, space1)
     float4 FogColorDensity; // xyz = color, w = density
     float4 PointLightPos[4];   // xyz = pos, w = radius
     float4 PointLightColor[4]; // xyz = color, w = intensity
+    float4x4 LightViewProj;
+    float4 ShadowParams;       // x = bias, y = strength (0 = disabled), z = invMapSize, w = normalBias
 };
 
 cbuffer BatchUniformsVS : register(b1, space1)
@@ -105,6 +107,8 @@ PSInput VSMain(VSInput input)
 
 SamplerState AlbedoSamp : register(s0, space2);
 Texture2D AlbedoTex : register(t0, space2);
+SamplerState ShadowSamp : register(s1, space2);
+Texture2D ShadowMap : register(t1, space2);
 
 cbuffer FrameUniformsPS : register(b0, space3)
 {
@@ -117,7 +121,45 @@ cbuffer FrameUniformsPS : register(b0, space3)
     float4 PS_FogColorDensity;
     float4 PS_PointLightPos[4];
     float4 PS_PointLightColor[4];
+    float4x4 PS_LightViewProj;
+    float4 PS_ShadowParams;    // x = bias, y = strength (0 = disabled), z = invMapSize, w = normalBias
 };
+
+float SampleDirectionalShadow(float3 worldPos, float3 N, float NdotL)
+{
+    float strength = PS_ShadowParams.y;
+    float texel = PS_ShadowParams.z;
+    if (strength <= 0.001 || texel <= 0.0 || NdotL <= 0.001)
+        return 1.0;
+
+    float3 offsetPos = worldPos + N * PS_ShadowParams.w;
+    float4 lightClip = mul(PS_LightViewProj, float4(offsetPos, 1.0));
+    float2 shadowUv = lightClip.xy * float2(0.5, -0.5) + float2(0.5, 0.5);
+    float currentDepth = lightClip.z;
+
+    if (shadowUv.x <= 0.001 || shadowUv.x >= 0.999 ||
+        shadowUv.y <= 0.001 || shadowUv.y >= 0.999 ||
+        currentDepth <= 0.0 || currentDepth >= 1.0)
+        return 1.0;
+
+    float bias = PS_ShadowParams.x * (1.0 + (1.0 - NdotL) * 2.0);
+    float lit = 0.0;
+    [unroll]
+    for (int sy = -1; sy <= 1; sy++)
+    {
+        [unroll]
+        for (int sx = -1; sx <= 1; sx++)
+        {
+            float mapDepth = ShadowMap.SampleLevel(ShadowSamp, shadowUv + float2(sx, sy) * texel, 0.0).r;
+            lit += (currentDepth - bias <= mapDepth) ? 1.0 : 0.0;
+        }
+    }
+    lit *= (1.0 / 9.0);
+
+    float2 edgeDist = min(shadowUv, 1.0 - shadowUv);
+    float edgeFade = saturate(min(edgeDist.x, edgeDist.y) * 16.0);
+    return lerp(1.0, lerp(1.0 - strength, 1.0, lit), edgeFade);
+}
 
 float4 PSMain(PSInput input) : SV_Target0
 {
@@ -138,13 +180,14 @@ float4 PSMain(PSInput input) : SV_Target0
     float hemi = N.y * 0.5 + 0.5;
     float3 ambient = lerp(PS_AmbientGround.rgb, PS_AmbientSky.rgb, hemi) * albedo.rgb * (1.0 - metallic * 0.45);
 
-    // Directional Sun (Blinn-PBR)
+    // Directional Sun (Blinn-PBR + 3x3 PCF Directional Shadow Map)
     float3 L = normalize(PS_SunDirIntensity.xyz);
     float NdotL = max(dot(N, L), 0.0);
+    float shadowFactor = SampleDirectionalShadow(input.WorldPos, N, NdotL);
     float3 H = normalize(L + V);
     float NdotH = max(dot(N, H), 0.0);
     float spec = pow(NdotH, specPower) * (0.25 + (1.0 - roughness) * 0.85);
-    float3 sunLight = (albedo.rgb * (1.0 - metallic * 0.7) + F0 * spec * 2.2) * PS_SunColor.rgb * (NdotL * PS_SunDirIntensity.w);
+    float3 sunLight = (albedo.rgb * (1.0 - metallic * 0.7) + F0 * spec * 2.2) * PS_SunColor.rgb * (NdotL * PS_SunDirIntensity.w * shadowFactor);
 
     // Dynamic Point Lights
     float3 pointAccum = float3(0.0, 0.0, 0.0);

@@ -17,6 +17,7 @@ public static unsafe class SimulationTests
         Assert.Run("TransformTable_ParentChildHierarchyPropagation", &TestTransformHierarchy);
         Assert.Run("CameraSystem_FollowShakeFrustumAndRayPick", &TestCameraSystem);
         Assert.Run("InputState_BitsetEdgesAndWASD", &TestInputState);
+        Assert.Run("InputState_ExtendedKeysMouseReleaseTextInputFocusAndZeroGc", &TestInputPlatformEssentials);
         Assert.Run("GamepadInput_ButtonsAxesRadialDeadzoneMultiSlotAndCombinedMoveZeroGc", &TestGamepadInput);
     }
 
@@ -152,6 +153,84 @@ public static unsafe class SimulationTests
 
         input.SetKey(KeyCode.W, false);
         Assert.True(input.IsKeyReleased(KeyCode.W), "W released");
+    }
+
+    private static void TestInputPlatformEssentials()
+    {
+        InputState input = default;
+        // Default state must be headless-friendly: focused, not minimized, mouse unlocked
+        Assert.True(input.IsWindowFocused, "Default InputState is window-focused");
+        Assert.True(!input.IsWindowMinimized, "Default InputState is not minimized");
+        Assert.True(!input.IsMouseLocked, "Default InputState mouse is unlocked");
+
+        // Extended KeyCode scancodes
+        input.BeginFrame();
+        input.SetKey(KeyCode.Num0, true);
+        input.SetKey(KeyCode.Num9, true);
+        input.SetKey(KeyCode.LeftAlt, true);
+        input.SetKey(KeyCode.RightShift, true);
+        input.SetKey(KeyCode.Delete, true);
+        input.SetKey(KeyCode.Home, true);
+        input.SetKey(KeyCode.PageDown, true);
+        input.SetKey(KeyCode.Grave, true);
+        input.SetKey(KeyCode.KpEnter, true);
+        Assert.True(input.IsKeyPressed(KeyCode.Num0) && input.IsKeyPressed(KeyCode.Num9), "Num0/Num9 pressed");
+        Assert.True(input.IsKeyPressed(KeyCode.LeftAlt) && input.IsKeyPressed(KeyCode.RightShift), "Modifier keys pressed");
+        Assert.True(input.IsKeyPressed(KeyCode.Delete) && input.IsKeyPressed(KeyCode.Home) && input.IsKeyPressed(KeyCode.PageDown), "Nav keys pressed");
+        Assert.True(input.IsKeyPressed(KeyCode.Grave) && input.IsKeyPressed(KeyCode.KpEnter), "Punctuation & keypad keys pressed");
+
+        // Mouse button pressed / down / released edge transitions
+        input.MouseButtonsDown |= 1u << 0; // Left button down
+        Assert.True(input.IsMousePressed(0) && input.IsMouseDown(0) && !input.IsMouseReleased(0), "LMB pressed edge");
+        input.BeginFrame();
+        Assert.True(!input.IsMousePressed(0) && input.IsMouseDown(0) && !input.IsMouseReleased(0), "LMB held");
+        input.MouseButtonsDown &= ~(1u << 0);
+        Assert.True(!input.IsMouseDown(0) && input.IsMouseReleased(0), "LMB released edge");
+
+        // Window focus & minimize edges
+        input.BeginFrame();
+        input.SetWindowFocused(false);
+        input.SetWindowMinimized(true);
+        input.SetMouseLocked(true);
+        Assert.True(!input.IsWindowFocused && input.WasWindowFocusLost, "Focus lost edge detected");
+        Assert.True(input.IsWindowMinimized && input.IsMouseLocked, "Minimized & mouse lock flags tracked");
+        input.BeginFrame();
+        Assert.True(!input.WasWindowFocusLost && !input.IsWindowFocused, "Focus lost edge clears next frame");
+        input.SetWindowFocused(true);
+        Assert.True(input.IsWindowFocused && input.WasWindowFocusGained, "Focus gained edge detected");
+
+        // UTF-8 text input buffer (ASCII + multi-byte UTF-8 + frame clear + capacity clamp)
+        input.BeginFrame();
+        Assert.True(!input.HasTextInput, "Text input cleared on BeginFrame");
+        input.AppendTextInput("Bring-");
+        input.AppendTextInputUtf8("123"u8);
+        Assert.True(input.HasTextInput && input.TextInputLength == 9, "Appended 9 UTF-8 text bytes");
+
+        Span<char> chars = stackalloc char[32];
+        int charCount = input.CopyTextInputChars(chars);
+        Assert.True(chars.Slice(0, charCount).SequenceEqual("Bring-123"), "Decoded text input matches");
+
+        // Overflow clamp safety (> MaxTextInputBytes must not throw or corrupt)
+        for (int i = 0; i < 20; i++) input.AppendTextInput("ABCDEFGH");
+        Assert.Equal((byte)InputState.MaxTextInputBytes, input.TextInputLength, "Text input clamped cleanly to MaxTextInputBytes");
+
+        // Zero-GC hot loop across 500 frames
+        Span<byte> utf8Out = stackalloc byte[InputState.MaxTextInputBytes];
+        Span<char> charOut = stackalloc char[InputState.MaxTextInputBytes];
+        long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+        int totalChars = 0;
+        for (int i = 0; i < 500; i++)
+        {
+            input.BeginFrame();
+            input.AppendTextInput("ab");
+            int b = input.CopyTextInputUtf8(utf8Out);
+            int c = input.CopyTextInputChars(charOut);
+            bool rel = input.IsMouseReleased(0);
+            totalChars += b + c + (rel ? 1 : 0);
+        }
+        long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+        Assert.Equal(0L, gcAfter - gcBefore, "Text input + mouse release + focus hot loop allocates 0 GC bytes");
+        Assert.True(totalChars > 0, "Text input loop read characters");
     }
 
     private static void TestGamepadInput()

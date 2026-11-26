@@ -284,14 +284,20 @@ public static unsafe class ProfilerOverlaySystem
         UpdateStageBar(in world.RenderComponents, ov.RenderBarSprite, renderMs, budgetMs, trackW, new ColorF(0.22f, 0.96f, 0.50f, 1.0f));
         UpdateStageBar(in world.RenderComponents, ov.GpuBarSprite, gpuMs, budgetMs, trackW, new ColorF(1.0f, 0.80f, 0.18f, 1.0f));
 
-        // Row 5: Draw calls, SetPass calls, Passes
+        // Row 5: Draw calls (+ shadow pass draws), SetPass calls, Passes
         int totalPasses = stats.RenderPasses + stats.CopyPasses;
         int n5 = 0;
         AppendStr(span, ref n5, "DRAWS: ");
         AppendInt(span, ref n5, stats.DrawCalls);
-        AppendStr(span, ref n5, "  |  SETPASS: ");
+        if (stats.ShadowDrawCalls > 0)
+        {
+            AppendStr(span, ref n5, "+");
+            AppendInt(span, ref n5, stats.ShadowDrawCalls);
+            AppendStr(span, ref n5, "S");
+        }
+        AppendStr(span, ref n5, " | SETPASS: ");
         AppendInt(span, ref n5, stats.SetPassCalls);
-        AppendStr(span, ref n5, "  |  PASSES: ");
+        AppendStr(span, ref n5, " | PASS: ");
         AppendInt(span, ref n5, totalPasses);
         WriteText(in world.RenderComponents, ov.DrawsText, span.Slice(0, n5));
 

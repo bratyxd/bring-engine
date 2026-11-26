@@ -29,3 +29,21 @@ All `MeshRendererData` components are automatically:
 2. Sorted in `FrameArena` by `(AlphaMode, Shader, Material, Mesh, SkinnedFlag)`.
 3. Merged into **instanced draw calls** sharing one storage buffer upload per frame (single `SDL_GPUCopyPass` before `SDL_GPURenderPass`).
 4. Skinned meshes automatically sample `AnimationTable.FrameJointPalette` uploaded to the GPU joint storage buffer!
+
+## Directional Sun Shadow Mapping (`SceneLighting` + `shadow_depth.hlsl`)
+Built-in 3D PBR rendering (`pbr_mesh.hlsl`) automatically renders a **texel-snapped directional sun shadow map** (`D32Float`, **3×3 PCF soft shadows**) before the main scene pass whenever `SceneLighting.ShadowsEnabled != 0` (enabled by default in `SceneLighting.Default`).
+
+- Both **static** and **skinned animated glTF** opaque/masked meshes automatically cast shadows in a single depth pass (`shadow_depth.hlsl`), batched strictly by `MeshGpuSlot` (ignoring material/texture so many meshes sharing geometry collapse into 1 shadow draw call, tracked in `RenderStats.ShadowDrawCalls`).
+- Transparent meshes (`MaterialAlphaMode.Blend`) do not cast opaque depth shadows.
+- **Large Worlds**: Update `lighting.ShadowCenter = playerPos` each frame — `BatchRenderer.ComputeDirectionalLightViewProj` automatically snaps the orthographic frustum to exact shadow texels so shadows stay rock-solid without swimming!
+
+```csharp
+SceneLighting lighting = SceneLighting.Default;
+lighting.ShadowsEnabled = 1;           // Set to 0 to disable shadow pass completely
+lighting.ShadowMapSize = 2048;         // 512..4096 (default 2048; use 1024 on low-power presets)
+lighting.ShadowCenter = playerWorldPos;// Center of orthographic shadow coverage box
+lighting.ShadowDistance = 28f;         // Half-extent in world units (28 => 56x56m coverage)
+lighting.ShadowStrength = 0.72f;       // Shadow darkening intensity [0..1]
+lighting.ShadowBias = 0.0018f;         // Depth comparison bias
+lighting.ShadowNormalBias = 0.04f;     // World-space normal offset to eliminate slope acne
+```
