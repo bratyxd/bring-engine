@@ -10,6 +10,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using BringEngine.Core.Handles;
+using BringEngine.Core.Logging;
 using BringEngine.Core.Memory;
 using BringEngine.Core.Threading;
 
@@ -106,6 +107,7 @@ public unsafe struct HttpClientState
     public int MaxConcurrent;
     public int DefaultTimeoutMsValue;
     public int PoolSlot;
+    public LogState* Log;
     public byte Active;
 
     public CachePaddedInt PendingCount;
@@ -124,16 +126,23 @@ public static unsafe class HttpSystem
 {
     private const int MaxInstances = 8;
 
-    private struct ManagedRequestSlot
+    internal struct ManagedRequestSlot
     {
         public CancellationTokenSource? Cts;
         public Task? InFlightTask;
     }
 
-    private struct ManagedHttpPool
+    internal sealed class ManagedHttpGuard
     {
+        public volatile bool Stopped;
+        public int ActiveWorkers;
         public HttpClient? Client;
         public ManagedRequestSlot[]? Requests;
+    }
+
+    private struct ManagedHttpPool
+    {
+        public ManagedHttpGuard? Guard;
         public bool InUse;
     }
 
@@ -147,10 +156,13 @@ public static unsafe class HttpSystem
         HttpClientState* state,
         ref LinearArena persistentArena,
         int maxConcurrent = HttpClientState.DefaultMaxConcurrent,
-        int defaultTimeoutMs = HttpClientState.DefaultTimeoutMs)
+        int defaultTimeoutMs = HttpClientState.DefaultTimeoutMs,
+        LogState* log = null)
     {
         if (state == null) throw new ArgumentNullException(nameof(state));
         if (maxConcurrent < 4) maxConcurrent = 4;
+        int maxHandleSlots = (int)HandlePacking.IndexMask + 1;
+        if (maxConcurrent > maxHandleSlots) maxConcurrent = maxHandleSlots;
         if (defaultTimeoutMs <= 0) defaultTimeoutMs = HttpClientState.DefaultTimeoutMs;
 
         int qCap = 8;
@@ -168,6 +180,12 @@ public static unsafe class HttpSystem
             Timeout = Timeout.InfiniteTimeSpan, // Per-request CTS controls exact timeouts
         };
 
+        var guard = new ManagedHttpGuard
+        {
+            Client = client,
+            Requests = new ManagedRequestSlot[maxConcurrent],
+        };
+
         int poolSlot = -1;
         lock (s_poolLock)
         {
@@ -176,8 +194,7 @@ public static unsafe class HttpSystem
                 if (!s_pools[i].InUse)
                 {
                     s_pools[i].InUse = true;
-                    s_pools[i].Client = client;
-                    s_pools[i].Requests = new ManagedRequestSlot[maxConcurrent];
+                    s_pools[i].Guard = guard;
                     poolSlot = i;
                     break;
                 }
@@ -189,19 +206,34 @@ public static unsafe class HttpSystem
             throw new InvalidOperationException("Maximum concurrent HttpClientState instances exceeded.");
         }
 
-        *state = default;
-        state->Slots = persistentArena.Alloc<HttpSlotMeta>(maxConcurrent, 64);
-        for (int i = 0; i < maxConcurrent; i++)
+        try
         {
-            state->Slots[i].Generation = 1;
-            state->Slots[i].State = 0;
+            *state = default;
+            state->Slots = persistentArena.Alloc<HttpSlotMeta>(maxConcurrent, 64);
+            for (int i = 0; i < maxConcurrent; i++)
+            {
+                state->Slots[i].Generation = 1;
+                state->Slots[i].State = 0;
+            }
+            state->CompletedQueue = persistentArena.Alloc<HttpResponse>(qCap, 64);
+            state->CompletedMask = qCap - 1;
+            state->MaxConcurrent = maxConcurrent;
+            state->DefaultTimeoutMsValue = defaultTimeoutMs;
+            state->PoolSlot = poolSlot;
+            state->Log = log;
+            Volatile.Write(ref state->Active, 1);
         }
-        state->CompletedQueue = persistentArena.Alloc<HttpResponse>(qCap, 64);
-        state->CompletedMask = qCap - 1;
-        state->MaxConcurrent = maxConcurrent;
-        state->DefaultTimeoutMsValue = defaultTimeoutMs;
-        state->PoolSlot = poolSlot;
-        state->Active = 1;
+        catch
+        {
+            client.Dispose();
+            lock (s_poolLock)
+            {
+                s_pools[poolSlot] = default;
+            }
+            throw;
+        }
+
+        LogSystem.Info(log, $"HttpSystem started (maxConcurrent={maxConcurrent}, timeoutMs={defaultTimeoutMs})");
     }
 
     /// <summary>
@@ -210,19 +242,34 @@ public static unsafe class HttpSystem
     /// </summary>
     public static void Stop(HttpClientState* state)
     {
-        if (state == null || state->Active == 0) return;
-        int poolSlot = state->PoolSlot;
+        if (state == null || Volatile.Read(ref state->Active) == 0) return;
 
-        state->Active = 0;
-        Thread.MemoryBarrier();
-
-        ManagedRequestSlot[]? reqs = s_pools[poolSlot].Requests;
+        int poolSlot;
+        ManagedHttpGuard? guard;
+        ManagedRequestSlot[]? reqs;
+        AcquireSpinLock(ref state->SlotLock.Value);
+        if (Volatile.Read(ref state->Active) == 0)
+        {
+            ReleaseSpinLock(ref state->SlotLock.Value);
+            return;
+        }
+        Volatile.Write(ref state->Active, 0);
+        poolSlot = state->PoolSlot;
+        guard = (uint)poolSlot < MaxInstances ? s_pools[poolSlot].Guard : null;
+        reqs = guard?.Requests;
+        if (guard != null)
+            guard.Stopped = true;
         if (reqs != null)
         {
             for (int i = 0; i < reqs.Length; i++)
             {
                 try { reqs[i].Cts?.Cancel(); } catch { /* ignore shutdown races */ }
             }
+        }
+        ReleaseSpinLock(ref state->SlotLock.Value);
+
+        if (reqs != null)
+        {
             for (int i = 0; i < reqs.Length; i++)
             {
                 Task? t = reqs[i].InFlightTask;
@@ -230,7 +277,8 @@ public static unsafe class HttpSystem
                 {
                     try { t.Wait(TimeSpan.FromSeconds(5)); } catch { /* ignore task cancellation */ }
                 }
-                reqs[i].Cts?.Dispose();
+                if (t == null || t.IsCompleted)
+                    reqs[i].Cts?.Dispose();
                 reqs[i] = default;
             }
         }
@@ -239,11 +287,21 @@ public static unsafe class HttpSystem
         while (TryDequeueCompletedRaw(state, out HttpResponse leftover))
             ReleaseResponse(ref leftover);
 
-        s_pools[poolSlot].Client?.Dispose();
-        lock (s_poolLock)
+        if (guard != null && Volatile.Read(ref guard.ActiveWorkers) == 0)
         {
-            s_pools[poolSlot] = default;
+            try { guard.Client?.Dispose(); } catch { }
         }
+
+        if ((uint)poolSlot < MaxInstances)
+        {
+            lock (s_poolLock)
+            {
+                s_pools[poolSlot] = default;
+            }
+        }
+
+        LogSystem.Info(state->Log,
+            $"HttpSystem stopped (sent={Interlocked.Read(ref state->TotalRequestsSent.Value)}, completed={Interlocked.Read(ref state->TotalResponsesCompleted.Value)})");
     }
 
     public static HttpRequestHandle Get(
@@ -280,84 +338,105 @@ public static unsafe class HttpSystem
         int maxResponseBytes = HttpClientState.DefaultMaxResponseBytes,
         ulong userTag = 0)
     {
-        if (state == null || state->Active == 0 || url.IsEmpty)
+        if (state == null || Volatile.Read(ref state->Active) == 0 || url.IsEmpty)
             return HttpRequestHandle.Invalid;
 
         int slotIdx = -1;
         uint gen = 0;
-
-        AcquireSpinLock(ref state->SlotLock.Value);
-        for (int i = 0; i < state->MaxConcurrent; i++)
-        {
-            if (state->Slots[i].State == 0)
-            {
-                state->Slots[i].State = 1;
-                gen = state->Slots[i].Generation;
-                slotIdx = i;
-                break;
-            }
-        }
-        ReleaseSpinLock(ref state->SlotLock.Value);
-
-        if (slotIdx < 0)
-            return HttpRequestHandle.Invalid;
-
-        HttpRequestHandle handle = HttpRequestHandle.Create((uint)slotIdx, gen);
+        HttpRequestHandle handle = HttpRequestHandle.Invalid;
         int effTimeout = timeoutMs > 0 ? timeoutMs : state->DefaultTimeoutMsValue;
         if (maxResponseBytes <= 0) maxResponseBytes = HttpClientState.DefaultMaxResponseBytes;
 
-        HttpRequestMessage msg;
+        AcquireSpinLock(ref state->SlotLock.Value);
         try
         {
-            var uri = new Uri(new string(url), UriKind.Absolute);
-            msg = new HttpRequestMessage(ToHttpMethod(method), uri);
+            ManagedHttpGuard? guard = (uint)state->PoolSlot < MaxInstances ? s_pools[state->PoolSlot].Guard : null;
+            if (Volatile.Read(ref state->Active) == 0 || guard == null || guard.Stopped || guard.Client == null || guard.Requests == null)
+                return HttpRequestHandle.Invalid;
 
-            if (!body.IsEmpty)
+            for (int i = 0; i < state->MaxConcurrent; i++)
             {
-                byte[] copy = body.ToArray();
-                var content = new ByteArrayContent(copy);
-                if (!contentType.IsEmpty)
-                    content.Headers.ContentType = MediaTypeHeaderValue.Parse(new string(contentType));
-                msg.Content = content;
-                Interlocked.Add(ref state->TotalBytesSent.Value, copy.Length);
+                if (state->Slots[i].State == 0)
+                {
+                    state->Slots[i].State = 1;
+                    gen = state->Slots[i].Generation;
+                    slotIdx = i;
+                    break;
+                }
             }
 
-            for (int i = 0; i < headers.Length; i++)
+            if (slotIdx < 0)
             {
-                if (headers[i].Name.Length <= 0) continue;
-                string k = headers[i].Name.ToString();
-                string v = headers[i].Value.ToString();
-                if (!msg.Headers.TryAddWithoutValidation(k, v) && msg.Content != null)
-                    msg.Content.Headers.TryAddWithoutValidation(k, v);
+                LogSystem.Warn(state->Log, $"HttpSystem slot pool exhausted (maxConcurrent={state->MaxConcurrent})");
+                return HttpRequestHandle.Invalid;
             }
-        }
-        catch (Exception ex)
-        {
-            var fail = new HttpResponse
+
+            handle = HttpRequestHandle.Create((uint)slotIdx, gen);
+            HttpRequestMessage? msg = null;
+            int bodyByteLen = 0;
+            try
             {
-                Handle = handle,
-                UserTag = userTag,
-                Status = HttpRequestStatus.Failed,
-                Error = FixedString256.From(ex.Message),
-            };
-            EnqueueCompleted(state, slotIdx, in fail);
+                var uri = new Uri(new string(url), UriKind.Absolute);
+                msg = new HttpRequestMessage(ToHttpMethod(method), uri);
+
+                if (!body.IsEmpty)
+                {
+                    byte[] copy = body.ToArray();
+                    bodyByteLen = copy.Length;
+                    var content = new ByteArrayContent(copy);
+                    if (!contentType.IsEmpty)
+                        content.Headers.ContentType = MediaTypeHeaderValue.Parse(new string(contentType));
+                    msg.Content = content;
+                }
+
+                for (int i = 0; i < headers.Length; i++)
+                {
+                    if (headers[i].Name.Length <= 0) continue;
+                    string k = headers[i].Name.ToString();
+                    string v = headers[i].Value.ToString();
+                    if (!msg.Headers.TryAddWithoutValidation(k, v) && msg.Content != null)
+                        msg.Content.Headers.TryAddWithoutValidation(k, v);
+                }
+            }
+            catch (Exception ex)
+            {
+                msg?.Dispose();
+                Interlocked.Increment(ref state->TotalRequestsSent.Value);
+                Interlocked.Increment(ref state->TotalResponsesCompleted.Value);
+                LogSystem.Warn(state->Log, $"HTTP {handle} request build failed: {ex.Message}");
+                var fail = new HttpResponse
+                {
+                    Handle = handle,
+                    UserTag = userTag,
+                    Status = HttpRequestStatus.Failed,
+                    Error = FixedString256.From(ex.Message),
+                };
+                EnqueueCompleted(state, slotIdx, in fail);
+                return handle;
+            }
+
+            if (bodyByteLen > 0)
+                Interlocked.Add(ref state->TotalBytesSent.Value, bodyByteLen);
+
+            var cts = new CancellationTokenSource();
+            ManagedRequestSlot[] reqs = guard.Requests;
+            reqs[slotIdx].Cts = cts;
+
+            Interlocked.Increment(ref state->PendingCount.Value);
+            Interlocked.Increment(ref state->TotalRequestsSent.Value);
+            Interlocked.Increment(ref guard.ActiveWorkers);
+
+            nint statePtr = (nint)state;
+            HttpClient client = guard.Client;
+            reqs[slotIdx].InFlightTask = Task.Run(() => HttpAsyncWorker.ExecuteRequestAsync(
+                statePtr, guard, client, msg, cts, slotIdx, handle, userTag, effTimeout, maxResponseBytes));
+
             return handle;
         }
-
-        var cts = new CancellationTokenSource();
-        int poolSlot = state->PoolSlot;
-        ManagedRequestSlot[] reqs = s_pools[poolSlot].Requests!;
-        reqs[slotIdx].Cts = cts;
-
-        Interlocked.Increment(ref state->PendingCount.Value);
-        Interlocked.Increment(ref state->TotalRequestsSent.Value);
-
-        nint statePtr = (nint)state;
-        HttpClient client = s_pools[poolSlot].Client!;
-        reqs[slotIdx].InFlightTask = Task.Run(() => HttpAsyncWorker.ExecuteRequestAsync(
-            statePtr, client, msg, cts, slotIdx, handle, userTag, effTimeout, maxResponseBytes));
-
-        return handle;
+        finally
+        {
+            ReleaseSpinLock(ref state->SlotLock.Value);
+        }
     }
 
     /// <summary>
@@ -365,15 +444,23 @@ public static unsafe class HttpSystem
     /// </summary>
     public static void Cancel(HttpClientState* state, HttpRequestHandle handle)
     {
-        if (state == null || state->Active == 0 || !handle.IsValid) return;
+        if (state == null || Volatile.Read(ref state->Active) == 0 || !handle.IsValid) return;
         uint idx = handle.Index;
         if (idx >= (uint)state->MaxConcurrent) return;
 
-        if (Volatile.Read(ref state->Slots[idx].Generation) != handle.Generation) return;
-        if (Volatile.Read(ref state->Slots[idx].State) != 1) return;
-
-        CancellationTokenSource? cts = s_pools[state->PoolSlot].Requests?[idx].Cts;
-        try { cts?.Cancel(); } catch { /* ignore already disposed */ }
+        AcquireSpinLock(ref state->SlotLock.Value);
+        try
+        {
+            if (Volatile.Read(ref state->Active) == 0) return;
+            if (state->Slots[idx].Generation != handle.Generation || state->Slots[idx].State != 1) return;
+            ManagedHttpGuard? guard = (uint)state->PoolSlot < MaxInstances ? s_pools[state->PoolSlot].Guard : null;
+            CancellationTokenSource? cts = guard?.Requests?[idx].Cts;
+            try { cts?.Cancel(); } catch (ObjectDisposedException) { }
+        }
+        finally
+        {
+            ReleaseSpinLock(ref state->SlotLock.Value);
+        }
     }
 
     /// <summary>
@@ -407,19 +494,22 @@ public static unsafe class HttpSystem
         uint idx = response.Handle.Index;
         if (idx < (uint)state->MaxConcurrent)
         {
-            ManagedRequestSlot[]? reqs = s_pools[state->PoolSlot].Requests;
+            CancellationTokenSource? ctsToDispose = null;
+            AcquireSpinLock(ref state->SlotLock.Value);
+            ManagedHttpGuard? guard = (uint)state->PoolSlot < MaxInstances ? s_pools[state->PoolSlot].Guard : null;
+            ManagedRequestSlot[]? reqs = guard?.Requests;
             if (reqs != null)
             {
-                reqs[idx].Cts?.Dispose();
+                ctsToDispose = reqs[idx].Cts;
                 reqs[idx] = default;
             }
-
-            AcquireSpinLock(ref state->SlotLock.Value);
             uint nextGen = (state->Slots[idx].Generation + 1) & HandlePacking.GenerationMask;
             if (nextGen == 0) nextGen = 1;
             Volatile.Write(ref state->Slots[idx].Generation, nextGen);
             Volatile.Write(ref state->Slots[idx].State, 0);
             ReleaseSpinLock(ref state->SlotLock.Value);
+
+            ctsToDispose?.Dispose();
         }
 
         return true;
@@ -471,6 +561,8 @@ public static unsafe class HttpSystem
             BodyAllocSize = bodyCap,
             Error = error,
         };
+        if (status == HttpRequestStatus.Failed || status == HttpRequestStatus.TimedOut)
+            LogSystem.Warn(state->Log, $"HTTP {handle} {status} (code={statusCode}): {error}");
         EnqueueCompleted(state, slotIdx, in resp);
     }
 
@@ -532,6 +624,7 @@ file static class HttpAsyncWorker
 {
     public static async Task ExecuteRequestAsync(
         nint statePtr,
+        HttpSystem.ManagedHttpGuard guard,
         HttpClient client,
         HttpRequestMessage msg,
         CancellationTokenSource userCts,
@@ -549,10 +642,10 @@ file static class HttpAsyncWorker
         FixedString256 error = default;
 
         using var timeoutCts = new CancellationTokenSource(timeoutMs);
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(userCts.Token, timeoutCts.Token);
 
         try
         {
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(userCts.Token, timeoutCts.Token);
             using (msg)
             using (HttpResponseMessage httpResp = await client.SendAsync(msg, HttpCompletionOption.ResponseHeadersRead, linkedCts.Token).ConfigureAwait(false))
             {
@@ -582,7 +675,8 @@ file static class HttpAsyncWorker
                             int n = await stream.ReadAsync(chunk.AsMemory(0, chunk.Length), linkedCts.Token).ConfigureAwait(false);
                             if (n <= 0) break;
 
-                            if (bodyLen + n > maxResponseBytes)
+                            long needed = (long)bodyLen + n;
+                            if (needed > maxResponseBytes)
                             {
                                 FreeNative(ref bodyPtr, ref bodyCap);
                                 bodyLen = 0;
@@ -592,10 +686,10 @@ file static class HttpAsyncWorker
                                 break;
                             }
 
-                            if ((nuint)(bodyLen + n) > bodyCap)
+                            if ((nuint)needed > bodyCap)
                             {
                                 nuint newCap = bodyCap == 0 ? 4096u : bodyCap * 2u;
-                                while (newCap < (nuint)(bodyLen + n)) newCap *= 2u;
+                                while (newCap < (nuint)needed) newCap *= 2u;
                                 if (newCap > (nuint)maxResponseBytes) newCap = (nuint)maxResponseBytes;
                                 bodyPtr = GrowNative(bodyPtr, bodyLen, bodyCap, newCap);
                                 bodyCap = newCap;
@@ -623,25 +717,57 @@ file static class HttpAsyncWorker
         }
         catch (OperationCanceledException)
         {
-            if (userCts.IsCancellationRequested)
-            {
-                status = HttpRequestStatus.Cancelled;
-                error = FixedString256.From("Request cancelled.");
-            }
-            else
+            if (timeoutCts.IsCancellationRequested)
             {
                 status = HttpRequestStatus.TimedOut;
                 error = FixedString256.From("Request timed out.");
             }
+            else
+            {
+                status = HttpRequestStatus.Cancelled;
+                error = FixedString256.From("Request cancelled.");
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            FreeNative(ref bodyPtr, ref bodyCap);
+            bodyLen = 0;
+            status = HttpRequestStatus.Cancelled;
+            error = FixedString256.From("Request cancelled.");
         }
         catch (Exception ex)
         {
+            FreeNative(ref bodyPtr, ref bodyCap);
+            bodyLen = 0;
             status = HttpRequestStatus.Failed;
             error = FixedString256.From(ex.Message);
         }
 
-        HttpSystem.CompleteRequestFromWorker(
-            statePtr, slotIdx, handle, userTag, status, statusCode, bodyPtr, bodyLen, bodyCap, in error);
+        try
+        {
+            if (guard.Stopped)
+            {
+                FreeNative(ref bodyPtr, ref bodyCap);
+                bodyLen = 0;
+            }
+            else
+            {
+                HttpSystem.CompleteRequestFromWorker(
+                    statePtr, slotIdx, handle, userTag, status, statusCode, bodyPtr, bodyLen, bodyCap, in error);
+            }
+        }
+        finally
+        {
+            int rem = Interlocked.Decrement(ref guard.ActiveWorkers);
+            if (guard.Stopped)
+            {
+                try { userCts.Dispose(); } catch { }
+                if (rem == 0)
+                {
+                    try { guard.Client?.Dispose(); } catch { }
+                }
+            }
+        }
     }
 
     private static unsafe nint AllocNative(nuint bytes)

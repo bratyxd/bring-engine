@@ -38,7 +38,16 @@ public readonly struct Fix32 : IEquatable<Fix32>, IComparable<Fix32>
     public static Fix32 FromInt(int v) => new Fix32(v << Shift);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Fix32 FromFloat(float v) => new Fix32((int)System.MathF.Round(v * OneRaw));
+    public static Fix32 FromFloat(float v)
+    {
+        if (float.IsNaN(v)) return Zero;
+        if (v >= 32767.9999f) return MaxValue;
+        if (v <= -32768.0f) return MinValue;
+        double scaled = System.Math.Round((double)v * OneRaw);
+        if (scaled >= int.MaxValue) return MaxValue;
+        if (scaled <= int.MinValue) return MinValue;
+        return new Fix32((int)scaled);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Fix32 FromRatio(int num, int den) => new Fix32((int)(((long)num << Shift) / den));
@@ -53,7 +62,7 @@ public readonly struct Fix32 : IEquatable<Fix32>, IComparable<Fix32>
     public int ToIntFloor() => Raw >> Shift;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int ToIntRound() => (Raw + HalfRaw) >> Shift;
+    public int ToIntRound() => (int)(((long)Raw + HalfRaw) >> Shift);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Fix32 operator +(Fix32 a, Fix32 b) => new Fix32(a.Raw + b.Raw);
@@ -93,7 +102,7 @@ public readonly struct Fix32 : IEquatable<Fix32>, IComparable<Fix32>
     public static bool operator >=(Fix32 a, Fix32 b) => a.Raw >= b.Raw;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Fix32 Abs(Fix32 a) => new Fix32(a.Raw < 0 ? -a.Raw : a.Raw);
+    public static Fix32 Abs(Fix32 a) => a.Raw == int.MinValue ? MaxValue : new Fix32(a.Raw < 0 ? -a.Raw : a.Raw);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Fix32 Min(Fix32 a, Fix32 b) => a.Raw < b.Raw ? a : b;
@@ -133,13 +142,40 @@ public readonly struct Fix32 : IEquatable<Fix32>, IComparable<Fix32>
         return new Fix32((int)res);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static ulong SqrtU64(ulong n)
+    {
+        if (n == 0) return 0;
+        ulong res = 0;
+        ulong bit = 1UL << 62;
+        while (bit > n) bit >>= 2;
+        while (bit != 0)
+        {
+            if (n >= res + bit)
+            {
+                n -= res + bit;
+                res = (res >> 1) + bit;
+            }
+            else
+            {
+                res >>= 1;
+            }
+            bit >>= 2;
+        }
+        return res;
+    }
+
     /// <summary>
     /// Deterministic pure-integer sine (radian input) via quadrant reduction and minimax polynomial.
-    /// Max error < 0.0001 across full domain.
+    /// Max error &lt; 0.0001 across full domain.
     /// </summary>
-    public static Fix32 Sin(Fix32 radians)
+    public static Fix32 Sin(Fix32 radians) => SinRaw(radians.Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Fix32 Cos(Fix32 radians) => SinRaw((long)radians.Raw + HalfPi.Raw);
+
+    private static Fix32 SinRaw(long r)
     {
-        long r = radians.Raw;
         long twoPi = TwoPi.Raw;
         long pi = Pi.Raw;
         long halfPi = HalfPi.Raw;
@@ -179,9 +215,6 @@ public readonly struct Fix32 : IEquatable<Fix32>, IComparable<Fix32>
         if (raw < -OneRaw) raw = -OneRaw;
         return new Fix32(negate ? -raw : raw);
     }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Fix32 Cos(Fix32 radians) => Sin(radians + HalfPi);
 
     public static Fix32 Atan2(Fix32 y, Fix32 x)
     {
@@ -256,6 +289,13 @@ public readonly struct Fix64 : IEquatable<Fix64>, IComparable<Fix64>
     public static bool operator !=(Fix64 a, Fix64 b) => a.Raw != b.Raw;
     public static bool operator <(Fix64 a, Fix64 b) => a.Raw < b.Raw;
     public static bool operator >(Fix64 a, Fix64 b) => a.Raw > b.Raw;
+    public static bool operator <=(Fix64 a, Fix64 b) => a.Raw <= b.Raw;
+    public static bool operator >=(Fix64 a, Fix64 b) => a.Raw >= b.Raw;
+
+    public static Fix64 Abs(Fix64 a) => a.Raw == long.MinValue ? new Fix64(long.MaxValue) : new Fix64(a.Raw < 0 ? -a.Raw : a.Raw);
+    public static Fix64 Min(Fix64 a, Fix64 b) => a.Raw < b.Raw ? a : b;
+    public static Fix64 Max(Fix64 a, Fix64 b) => a.Raw > b.Raw ? a : b;
+    public static Fix64 Clamp(Fix64 v, Fix64 min, Fix64 max) => v.Raw < min.Raw ? min : (v.Raw > max.Raw ? max : v);
 
     public bool Equals(Fix64 other) => Raw == other.Raw;
     public override bool Equals(object? obj) => obj is Fix64 other && Raw == other.Raw;
@@ -282,13 +322,22 @@ public struct FixVec2 : IEquatable<FixVec2>
     public static FixVec2 operator *(FixVec2 a, Fix32 s) => new FixVec2(a.X * s, a.Y * s);
     public static Fix32 Dot(FixVec2 a, FixVec2 b) => a.X * b.X + a.Y * b.Y;
     public readonly Fix32 LengthSq() => X * X + Y * Y;
-    public readonly Fix32 Length() => Fix32.Sqrt(LengthSq());
+
+    public readonly Fix32 Length()
+    {
+        ulong sumSq = (ulong)((long)X.Raw * X.Raw) + (ulong)((long)Y.Raw * Y.Raw);
+        ulong lenRaw = Fix32.SqrtU64(sumSq);
+        return new Fix32(lenRaw >= int.MaxValue ? int.MaxValue : (int)lenRaw);
+    }
 
     public readonly FixVec2 Normalized()
     {
-        Fix32 len = Length();
-        if (len.Raw == 0) return Zero;
-        return new FixVec2(X / len, Y / len);
+        ulong sumSq = (ulong)((long)X.Raw * X.Raw) + (ulong)((long)Y.Raw * Y.Raw);
+        ulong lenRaw = Fix32.SqrtU64(sumSq);
+        if (lenRaw == 0) return Zero;
+        return new FixVec2(
+            new Fix32((int)(((long)X.Raw << Fix32.Shift) / (long)lenRaw)),
+            new Fix32((int)(((long)Y.Raw << Fix32.Shift) / (long)lenRaw)));
     }
 
     public readonly bool Equals(FixVec2 other) => X == other.X && Y == other.Y;
@@ -329,15 +378,26 @@ public struct FixVec3 : IEquatable<FixVec3>
         a.X * b.Y - a.Y * b.X);
 
     public readonly Fix32 LengthSq() => X * X + Y * Y + Z * Z;
-    public readonly Fix32 Length() => Fix32.Sqrt(LengthSq());
+
+    public readonly Fix32 Length()
+    {
+        ulong sumSq = (ulong)((long)X.Raw * X.Raw) + (ulong)((long)Y.Raw * Y.Raw) + (ulong)((long)Z.Raw * Z.Raw);
+        ulong lenRaw = Fix32.SqrtU64(sumSq);
+        return new Fix32(lenRaw >= int.MaxValue ? int.MaxValue : (int)lenRaw);
+    }
+
     public static Fix32 DistanceSq(FixVec3 a, FixVec3 b) => (a - b).LengthSq();
     public static Fix32 Distance(FixVec3 a, FixVec3 b) => (a - b).Length();
 
     public readonly FixVec3 Normalized()
     {
-        Fix32 len = Length();
-        if (len.Raw == 0) return Zero;
-        return new FixVec3(X / len, Y / len, Z / len);
+        ulong sumSq = (ulong)((long)X.Raw * X.Raw) + (ulong)((long)Y.Raw * Y.Raw) + (ulong)((long)Z.Raw * Z.Raw);
+        ulong lenRaw = Fix32.SqrtU64(sumSq);
+        if (lenRaw == 0) return Zero;
+        return new FixVec3(
+            new Fix32((int)(((long)X.Raw << Fix32.Shift) / (long)lenRaw)),
+            new Fix32((int)(((long)Y.Raw << Fix32.Shift) / (long)lenRaw)),
+            new Fix32((int)(((long)Z.Raw << Fix32.Shift) / (long)lenRaw)));
     }
 
     public static FixVec3 Lerp(FixVec3 a, FixVec3 b, Fix32 t) => new FixVec3(
@@ -359,18 +419,33 @@ public struct FixQuat : IEquatable<FixQuat>
 
     public static FixQuat FromAxisAngle(FixVec3 axis, Fix32 angleRad)
     {
+        FixVec3 n = axis.Normalized();
+        if (n.X.Raw == 0 && n.Y.Raw == 0 && n.Z.Raw == 0)
+            return Identity;
         Fix32 half = new Fix32(angleRad.Raw >> 1);
         Fix32 s = Fix32.Sin(half);
         Fix32 c = Fix32.Cos(half);
-        FixVec3 n = axis.Normalized();
         return new FixQuat(n.X * s, n.Y * s, n.Z * s, c);
     }
 
     public readonly FixQuat Normalized()
     {
-        Fix32 len = Fix32.Sqrt(X * X + Y * Y + Z * Z + W * W);
-        if (len.Raw == 0) return Identity;
-        return new FixQuat(X / len, Y / len, Z / len, W / len);
+        long x = X.Raw, y = Y.Raw, z = Z.Raw, w = W.Raw;
+        ulong ab = (ulong)(x * x) + (ulong)(y * y);
+        ulong cd = (ulong)(z * z) + (ulong)(w * w);
+        if (ab > ulong.MaxValue - cd)
+        {
+            x >>= 1; y >>= 1; z >>= 1; w >>= 1;
+            ab = (ulong)(x * x) + (ulong)(y * y);
+            cd = (ulong)(z * z) + (ulong)(w * w);
+        }
+        ulong lenRaw = Fix32.SqrtU64(ab + cd);
+        if (lenRaw == 0) return Identity;
+        return new FixQuat(
+            new Fix32((int)((x << Fix32.Shift) / (long)lenRaw)),
+            new Fix32((int)((y << Fix32.Shift) / (long)lenRaw)),
+            new Fix32((int)((z << Fix32.Shift) / (long)lenRaw)),
+            new Fix32((int)((w << Fix32.Shift) / (long)lenRaw)));
     }
 
     public readonly FixVec3 Rotate(FixVec3 v)

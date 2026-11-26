@@ -227,52 +227,87 @@ public static unsafe class JobSystem
             throw new InvalidOperationException("Maximum concurrent JobScheduler instances exceeded.");
 
         *sched = default;
-        sched->Slots = persistentArena.Alloc<JobSlot>(maxJobs, 64);
-        sched->MaxJobs = maxJobs;
-        for (int i = 0; i < maxJobs; i++)
+        int startedWorkers = 0;
+        try
         {
-            sched->Slots[i].Generation = 1;
-            sched->Slots[i].State = JobStateConst.Free;
-            sched->Slots[i].FirstDependent = -1;
-        }
-
-        sched->DepLinks = persistentArena.Alloc<JobDepLink>(maxDepLinks, 64);
-        sched->MaxDepLinks = maxDepLinks;
-        for (int i = 0; i < maxDepLinks - 1; i++)
-            sched->DepLinks[i].Next = i + 1;
-        sched->DepLinks[maxDepLinks - 1].Next = -1;
-        sched->FreeDepHead.Value = 0;
-
-        sched->ReadyQueue = persistentArena.Alloc<int>(qCap, 64);
-        sched->ReadyQueueMask = qCap - 1;
-
-        int totalSlots = workerCount + 1;
-        sched->TotalThreadSlots = totalSlots;
-        sched->WorkerCount = workerCount;
-        sched->PoolSlot = poolSlot;
-        sched->WorkerScratches = persistentArena.Alloc<WorkerScratchSlot>(totalSlots, 64);
-        if (workerScratchBytes > 0)
-        {
-            for (int i = 0; i < totalSlots; i++)
-                sched->WorkerScratches[i].Arena = LinearArena.Create(workerScratchBytes, StringId.Hash("JobScratch").Value ^ (ulong)i);
-        }
-
-        sched->Active = 1;
-
-        if (workerCount > 0)
-        {
-            nint rawPtr = (nint)sched;
-            for (int w = 0; w < workerCount; w++)
+            sched->Slots = persistentArena.Alloc<JobSlot>(maxJobs, 64);
+            sched->MaxJobs = maxJobs;
+            for (int i = 0; i < maxJobs; i++)
             {
-                var param = new WorkerStartParam { SchedulerPtr = rawPtr, WorkerIndex = w + 1 };
-                var thread = new Thread(WorkerEntry)
-                {
-                    Name = $"BringEngine.JobWorker.{w + 1}",
-                    IsBackground = true,
-                };
-                s_pools[poolSlot].Workers![w] = thread;
-                thread.Start(param);
+                sched->Slots[i].Generation = 1;
+                sched->Slots[i].State = JobStateConst.Free;
+                sched->Slots[i].FirstDependent = -1;
             }
+
+            sched->DepLinks = persistentArena.Alloc<JobDepLink>(maxDepLinks, 64);
+            sched->MaxDepLinks = maxDepLinks;
+            for (int i = 0; i < maxDepLinks - 1; i++)
+                sched->DepLinks[i].Next = i + 1;
+            sched->DepLinks[maxDepLinks - 1].Next = -1;
+            sched->FreeDepHead.Value = 0;
+
+            sched->ReadyQueue = persistentArena.Alloc<int>(qCap, 64);
+            sched->ReadyQueueMask = qCap - 1;
+
+            int totalSlots = workerCount + 1;
+            sched->TotalThreadSlots = totalSlots;
+            sched->WorkerCount = workerCount;
+            sched->PoolSlot = poolSlot;
+            sched->WorkerScratches = persistentArena.Alloc<WorkerScratchSlot>(totalSlots, 64);
+            if (workerScratchBytes > 0)
+            {
+                for (int i = 0; i < totalSlots; i++)
+                    sched->WorkerScratches[i].Arena = LinearArena.Create(workerScratchBytes, StringId.Hash("JobScratch").Value ^ (ulong)i);
+            }
+
+            sched->Active = 1;
+
+            if (workerCount > 0)
+            {
+                nint rawPtr = (nint)sched;
+                for (int w = 0; w < workerCount; w++)
+                {
+                    var param = new WorkerStartParam { SchedulerPtr = rawPtr, WorkerIndex = w + 1 };
+                    var thread = new Thread(WorkerEntry)
+                    {
+                        Name = $"BringEngine.JobWorker.{w + 1}",
+                        IsBackground = true,
+                    };
+                    s_pools[poolSlot].Workers![w] = thread;
+                    thread.Start(param);
+                    startedWorkers++;
+                }
+            }
+        }
+        catch
+        {
+            Volatile.Write(ref sched->ShutdownFlag.Value, 1);
+            Thread.MemoryBarrier();
+            AutoResetEvent[]? events = s_pools[poolSlot].WakeEvents;
+            Thread[]? threads = s_pools[poolSlot].Workers;
+            if (events != null)
+            {
+                for (int w = 0; w < startedWorkers; w++)
+                    try { events[w]?.Set(); } catch { }
+            }
+            if (threads != null)
+            {
+                for (int w = 0; w < startedWorkers; w++)
+                    threads[w]?.Join();
+            }
+            if (events != null)
+            {
+                for (int w = 0; w < events.Length; w++)
+                    events[w]?.Dispose();
+            }
+            if (sched->WorkerScratches != null)
+            {
+                for (int i = 0; i < sched->TotalThreadSlots; i++)
+                    sched->WorkerScratches[i].Arena.Dispose();
+            }
+            sched->Active = 0;
+            lock (s_poolLock) { s_pools[poolSlot] = default; }
+            throw;
         }
     }
 
@@ -316,7 +351,7 @@ public static unsafe class JobSystem
                 sched->WorkerScratches[i].Arena.Dispose();
         }
 
-        Exception? err = s_pools[poolSlot].WorkerError;
+        Exception? err = Interlocked.Exchange(ref s_pools[poolSlot].WorkerError, null);
         lock (s_poolLock)
         {
             s_pools[poolSlot] = default;
@@ -328,7 +363,8 @@ public static unsafe class JobSystem
     }
 
     /// <summary>
-    /// Returns the dedicated lock-free LinearArena for the current workerIndex (0 = calling thread, 1..WorkerCount = pool workers).
+    /// Returns the dedicated lock-free LinearArena for the current workerIndex (0 = calling external thread, 1..WorkerCount = pool workers).
+    /// Slot 0 must only be used by one external caller thread at a time (e.g., Logic Thread during ParallelFor/Complete).
     /// Always pair with SaveMarker() / Rollback() inside a job callback or call ResetAllWorkerScratch at the frame barrier.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -417,7 +453,13 @@ public static unsafe class JobSystem
         Interlocked.Increment(ref sched->TotalJobsScheduled.Value);
 
         if (dependency.IsValid)
-            AttachDependency(sched, dependency, slotIdx);
+        {
+            if (!TryAttachDependency(sched, dependency, slotIdx))
+            {
+                Volatile.Write(ref slot->State, JobStateConst.Free);
+                throw new OutOfMemoryException($"JobScheduler dependency link pool ({sched->MaxDepLinks}) exhausted.");
+            }
+        }
 
         if (Interlocked.Decrement(ref slot->PendingDeps) == 0)
             EnqueueReadyJob(sched, slotIdx, wakeCount: 1);
@@ -438,7 +480,43 @@ public static unsafe class JobSystem
         JobHandle dependency = default,
         int minParallelCount = 0)
     {
-        if (count <= 0) return dependency;
+        if (count <= 0)
+        {
+            if (sched == null || sched->Active == 0 || sched->WorkerCount <= 0)
+            {
+                if (sched != null && sched->Active != 0 && dependency.IsValid)
+                    Complete(sched, dependency);
+                return JobHandle.Invalid;
+            }
+            if (!dependency.IsValid || IsComplete(sched, dependency))
+                return JobHandle.Invalid;
+
+            // Allocate a distinct Fence job tracking dependency so RequestCancel on the returned handle never cancels dependency
+            int fSlotIdx = AllocSlot(sched);
+            JobSlot* fSlot = sched->Slots + fSlotIdx;
+            uint fGen = fSlot->Generation;
+            fSlot->Kind = JobKind.Fence;
+            fSlot->TotalItems = 0;
+            fSlot->BatchSize = 1;
+            fSlot->NextItem = 0;
+            fSlot->RemainingChunks = 0;
+            fSlot->CancelRequested = 0;
+            fSlot->FirstDependent = -1;
+            fSlot->DepLock = 0;
+            fSlot->UserData = null;
+            fSlot->CallbackPtr = null;
+            fSlot->PendingDeps = 1;
+            Volatile.Write(ref fSlot->State, JobStateConst.Pending);
+
+            if (!TryAttachDependency(sched, dependency, fSlotIdx))
+            {
+                Volatile.Write(ref fSlot->State, JobStateConst.Free);
+                throw new OutOfMemoryException($"JobScheduler dependency link pool ({sched->MaxDepLinks}) exhausted.");
+            }
+            if (Interlocked.Decrement(ref fSlot->PendingDeps) == 0)
+                FinishJob(sched, fSlotIdx);
+            return JobHandle.Create((uint)fSlotIdx, fGen);
+        }
         if (batchSize < 1) batchSize = 1;
 
         if (sched == null || sched->Active == 0 || sched->WorkerCount <= 0)
@@ -473,7 +551,13 @@ public static unsafe class JobSystem
         Interlocked.Increment(ref sched->TotalJobsScheduled.Value);
 
         if (dependency.IsValid)
-            AttachDependency(sched, dependency, slotIdx);
+        {
+            if (!TryAttachDependency(sched, dependency, slotIdx))
+            {
+                Volatile.Write(ref slot->State, JobStateConst.Free);
+                throw new OutOfMemoryException($"JobScheduler dependency link pool ({sched->MaxDepLinks}) exhausted.");
+            }
+        }
 
         if (Interlocked.Decrement(ref slot->PendingDeps) == 0)
             EnqueueReadyJob(sched, slotIdx, wakeCount: chunks < sched->WorkerCount ? chunks : sched->WorkerCount);
@@ -534,8 +618,12 @@ public static unsafe class JobSystem
 
         for (int i = 0; i < deps.Length; i++)
         {
-            if (deps[i].IsValid)
-                AttachDependency(sched, deps[i], slotIdx);
+            if (deps[i].IsValid && !TryAttachDependency(sched, deps[i], slotIdx))
+            {
+                if (Interlocked.Decrement(ref slot->PendingDeps) == 0)
+                    Volatile.Write(ref slot->State, JobStateConst.Free);
+                throw new OutOfMemoryException($"JobScheduler dependency link pool ({sched->MaxDepLinks}) exhausted.");
+            }
         }
 
         if (Interlocked.Decrement(ref slot->PendingDeps) == 0)
@@ -556,7 +644,9 @@ public static unsafe class JobSystem
         JobSlot* slot = sched->Slots + idx;
         uint gen = Volatile.Read(ref slot->Generation);
         if (gen != handle.Generation) return true;
-        return Volatile.Read(ref slot->State) == JobStateConst.Completed;
+        int st = Volatile.Read(ref slot->State);
+        if (st == JobStateConst.Completed || st == JobStateConst.Free) return true;
+        return Volatile.Read(ref slot->Generation) != handle.Generation;
     }
 
     /// <summary>
@@ -616,12 +706,9 @@ public static unsafe class JobSystem
 
         if (sched->Active != 0)
         {
-            Exception? err = s_pools[sched->PoolSlot].WorkerError;
+            Exception? err = Interlocked.Exchange(ref s_pools[sched->PoolSlot].WorkerError, null);
             if (err != null)
-            {
-                s_pools[sched->PoolSlot].WorkerError = null;
                 throw new InvalidOperationException("Unhandled exception occurred inside a JobSystem worker.", err);
-            }
         }
     }
 
@@ -709,8 +796,7 @@ public static unsafe class JobSystem
                 {
                     // Increment generation under DepLock so stale handles immediately see retired/completed
                     AcquireSpinLock(ref s->DepLock);
-                    uint nextGen = (s->Generation + 1) & HandlePacking.GenerationMask;
-                    if (nextGen == 0) nextGen = 1;
+                    uint nextGen = HandlePacking.NextGeneration(s->Generation);
                     Volatile.Write(ref s->Generation, nextGen);
                     Volatile.Write(ref s->State, JobStateConst.Pending);
                     ReleaseSpinLock(ref s->DepLock);
@@ -727,44 +813,60 @@ public static unsafe class JobSystem
         }
     }
 
-    private static void AttachDependency(JobScheduler* sched, JobHandle dep, int childSlotIdx)
+    private static bool TryAttachDependency(JobScheduler* sched, JobHandle dep, int childSlotIdx)
     {
         uint depIdx = dep.Index;
-        if (depIdx >= (uint)sched->MaxJobs) return;
+        if (depIdx >= (uint)sched->MaxJobs) return true;
         JobSlot* depSlot = sched->Slots + depIdx;
 
         // Pre-increment child's PendingDeps before publishing link so child cannot fire early
         Interlocked.Increment(ref sched->Slots[childSlotIdx].PendingDeps);
 
         bool alreadyDone;
+        bool attached = true;
         AcquireSpinLock(ref depSlot->DepLock);
-        if (Volatile.Read(ref depSlot->Generation) != dep.Generation ||
-            Volatile.Read(ref depSlot->State) == JobStateConst.Completed)
+        try
         {
-            alreadyDone = true;
+            if (Volatile.Read(ref depSlot->Generation) != dep.Generation ||
+                Volatile.Read(ref depSlot->State) == JobStateConst.Completed)
+            {
+                alreadyDone = true;
+            }
+            else
+            {
+                int linkIdx = TryAllocDepLink(sched);
+                if (linkIdx < 0)
+                {
+                    alreadyDone = true;
+                    attached = false;
+                }
+                else
+                {
+                    sched->DepLinks[linkIdx].ChildSlot = childSlotIdx;
+                    sched->DepLinks[linkIdx].Next = depSlot->FirstDependent;
+                    depSlot->FirstDependent = linkIdx;
+                    alreadyDone = false;
+                }
+            }
         }
-        else
+        finally
         {
-            int linkIdx = AllocDepLink(sched);
-            sched->DepLinks[linkIdx].ChildSlot = childSlotIdx;
-            sched->DepLinks[linkIdx].Next = depSlot->FirstDependent;
-            depSlot->FirstDependent = linkIdx;
-            alreadyDone = false;
+            ReleaseSpinLock(ref depSlot->DepLock);
         }
-        ReleaseSpinLock(ref depSlot->DepLock);
 
         if (alreadyDone)
             Interlocked.Decrement(ref sched->Slots[childSlotIdx].PendingDeps);
+        return attached;
     }
 
-    private static int AllocDepLink(JobScheduler* sched)
+    private static int TryAllocDepLink(JobScheduler* sched)
     {
         AcquireSpinLock(ref sched->DepPoolLock.Value);
         int head = sched->FreeDepHead.Value;
         if (head < 0)
         {
             ReleaseSpinLock(ref sched->DepPoolLock.Value);
-            throw new OutOfMemoryException($"JobScheduler dependency link pool ({sched->MaxDepLinks}) exhausted.");
+            return -1;
         }
         sched->FreeDepHead.Value = sched->DepLinks[head].Next;
         ReleaseSpinLock(ref sched->DepPoolLock.Value);

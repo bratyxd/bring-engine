@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using BringEngine.Assets;
 using BringEngine.Assets.Compression;
 using BringEngine.Core.Handles;
+using BringEngine.Core.Logging;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
 using SDL3;
@@ -49,8 +50,12 @@ public struct GpuShaderSlot
     public nint PipelineAlphaBlend;
     public nint PipelineAdditive;
     public nint PipelineOverlayNoDepth;
+    public nint PipelineAdditiveNoDepth;
+    public nint PipelineOpaqueCullNone;
+    public nint PipelineAlphaBlendCullNone;
     public ShaderVertexLayout Layout;
     public byte FragmentSamplerCount;
+    public byte WarnedLayoutMismatch;
     public byte Alive;
 }
 
@@ -98,6 +103,11 @@ public unsafe struct GpuContext
     public nint ShadowVertexShader;
     public nint ShadowFragmentShader;
     public nint ShadowPipeline;
+    public nint ShadowPipelineCullNone;
+    public nint ShadowMaskVertexShader;
+    public nint ShadowMaskFragmentShader;
+    public nint ShadowMaskPipeline;
+    public nint ShadowMaskPipelineCullNone;
     public byte ShadowMapSupported;
 
     // Offscreen scene color target (decouples GPU render work from swapchain VSync Present wait)
@@ -152,6 +162,7 @@ public unsafe struct GpuContext
     public ShaderHandle BuiltinSdfTextShader;
     public ShaderHandle BuiltinParticleShader;
 
+    public LogState* Log;
     public RenderStats LastFrameStats;
     public SDL.GPUPresentMode ActivePresentMode;
     public byte VSyncEnabled;
@@ -167,54 +178,104 @@ public static unsafe class GpuSystem
         bool debugMode = false,
         int maxMeshes = 1024,
         int maxTextures = 512,
-        int maxShaders = 64)
+        int maxShaders = 64,
+        LogState* log = null)
     {
         if (!ShaderCross.Init())
-            throw new InvalidOperationException($"SDL_ShaderCross_Init failed: {SDL.GetError()}");
-
-        SDL.GPUShaderFormat formats = ShaderCross.GetSPIRVShaderFormats();
-        if (formats == 0)
-            formats = SDL.GPUShaderFormat.SPIRV | SDL.GPUShaderFormat.DXIL | SDL.GPUShaderFormat.MSL;
-
-        nint device = SDL.CreateGPUDevice(formats, debugMode, null);
-        if (device == nint.Zero)
-            throw new InvalidOperationException($"SDL_CreateGPUDevice failed: {SDL.GetError()}");
-
-        if (!SDL.ClaimWindowForGPUDevice(device, window))
-            throw new InvalidOperationException($"SDL_ClaimWindowForGPUDevice failed: {SDL.GetError()}");
-
-        SDL.GPUTextureFormat swapFmt = SDL.GetGPUSwapchainTextureFormat(device, window);
-
-        uint* shaderGens = persistentArena.AllocUninitialized<uint>(maxShaders, 16);
-        for (int i = 0; i < maxShaders; i++) shaderGens[i] = 1;
-
-        bool shadowSupported = SDL.GPUTextureSupportsFormat(
-            device,
-            SDL.GPUTextureFormat.D32Float,
-            SDL.GPUTextureType.TextureType2D,
-            SDL.GPUTextureUsageFlags.DepthStencilTarget | SDL.GPUTextureUsageFlags.Sampler);
-
-        var ctx = new GpuContext
         {
-            Device = device,
-            Window = window,
-            SwapchainFormat = swapFmt,
-            DepthFormat = SDL.GPUTextureFormat.D32Float,
-            ShadowMapSupported = (byte)(shadowSupported ? 1 : 0),
-            Meshes = persistentArena.Alloc<GpuMeshSlot>(maxMeshes, 64),
-            MaxMeshes = maxMeshes,
-            Textures = persistentArena.Alloc<GpuTextureSlot>(maxTextures, 64),
-            MaxTextures = maxTextures,
-            Shaders = persistentArena.Alloc<GpuShaderSlot>(maxShaders, 64),
-            ShaderGens = shaderGens,
-            MaxShaders = maxShaders,
-            Initialized = 1,
-        };
+            string err = SDL.GetError();
+            if (log != null) LogSystem.Error(log, $"SDL_ShaderCross_Init failed: {err}");
+            throw new InvalidOperationException($"SDL_ShaderCross_Init failed: {err}");
+        }
 
-        CreateDefaultSamplersAndBuffers(ref ctx);
-        SDL.SetGPUAllowedFramesInFlight(ctx.Device, 2); // Pipelined double-buffered GPU execution
-        SetVSync(ref ctx, enabled: true);               // VSync ON by default
-        return ctx;
+        nint device = nint.Zero;
+        bool windowClaimed = false;
+        var ctx = new GpuContext { Log = log };
+
+        try
+        {
+            SDL.GPUShaderFormat formats = ShaderCross.GetSPIRVShaderFormats();
+            if (formats == 0)
+                formats = SDL.GPUShaderFormat.SPIRV | SDL.GPUShaderFormat.DXIL | SDL.GPUShaderFormat.MSL;
+
+            device = SDL.CreateGPUDevice(formats, debugMode, null);
+            if (device == nint.Zero)
+            {
+                string err = SDL.GetError();
+                if (log != null) LogSystem.Error(log, $"SDL_CreateGPUDevice failed: {err}");
+                throw new InvalidOperationException($"SDL_CreateGPUDevice failed: {err}");
+            }
+
+            if (!SDL.ClaimWindowForGPUDevice(device, window))
+            {
+                string err = SDL.GetError();
+                if (log != null) LogSystem.Error(log, $"SDL_ClaimWindowForGPUDevice failed: {err}");
+                throw new InvalidOperationException($"SDL_ClaimWindowForGPUDevice failed: {err}");
+            }
+            windowClaimed = true;
+
+            SDL.GPUTextureFormat swapFmt = SDL.GetGPUSwapchainTextureFormat(device, window);
+
+            uint* shaderGens = persistentArena.AllocUninitialized<uint>(maxShaders, 16);
+            for (int i = 0; i < maxShaders; i++) shaderGens[i] = 1;
+
+            bool shadowSupported = SDL.GPUTextureSupportsFormat(
+                device,
+                SDL.GPUTextureFormat.D32Float,
+                SDL.GPUTextureType.TextureType2D,
+                SDL.GPUTextureUsageFlags.DepthStencilTarget | SDL.GPUTextureUsageFlags.Sampler);
+
+            ctx = new GpuContext
+            {
+                Device = device,
+                Window = window,
+                SwapchainFormat = swapFmt,
+                DepthFormat = SDL.GPUTextureFormat.D32Float,
+                ShadowMapSupported = (byte)(shadowSupported ? 1 : 0),
+                Meshes = persistentArena.Alloc<GpuMeshSlot>(maxMeshes, 64),
+                MaxMeshes = maxMeshes,
+                Textures = persistentArena.Alloc<GpuTextureSlot>(maxTextures, 64),
+                MaxTextures = maxTextures,
+                Shaders = persistentArena.Alloc<GpuShaderSlot>(maxShaders, 64),
+                ShaderGens = shaderGens,
+                MaxShaders = maxShaders,
+                Log = log,
+                Initialized = 1,
+            };
+
+            CreateDefaultSamplersAndBuffers(ref ctx);
+            SDL.SetGPUAllowedFramesInFlight(ctx.Device, 2); // Pipelined double-buffered GPU execution
+            SetVSync(ref ctx, enabled: true);               // VSync ON by default
+
+            if (log != null)
+            {
+                string driver = SDL.GetGPUDeviceDriver(ctx.Device) ?? "unknown";
+                LogSystem.Info(log, $"GpuContext created: driver={driver} debug={debugMode} swapFmt={swapFmt} shadowD32={shadowSupported} vsync={(ctx.VSyncEnabled != 0 ? "ON" : "OFF")} presentMode={ctx.ActivePresentMode}");
+            }
+
+            return ctx;
+        }
+        catch
+        {
+            if (device != nint.Zero)
+            {
+                if (ctx.DefaultWhiteTexture != nint.Zero) SDL.ReleaseGPUTexture(device, ctx.DefaultWhiteTexture);
+                if (ctx.SamplerLinearWrap != nint.Zero) SDL.ReleaseGPUSampler(device, ctx.SamplerLinearWrap);
+                if (ctx.SamplerLinearClamp != nint.Zero) SDL.ReleaseGPUSampler(device, ctx.SamplerLinearClamp);
+                if (ctx.SamplerNearestClamp != nint.Zero) SDL.ReleaseGPUSampler(device, ctx.SamplerNearestClamp);
+                if (ctx.QuadIndexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.QuadIndexBuffer);
+                if (ctx.Instance3DBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.Instance3DBuffer);
+                if (ctx.JointPaletteBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.JointPaletteBuffer);
+                if (ctx.SpriteInstanceBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.SpriteInstanceBuffer);
+                if (ctx.TextGlyphBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.TextGlyphBuffer);
+                if (ctx.ParticleInstanceBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.ParticleInstanceBuffer);
+                if (ctx.UploadTransferBuffer != nint.Zero) SDL.ReleaseGPUTransferBuffer(device, ctx.UploadTransferBuffer);
+                if (windowClaimed && window != nint.Zero) SDL.ReleaseWindowFromGPUDevice(device, window);
+                SDL.DestroyGPUDevice(device);
+            }
+            ShaderCross.Quit();
+            throw;
+        }
     }
 
     public static RenderShaderDefaults GetBuiltinShaders(in GpuContext ctx) => new RenderShaderDefaults
@@ -240,9 +301,17 @@ public static unsafe class GpuSystem
             if (SDL.WindowSupportsGPUPresentMode(ctx.Device, ctx.Window, SDL.GPUPresentMode.Immediate))
                 desired = SDL.GPUPresentMode.Immediate;
             else if (SDL.WindowSupportsGPUPresentMode(ctx.Device, ctx.Window, SDL.GPUPresentMode.Mailbox))
+            {
                 desired = SDL.GPUPresentMode.Mailbox;
+                if (ctx.Log != null)
+                    LogSystem.Warn(ctx.Log, "Immediate present mode unsupported; falling back to Mailbox");
+            }
             else
+            {
                 desired = SDL.GPUPresentMode.VSync;
+                if (ctx.Log != null)
+                    LogSystem.Warn(ctx.Log, "Immediate/Mailbox present modes unsupported; staying on VSync");
+            }
         }
 
         bool ok = SDL.SetGPUSwapchainParameters(ctx.Device, ctx.Window, SDL.GPUSwapchainComposition.SDR, desired);
@@ -251,9 +320,14 @@ public static unsafe class GpuSystem
             ctx.ActivePresentMode = desired;
             ctx.VSyncEnabled = (byte)(desired == SDL.GPUPresentMode.VSync ? 1 : 0);
         }
+        else if (ctx.Log != null)
+        {
+            LogSystem.Warn(ctx.Log, $"SDL_SetGPUSwapchainParameters({desired}) failed: {SDL.GetError()}");
+        }
         return ok;
     }
 
+    [Obsolete("Pass a pinned GpuContext* instead of ref GpuContext to prevent dangling pointer capture.", error: true)]
     public static void BindAssetCleanupHooks(ref GpuContext ctx, ref AssetRegistry assets)
     {
         fixed (GpuContext* ptr = &ctx)
@@ -265,13 +339,20 @@ public static unsafe class GpuSystem
     }
 
     /// <summary>
-    /// Overload taking explicit stable GpuContext* (preferred when GpuContext lives in native/fixed memory).
+    /// Binds GPU resource release hooks onto AssetRegistry using a stable pinned GpuContext*.
     /// </summary>
     public static void BindAssetCleanupHooks(GpuContext* ctxPtr, ref AssetRegistry assets)
     {
         assets.GpuContextPtr = ctxPtr;
-        assets.ReleaseGpuMesh = &ReleaseGpuMeshHook;
-        assets.ReleaseGpuTexture = &ReleaseGpuTextureHook;
+        assets.ReleaseGpuMesh = ctxPtr != null ? &ReleaseGpuMeshHook : null;
+        assets.ReleaseGpuTexture = ctxPtr != null ? &ReleaseGpuTextureHook : null;
+    }
+
+    public static void ClearAssetCleanupHooks(ref AssetRegistry assets)
+    {
+        assets.GpuContextPtr = null;
+        assets.ReleaseGpuMesh = null;
+        assets.ReleaseGpuTexture = null;
     }
 
     private static void ReleaseGpuMeshHook(void* ctxPtr, int slot)
@@ -320,12 +401,12 @@ public static unsafe class GpuSystem
         };
         ctx.UploadTransferBuffer = SDL.CreateGPUTransferBuffer(ctx.Device, in tbInfo);
 
-        // Allocate per-frame storage buffers
-        ctx.Instance3DBufferBytes = 4 * 1024 * 1024;       // ~28k 3D instances
-        ctx.JointPaletteBufferBytes = 2 * 1024 * 1024;     // 32k joint matrices
+        // Allocate per-frame storage buffers (grown dynamically on demand in BatchRenderer)
+        ctx.Instance3DBufferBytes = 4 * 1024 * 1024;       // 32,768 3D instances
+        ctx.JointPaletteBufferBytes = 2 * 1024 * 1024;     // 32,768 joint matrices
         ctx.SpriteInstanceBufferBytes = 2 * 1024 * 1024;   // ~18k sprites
-        ctx.TextGlyphBufferBytes = 4 * 1024 * 1024;        // ~32k text glyphs
-        ctx.ParticleInstanceBufferBytes = 2 * 1024 * 1024; // ~32k particles
+        ctx.TextGlyphBufferBytes = 4 * 1024 * 1024;        // ~29,127 text glyphs
+        ctx.ParticleInstanceBufferBytes = 2 * 1024 * 1024; // 32,768 particles
 
         ctx.Instance3DBuffer = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.GraphicsStorageRead, ctx.Instance3DBufferBytes);
         ctx.JointPaletteBuffer = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.GraphicsStorageRead, ctx.JointPaletteBufferBytes);
@@ -385,12 +466,17 @@ public static unsafe class GpuSystem
 
     public static void EnsureDepthTexture(ref GpuContext ctx, uint width, uint height)
     {
-        if (width == 0 || height == 0) return;
+        if (width == 0 || height == 0 || ctx.Device == nint.Zero) return;
         if (ctx.DepthTexture != nint.Zero && ctx.DepthWidth == width && ctx.DepthHeight == height)
             return;
 
         if (ctx.DepthTexture != nint.Zero)
+        {
             SDL.ReleaseGPUTexture(ctx.Device, ctx.DepthTexture);
+            ctx.DepthTexture = nint.Zero;
+            ctx.DepthWidth = 0;
+            ctx.DepthHeight = 0;
+        }
 
         var info = new SDL.GPUTextureCreateInfo
         {
@@ -403,7 +489,14 @@ public static unsafe class GpuSystem
             NumLevels = 1,
             SampleCount = SDL.GPUSampleCount.SampleCount1,
         };
-        ctx.DepthTexture = SDL.CreateGPUTexture(ctx.Device, in info);
+        nint tex = SDL.CreateGPUTexture(ctx.Device, in info);
+        if (tex == nint.Zero)
+        {
+            string err = SDL.GetError();
+            if (ctx.Log != null) LogSystem.Error(ctx.Log, $"EnsureDepthTexture({width}x{height}) failed: {err}");
+            return;
+        }
+        ctx.DepthTexture = tex;
         ctx.DepthWidth = width;
         ctx.DepthHeight = height;
     }
@@ -435,7 +528,11 @@ public static unsafe class GpuSystem
             SampleCount = SDL.GPUSampleCount.SampleCount1,
         };
         nint tex = SDL.CreateGPUTexture(ctx.Device, in info);
-        if (tex == nint.Zero) return false;
+        if (tex == nint.Zero)
+        {
+            if (ctx.Log != null) LogSystem.Warn(ctx.Log, $"EnsureShadowMapTexture({size}) failed: {SDL.GetError()}");
+            return false;
+        }
         ctx.ShadowDepthTexture = tex;
         ctx.ShadowMapSize = size;
         return true;
@@ -443,12 +540,17 @@ public static unsafe class GpuSystem
 
     public static void EnsureSceneColorTarget(ref GpuContext ctx, uint width, uint height)
     {
-        if (width == 0 || height == 0) return;
+        if (width == 0 || height == 0 || ctx.Device == nint.Zero) return;
         if (ctx.SceneColorTexture != nint.Zero && ctx.SceneColorWidth == width && ctx.SceneColorHeight == height)
             return;
 
         if (ctx.SceneColorTexture != nint.Zero)
+        {
             SDL.ReleaseGPUTexture(ctx.Device, ctx.SceneColorTexture);
+            ctx.SceneColorTexture = nint.Zero;
+            ctx.SceneColorWidth = 0;
+            ctx.SceneColorHeight = 0;
+        }
 
         var info = new SDL.GPUTextureCreateInfo
         {
@@ -461,18 +563,36 @@ public static unsafe class GpuSystem
             NumLevels = 1,
             SampleCount = SDL.GPUSampleCount.SampleCount1,
         };
-        ctx.SceneColorTexture = SDL.CreateGPUTexture(ctx.Device, in info);
+        nint tex = SDL.CreateGPUTexture(ctx.Device, in info);
+        if (tex == nint.Zero)
+        {
+            string err = SDL.GetError();
+            if (ctx.Log != null) LogSystem.Error(ctx.Log, $"EnsureSceneColorTarget({width}x{height}) failed: {err}");
+            return;
+        }
+        ctx.SceneColorTexture = tex;
         ctx.SceneColorWidth = width;
         ctx.SceneColorHeight = height;
     }
 
     public static void EnsureCaptureTarget(ref GpuContext ctx, uint width, uint height)
     {
+        if (width == 0 || height == 0 || ctx.Device == nint.Zero) return;
         if (ctx.CaptureColorTexture != nint.Zero && ctx.CaptureWidth == width && ctx.CaptureHeight == height)
             return;
 
-        if (ctx.CaptureColorTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.CaptureColorTexture);
-        if (ctx.CaptureTransferBuffer != nint.Zero) SDL.ReleaseGPUTransferBuffer(ctx.Device, ctx.CaptureTransferBuffer);
+        if (ctx.CaptureColorTexture != nint.Zero)
+        {
+            SDL.ReleaseGPUTexture(ctx.Device, ctx.CaptureColorTexture);
+            ctx.CaptureColorTexture = nint.Zero;
+        }
+        if (ctx.CaptureTransferBuffer != nint.Zero)
+        {
+            SDL.ReleaseGPUTransferBuffer(ctx.Device, ctx.CaptureTransferBuffer);
+            ctx.CaptureTransferBuffer = nint.Zero;
+        }
+        ctx.CaptureWidth = 0;
+        ctx.CaptureHeight = 0;
 
         var texInfo = new SDL.GPUTextureCreateInfo
         {
@@ -485,14 +605,38 @@ public static unsafe class GpuSystem
             NumLevels = 1,
             SampleCount = SDL.GPUSampleCount.SampleCount1,
         };
-        ctx.CaptureColorTexture = SDL.CreateGPUTexture(ctx.Device, in texInfo);
+        nint tex = SDL.CreateGPUTexture(ctx.Device, in texInfo);
+        if (tex == nint.Zero)
+        {
+            string err = SDL.GetError();
+            if (ctx.Log != null) LogSystem.Error(ctx.Log, $"EnsureCaptureTarget texture({width}x{height}) failed: {err}");
+            return;
+        }
+
+        ulong tbBytes = (ulong)width * height * 4UL;
+        if (tbBytes > uint.MaxValue)
+        {
+            SDL.ReleaseGPUTexture(ctx.Device, tex);
+            if (ctx.Log != null) LogSystem.Error(ctx.Log, $"EnsureCaptureTarget({width}x{height}) exceeds 4GB transfer limit");
+            return;
+        }
 
         var tbInfo = new SDL.GPUTransferBufferCreateInfo
         {
             Usage = SDL.GPUTransferBufferUsage.Download,
-            Size = width * height * 4,
+            Size = (uint)tbBytes,
         };
-        ctx.CaptureTransferBuffer = SDL.CreateGPUTransferBuffer(ctx.Device, in tbInfo);
+        nint tb = SDL.CreateGPUTransferBuffer(ctx.Device, in tbInfo);
+        if (tb == nint.Zero)
+        {
+            string err = SDL.GetError();
+            SDL.ReleaseGPUTexture(ctx.Device, tex);
+            if (ctx.Log != null) LogSystem.Error(ctx.Log, $"EnsureCaptureTarget transferBuffer({width}x{height}) failed: {err}");
+            return;
+        }
+
+        ctx.CaptureColorTexture = tex;
+        ctx.CaptureTransferBuffer = tb;
         ctx.CaptureWidth = width;
         ctx.CaptureHeight = height;
     }
@@ -647,20 +791,18 @@ public static unsafe class GpuSystem
         {
             fmt = SDL.GPUTextureFormat.R8Unorm;
         }
-        else if (srcFmt == TexturePixelFormat.Bc1Rgba)
+        else if (srcFmt == TexturePixelFormat.Bc1Rgba || srcFmt == TexturePixelFormat.Bc3Rgba)
         {
-            fmt = SDL.GPUTextureFormat.BC1RGBAUnorm;
-            if (!SDL.GPUTextureSupportsFormat(ctx.Device, fmt, SDL.GPUTextureType.TextureType2D, SDL.GPUTextureUsageFlags.Sampler))
+            bool isBc3 = srcFmt == TexturePixelFormat.Bc3Rgba;
+            fmt = isBc3 ? SDL.GPUTextureFormat.BC3RGBAUnorm : SDL.GPUTextureFormat.BC1RGBAUnorm;
+            bool nonBlockAligned = (tex.Width & 3) != 0 || (tex.Height & 3) != 0;
+            bool gpuSupports = !nonBlockAligned && SDL.GPUTextureSupportsFormat(ctx.Device, fmt, SDL.GPUTextureType.TextureType2D, SDL.GPUTextureUsageFlags.Sampler);
+            if (!gpuSupports)
             {
-                fmt = SDL.GPUTextureFormat.R8G8B8A8Unorm;
-                decodeFallbackToRgba = true;
-            }
-        }
-        else if (srcFmt == TexturePixelFormat.Bc3Rgba)
-        {
-            fmt = SDL.GPUTextureFormat.BC3RGBAUnorm;
-            if (!SDL.GPUTextureSupportsFormat(ctx.Device, fmt, SDL.GPUTextureType.TextureType2D, SDL.GPUTextureUsageFlags.Sampler))
-            {
+                if (ctx.Log != null)
+                {
+                    LogSystem.Warn(ctx.Log, $"Texture {tex.Name} ({tex.Width}x{tex.Height}, {srcFmt}) falling back to RGBA8 software decode (non4x4={nonBlockAligned})");
+                }
                 fmt = SDL.GPUTextureFormat.R8G8B8A8Unorm;
                 decodeFallbackToRgba = true;
             }
@@ -683,7 +825,11 @@ public static unsafe class GpuSystem
         };
         nint gpuTex = SDL.CreateGPUTexture(ctx.Device, in info);
         if (gpuTex == nint.Zero)
-            throw new InvalidOperationException($"SDL_CreateGPUTexture failed: {SDL.GetError()}");
+        {
+            string err = SDL.GetError();
+            if (ctx.Log != null) LogSystem.Error(ctx.Log, $"SDL_CreateGPUTexture({tex.Width}x{tex.Height}, {fmt}) failed: {err}");
+            throw new InvalidOperationException($"SDL_CreateGPUTexture failed: {err}");
+        }
 
         uint byteSize;
         if (decodeFallbackToRgba)
@@ -695,6 +841,13 @@ public static unsafe class GpuSystem
 
         var tbInfo = new SDL.GPUTransferBufferCreateInfo { Usage = SDL.GPUTransferBufferUsage.Upload, Size = byteSize };
         nint tb = SDL.CreateGPUTransferBuffer(ctx.Device, in tbInfo);
+        if (tb == nint.Zero)
+        {
+            string err = SDL.GetError();
+            SDL.ReleaseGPUTexture(ctx.Device, gpuTex);
+            if (ctx.Log != null) LogSystem.Error(ctx.Log, $"SDL_CreateGPUTransferBuffer({byteSize}) failed for texture {tex.Name}: {err}");
+            throw new InvalidOperationException($"SDL_CreateGPUTransferBuffer failed: {err}");
+        }
         void* mapped = (void*)SDL.MapGPUTransferBuffer(ctx.Device, tb, false);
         if (decodeFallbackToRgba)
         {
@@ -746,6 +899,7 @@ public static unsafe class GpuSystem
 
     public static void ReleaseMeshSlot(ref GpuContext ctx, int slot)
     {
+        if (ctx.Initialized == 0 || ctx.Device == nint.Zero || ctx.Meshes == null) return;
         if ((uint)slot >= (uint)ctx.MaxMeshes || ctx.Meshes[slot].Alive == 0) return;
         if (ctx.Meshes[slot].VertexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.Meshes[slot].VertexBuffer);
         if (ctx.Meshes[slot].IndexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.Meshes[slot].IndexBuffer);
@@ -754,9 +908,16 @@ public static unsafe class GpuSystem
 
     public static void ReleaseTextureSlot(ref GpuContext ctx, int slot)
     {
+        if (ctx.Initialized == 0 || ctx.Device == nint.Zero || ctx.Textures == null) return;
         if ((uint)slot >= (uint)ctx.MaxTextures || ctx.Textures[slot].Alive == 0) return;
         if (ctx.Textures[slot].Texture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.Textures[slot].Texture);
         ctx.Textures[slot] = default;
+    }
+
+    public static void Dispose(ref GpuContext ctx, ref AssetRegistry assets)
+    {
+        ClearAssetCleanupHooks(ref assets);
+        Dispose(ref ctx);
     }
 
     public static void Dispose(ref GpuContext ctx)
@@ -774,14 +935,22 @@ public static unsafe class GpuSystem
             if (s.PipelineAlphaBlend != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineAlphaBlend);
             if (s.PipelineAdditive != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineAdditive);
             if (s.PipelineOverlayNoDepth != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineOverlayNoDepth);
+            if (s.PipelineAdditiveNoDepth != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineAdditiveNoDepth);
+            if (s.PipelineOpaqueCullNone != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineOpaqueCullNone);
+            if (s.PipelineAlphaBlendCullNone != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineAlphaBlendCullNone);
             if (s.VertexShader != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, s.VertexShader);
             if (s.FragmentShader != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, s.FragmentShader);
             s = default;
         }
 
         if (ctx.ShadowPipeline != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, ctx.ShadowPipeline);
+        if (ctx.ShadowPipelineCullNone != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, ctx.ShadowPipelineCullNone);
         if (ctx.ShadowVertexShader != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, ctx.ShadowVertexShader);
         if (ctx.ShadowFragmentShader != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, ctx.ShadowFragmentShader);
+        if (ctx.ShadowMaskPipeline != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, ctx.ShadowMaskPipeline);
+        if (ctx.ShadowMaskPipelineCullNone != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, ctx.ShadowMaskPipelineCullNone);
+        if (ctx.ShadowMaskVertexShader != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, ctx.ShadowMaskVertexShader);
+        if (ctx.ShadowMaskFragmentShader != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, ctx.ShadowMaskFragmentShader);
         if (ctx.ShadowDepthTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.ShadowDepthTexture);
         if (ctx.DepthTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.DepthTexture);
         if (ctx.SceneColorTexture != nint.Zero) SDL.ReleaseGPUTexture(ctx.Device, ctx.SceneColorTexture);

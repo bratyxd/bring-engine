@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using BringEngine;
 using BringEngine.Assets.Compression;
 using BringEngine.Assets.Packing;
@@ -34,19 +35,73 @@ public static unsafe class Program
         for (int i = 0; i < args.Length; i++)
         {
             string a = args[i];
-            if (a == "--help" || a == "-h") showHelp = true;
-            else if ((a == "--input" || a == "-i") && i + 1 < args.Length) inputDir = args[++i];
-            else if ((a == "--output" || a == "-o") && i + 1 < args.Length) outputPack = args[++i];
-            else if (a == "--verify-no-loose-textures" && i + 1 < args.Length) verifyDir = args[++i];
-            else if (a == "--compression" && i + 1 < args.Length) compression = ParseComp(args[++i]);
-            else if (a == "--atlas-compression" && i + 1 < args.Length) atlasComp = ParseTex(args[++i]);
-            else if (a == "--gltf-compression" && i + 1 < args.Length) gltfTexComp = ParseTex(args[++i]);
-            else if (a == "--max-atlas" && i + 1 < args.Length) int.TryParse(args[++i], out maxAtlas);
-            else if (a == "--padding" && i + 1 < args.Length) int.TryParse(args[++i], out padding);
+            if (a == "--help" || a == "-h") { showHelp = true; }
+            else if (a == "--input" || a == "-i")
+            {
+                if (!TryConsumeValue(args, ref i, a, out inputDir)) return 2;
+            }
+            else if (a == "--output" || a == "-o")
+            {
+                if (!TryConsumeValue(args, ref i, a, out outputPack)) return 2;
+            }
+            else if (a == "--verify-no-loose-textures")
+            {
+                if (!TryConsumeValue(args, ref i, a, out verifyDir)) return 2;
+            }
+            else if (a == "--compression")
+            {
+                if (!TryConsumeValue(args, ref i, a, out string? v) || !TryParseComp(v, out compression))
+                {
+                    Console.Error.WriteLine($"[BringPacker] ERROR: Invalid --compression value '{(v ?? "<missing>")}'. Expected brotli|lz4|none.");
+                    return 2;
+                }
+            }
+            else if (a == "--atlas-compression")
+            {
+                if (!TryConsumeValue(args, ref i, a, out string? v) || !TryParseTex(v, out atlasComp))
+                {
+                    Console.Error.WriteLine($"[BringPacker] ERROR: Invalid --atlas-compression value '{(v ?? "<missing>")}'. Expected auto|bc1|bc3|none.");
+                    return 2;
+                }
+            }
+            else if (a == "--gltf-compression")
+            {
+                if (!TryConsumeValue(args, ref i, a, out string? v) || !TryParseTex(v, out gltfTexComp))
+                {
+                    Console.Error.WriteLine($"[BringPacker] ERROR: Invalid --gltf-compression value '{(v ?? "<missing>")}'. Expected auto|bc1|bc3|none.");
+                    return 2;
+                }
+            }
+            else if (a == "--max-atlas")
+            {
+                if (!TryConsumeValue(args, ref i, a, out string? v) || !int.TryParse(v, out maxAtlas) || maxAtlas <= 0)
+                {
+                    Console.Error.WriteLine($"[BringPacker] ERROR: Invalid --max-atlas value '{(v ?? "<missing>")}'. Expected positive integer.");
+                    return 2;
+                }
+            }
+            else if (a == "--padding")
+            {
+                if (!TryConsumeValue(args, ref i, a, out string? v) || !int.TryParse(v, out padding) || padding < 0)
+                {
+                    Console.Error.WriteLine($"[BringPacker] ERROR: Invalid --padding value '{(v ?? "<missing>")}'. Expected integer >= 0.");
+                    return 2;
+                }
+            }
+            else
+            {
+                Console.Error.WriteLine($"[BringPacker] ERROR: Unknown argument '{a}'.");
+                return 2;
+            }
         }
 
         if (!string.IsNullOrEmpty(verifyDir))
         {
+            if (!Directory.Exists(verifyDir))
+            {
+                Console.Error.WriteLine($"[BringPacker] FAIL: directory does not exist: '{verifyDir}'.");
+                return 1;
+            }
             if (AssetPackBuilder.VerifyNoLooseTextures(verifyDir, out string[] bad))
             {
                 Console.WriteLine($"[BringPacker] OK: zero loose textures in '{verifyDir}'.");
@@ -92,18 +147,38 @@ public static unsafe class Program
         }
     }
 
-    private static PackCompressionMode ParseComp(string s) => s.ToLowerInvariant() switch
+    private static bool TryConsumeValue(string[] args, ref int i, string flag, out string? value)
     {
-        "none" => PackCompressionMode.None,
-        "lz4" => PackCompressionMode.Lz4,
-        _ => PackCompressionMode.Brotli,
-    };
+        if (i + 1 >= args.Length)
+        {
+            Console.Error.WriteLine($"[BringPacker] ERROR: Missing value for '{flag}'.");
+            value = null;
+            return false;
+        }
+        value = args[++i];
+        return true;
+    }
 
-    private static TextureCompressionPolicy ParseTex(string s) => s.ToLowerInvariant() switch
+    private static bool TryParseComp(string? s, out PackCompressionMode mode)
     {
-        "bc1" or "dxt1" => TextureCompressionPolicy.Bc1,
-        "bc3" or "dxt5" => TextureCompressionPolicy.Bc3,
-        "none" or "rgba8" => TextureCompressionPolicy.None,
-        _ => TextureCompressionPolicy.Auto,
-    };
+        switch (s?.ToLowerInvariant())
+        {
+            case "none": mode = PackCompressionMode.None; return true;
+            case "lz4": mode = PackCompressionMode.Lz4; return true;
+            case "brotli": mode = PackCompressionMode.Brotli; return true;
+            default: mode = PackCompressionMode.Brotli; return false;
+        }
+    }
+
+    private static bool TryParseTex(string? s, out TextureCompressionPolicy policy)
+    {
+        switch (s?.ToLowerInvariant())
+        {
+            case "auto": policy = TextureCompressionPolicy.Auto; return true;
+            case "bc1" or "dxt1": policy = TextureCompressionPolicy.Bc1; return true;
+            case "bc3" or "dxt5": policy = TextureCompressionPolicy.Bc3; return true;
+            case "none" or "rgba8": policy = TextureCompressionPolicy.None; return true;
+            default: policy = TextureCompressionPolicy.Auto; return false;
+        }
+    }
 }

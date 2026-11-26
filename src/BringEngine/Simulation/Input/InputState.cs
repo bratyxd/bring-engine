@@ -1,7 +1,8 @@
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Text;
+using System.Text.Unicode;
 using BringEngine.Core.Math;
 
 namespace BringEngine.Simulation.Input;
@@ -130,6 +131,7 @@ public struct GamepadState
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetAxis(GamepadAxis axis, float value)
     {
+        if (!float.IsFinite(value)) value = 0f;
         switch (axis)
         {
             case GamepadAxis.LeftX: LeftX = DetMath.Clamp(value, -1f, 1f); break;
@@ -189,9 +191,11 @@ public struct GamepadState
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vec2 ApplyRadialDeadzone(float x, float y, float deadzone)
     {
+        if (!float.IsFinite(x)) x = 0f;
+        if (!float.IsFinite(y)) y = 0f;
         float dz = DetMath.Clamp(deadzone, 0f, 0.95f);
         float mag = DetMath.Sqrt(x * x + y * y);
-        if (mag <= dz || mag <= 1e-5f) return Vec2.Zero;
+        if (!(mag > dz) || mag <= 1e-5f) return Vec2.Zero;
         float scaled = (mag - dz) / (1f - dz);
         if (scaled > 1f) scaled = 1f;
         float factor = scaled / mag;
@@ -296,11 +300,13 @@ public unsafe struct InputState
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public readonly bool IsMouseDown(int buttonIndex) => (MouseButtonsDown & (1u << buttonIndex)) != 0;
+    public readonly bool IsMouseDown(int buttonIndex)
+        => (uint)buttonIndex < 32u && (MouseButtonsDown & (1u << buttonIndex)) != 0;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public readonly bool IsMousePressed(int buttonIndex)
     {
+        if ((uint)buttonIndex >= 32u) return false;
         uint bit = 1u << buttonIndex;
         return (MouseButtonsDown & bit) != 0 && (MouseButtonsPrev & bit) == 0;
     }
@@ -308,6 +314,7 @@ public unsafe struct InputState
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public readonly bool IsMouseReleased(int buttonIndex)
     {
+        if ((uint)buttonIndex >= 32u) return false;
         uint bit = 1u << buttonIndex;
         return (MouseButtonsDown & bit) == 0 && (MouseButtonsPrev & bit) != 0;
     }
@@ -331,30 +338,67 @@ public unsafe struct InputState
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void ClearTextInput() => TextInputLength = 0;
 
+    private static int TrimToUtf8RuneBoundary(byte* buf, int start, int end)
+    {
+        if (end <= start) return start;
+        int minSearch = end - 4;
+        if (minSearch < start) minSearch = start;
+        int idx = end - 1;
+        while (idx >= minSearch && (buf[idx] & 0xC0) == 0x80)
+            idx--;
+        if (idx < start) return start;
+
+        byte lead = buf[idx];
+        int expected;
+        if ((lead & 0x80) == 0) expected = 1;
+        else if ((lead & 0xE0) == 0xC0) expected = 2;
+        else if ((lead & 0xF0) == 0xE0) expected = 3;
+        else if ((lead & 0xF8) == 0xF0) expected = 4;
+        else return idx; // invalid lead byte at boundary
+
+        return (end - idx < expected) ? idx : end;
+    }
+
     /// <summary>
     /// Appends a null-terminated UTF-8 string into this frame's fixed text input buffer (0 GC).
+    /// Truncates safely at UTF-8 rune boundaries if the buffer reaches MaxTextInputBytes.
     /// </summary>
     public void AppendTextInputUtf8(byte* utf8NullTerminated)
     {
         if (utf8NullTerminated == null) return;
-        int len = TextInputLength;
-        for (int i = 0; utf8NullTerminated[i] != 0 && len < MaxTextInputBytes; i++)
-            TextInputUtf8[len++] = utf8NullTerminated[i];
+        int startLen = TextInputLength;
+        int len = startLen;
+        int i = 0;
+        while (utf8NullTerminated[i] != 0 && len < MaxTextInputBytes)
+            TextInputUtf8[len++] = utf8NullTerminated[i++];
+        if (utf8NullTerminated[i] != 0)
+        {
+            fixed (byte* ptr = TextInputUtf8)
+                len = TrimToUtf8RuneBoundary(ptr, startLen, len);
+        }
         TextInputLength = (byte)len;
     }
 
     /// <summary>
     /// Appends raw UTF-8 bytes into this frame's fixed text input buffer (0 GC; useful in headless tests).
+    /// Truncates safely at UTF-8 rune boundaries if the buffer reaches MaxTextInputBytes.
     /// </summary>
     public void AppendTextInputUtf8(ReadOnlySpan<byte> utf8Bytes)
     {
-        int len = TextInputLength;
-        int avail = MaxTextInputBytes - len;
+        int startLen = TextInputLength;
+        int avail = MaxTextInputBytes - startLen;
         if (avail <= 0 || utf8Bytes.IsEmpty) return;
-        int copy = utf8Bytes.Length < avail ? utf8Bytes.Length : avail;
+        bool truncated = utf8Bytes.Length > avail;
+        int copy = truncated ? avail : utf8Bytes.Length;
+        int len = startLen + copy;
         for (int i = 0; i < copy; i++)
-            TextInputUtf8[len + i] = utf8Bytes[i];
-        TextInputLength = (byte)(len + copy);
+            TextInputUtf8[startLen + i] = utf8Bytes[i];
+        if (truncated)
+        {
+            fixed (byte* ptr = TextInputUtf8)
+                len = TrimToUtf8RuneBoundary(ptr, startLen, len);
+        }
+        TextInputLength = (byte)len;
     }
 
     /// <summary>
@@ -370,27 +414,8 @@ public unsafe struct InputState
         fixed (byte* dstBase = TextInputUtf8)
         {
             Span<byte> dst = new Span<byte>(dstBase + len, avail);
-            if (Encoding.UTF8.TryGetBytes(text, dst, out int written))
-            {
-                TextInputLength = (byte)(len + written);
-                return;
-            }
-
-            // Partial fit fallback (append char-by-char until buffer full, zero GC)
-            Span<byte> tmp = stackalloc byte[4];
-            for (int i = 0; i < text.Length; i++)
-            {
-                ReadOnlySpan<char> slice = text.Slice(i, 1);
-                if (char.IsHighSurrogate(text[i]) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
-                {
-                    slice = text.Slice(i, 2);
-                    i++;
-                }
-                int b = Encoding.UTF8.GetBytes(slice, tmp);
-                if (len + b > MaxTextInputBytes) break;
-                for (int k = 0; k < b; k++) dstBase[len++] = tmp[k];
-            }
-            TextInputLength = (byte)len;
+            Utf8.FromUtf16(text, dst, out _, out int written, replaceInvalidSequences: true, isFinalBlock: true);
+            TextInputLength = (byte)(len + written);
         }
     }
 
@@ -412,15 +437,17 @@ public unsafe struct InputState
 
     /// <summary>
     /// Decodes this frame's UTF-8 text input into caller's char span with 0 GC allocations.
+    /// Truncates cleanly without throwing if destination is smaller than the decoded text.
     /// </summary>
     public readonly int CopyTextInputChars(Span<char> destination)
     {
         int len = TextInputLength;
         if (len == 0 || destination.IsEmpty) return 0;
         fixed (byte* src = TextInputUtf8)
-        fixed (char* dst = destination)
         {
-            return Encoding.UTF8.GetChars(src, len, dst, destination.Length);
+            ReadOnlySpan<byte> utf8 = new ReadOnlySpan<byte>(src, len);
+            Utf8.ToUtf16(utf8, destination, out _, out int charsWritten, replaceInvalidSequences: true, isFinalBlock: true);
+            return charsWritten;
         }
     }
 

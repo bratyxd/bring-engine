@@ -1,12 +1,15 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using BringEngine.Assets.Compression;
 using BringEngine.Assets.Fonts;
 using BringEngine.Assets.Gltf;
 using BringEngine.Assets.Packing;
 using BringEngine.Assets.Textures;
 using BringEngine.Core.Handles;
+using BringEngine.Core.Logging;
 using BringEngine.Core.Memory;
 using BringEngine.Simulation.Animation;
 using BringEngine.Simulation.World;
@@ -53,8 +56,9 @@ public unsafe struct BundleManager
     public int Count;
     public int Capacity;
     public NativeHashMap<int> NameToSlot;
+    public LogState* Log;
 
-    public static BundleManager Create(ref LinearArena persistentArena, int maxBundles = 64)
+    public static BundleManager Create(ref LinearArena persistentArena, int maxBundles = 64, LogState* log = null)
     {
         return new BundleManager
         {
@@ -62,6 +66,7 @@ public unsafe struct BundleManager
             Count = 0,
             Capacity = maxBundles,
             NameToSlot = NativeHashMap<int>.Create(ref persistentArena, maxBundles),
+            Log = log,
         };
     }
 
@@ -90,6 +95,8 @@ public unsafe struct BundleManager
 
 public static unsafe class BundleSystem
 {
+    public static void SetLogger(ref BundleManager mgr, LogState* log) => mgr.Log = log;
+
     public static BundleId Register(
         ref BundleManager mgr,
         ReadOnlySpan<char> name,
@@ -158,58 +165,85 @@ public static unsafe class BundleSystem
 
     /// <summary>
     /// Increments bundle RefCount; allocates bundle LinearArena and loads assets if transitioning 0 -> 1.
+    /// Rolls back partial assets and native arena cleanly if loading throws.
     /// </summary>
     public static void Acquire(
         ref BundleManager mgr,
         BundleId id,
         ref EngineWorld world,
-        ref LinearArena scratchArena)
+        ref LinearArena scratchArena,
+        LogState* log = null)
     {
         if (!id.IsValid || id.Index >= (uint)mgr.Count) return;
         ref AssetBundleData b = ref mgr.Bundles[id.Index];
         b.RefCount++;
         if (b.Loaded != 0) return;
 
+        LogState* activeLog = log != null ? log : mgr.Log;
+        long startTicks = Stopwatch.GetTimestamp();
+
         b.Arena = LinearArena.Create(b.ArenaCapacityBytes, b.Name.Value);
         b.Loaded = 1;
 
-        if (b.PackPath.Length > 0)
+        try
         {
-            string packPath = b.PackPath.ToString();
-            if (File.Exists(packPath))
-                AssetPackLoader.LoadIntoBundle(packPath, ref b.Arena, ref scratchArena, ref world, id);
-        }
-
-        if (b.ManifestPath.Length > 0)
-        {
-            string path = b.ManifestPath.ToString();
-            if (File.Exists(path))
-                LoadFromManifestJson(path, id, ref b.Arena, ref scratchArena, ref world);
-        }
-
-        if (b.LoaderFunc != null)
-        {
-            fixed (LinearArena* bArenaPtr = &b.Arena)
-            fixed (LinearArena* sArenaPtr = &scratchArena)
-            fixed (EngineWorld* wPtr = &world)
+            if (b.PackPath.Length > 0)
             {
-                var ctx = new BundleLoadContext
-                {
-                    Bundle = id,
-                    BundleArena = bArenaPtr,
-                    ScratchArena = sArenaPtr,
-                    World = wPtr,
-                    UserData = b.UserData,
-                };
-                b.LoaderFunc(ref ctx);
+                string packPath = b.PackPath.ToString();
+                if (!File.Exists(packPath))
+                    throw new FileNotFoundException($"Bundle '{b.NameText}' .bpack file not found: '{packPath}'.", packPath);
+                AssetPackLoader.LoadIntoBundle(packPath, ref b.Arena, ref scratchArena, ref world, id);
             }
+
+            if (b.ManifestPath.Length > 0)
+            {
+                string path = b.ManifestPath.ToString();
+                if (!File.Exists(path))
+                    throw new FileNotFoundException($"Bundle '{b.NameText}' manifest file not found: '{path}'.", path);
+                LoadFromManifestJson(path, id, ref b.Arena, ref scratchArena, ref world, activeLog);
+            }
+
+            if (b.LoaderFunc != null)
+            {
+                fixed (LinearArena* bArenaPtr = &b.Arena)
+                fixed (LinearArena* sArenaPtr = &scratchArena)
+                fixed (EngineWorld* wPtr = &world)
+                {
+                    var ctx = new BundleLoadContext
+                    {
+                        Bundle = id,
+                        BundleArena = bArenaPtr,
+                        ScratchArena = sArenaPtr,
+                        World = wPtr,
+                        UserData = b.UserData,
+                    };
+                    b.LoaderFunc(ref ctx);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AssetSystem.UnloadByBundle(ref world.Assets, id);
+            AnimationSystem.UnregisterByBundle(ref world.Animations, id);
+            b.Arena.Dispose();
+            b.Loaded = 0;
+            b.RefCount--;
+            if (activeLog != null)
+                LogSystem.Error(activeLog, $"Bundle '{b.NameText}' acquire failed ({ex.GetType().Name}); rolled back");
+            throw;
+        }
+
+        if (activeLog != null)
+        {
+            double elapsedMs = (Stopwatch.GetTimestamp() - startTicks) * 1000.0 / Stopwatch.Frequency;
+            LogSystem.Info(activeLog, $"Bundle '{b.NameText}' loaded (handle={id}, used={b.Arena.Offset}/{b.Arena.Capacity}B, {elapsedMs:F2}ms)");
         }
     }
 
     /// <summary>
     /// Decrements bundle RefCount; immediately frees all GPU/CPU assets and disposes bundle LinearArena when RefCount == 0.
     /// </summary>
-    public static void Release(ref BundleManager mgr, BundleId id, ref EngineWorld world)
+    public static void Release(ref BundleManager mgr, BundleId id, ref EngineWorld world, LogState* log = null)
     {
         if (!id.IsValid || id.Index >= (uint)mgr.Count) return;
         ref AssetBundleData b = ref mgr.Bundles[id.Index];
@@ -217,24 +251,34 @@ public static unsafe class BundleSystem
         b.RefCount--;
         if (b.RefCount > 0 || b.Loaded == 0) return;
 
+        LogState* activeLog = log != null ? log : mgr.Log;
+        nuint reclaimedBytes = b.Arena.Capacity;
+
         AssetSystem.UnloadByBundle(ref world.Assets, id);
         AnimationSystem.UnregisterByBundle(ref world.Animations, id);
         b.Arena.Dispose();
         b.Loaded = 0;
+
+        if (activeLog != null)
+            LogSystem.Info(activeLog, $"Bundle '{b.NameText}' unloaded (handle={id}, reclaimed={reclaimedBytes}B)");
     }
 
-    public static void UnloadAll(ref BundleManager mgr, ref EngineWorld world)
+    public static void UnloadAll(ref BundleManager mgr, ref EngineWorld world, LogState* log = null)
     {
+        LogState* activeLog = log != null ? log : mgr.Log;
         for (int i = 0; i < mgr.Count; i++)
         {
             ref AssetBundleData b = ref mgr.Bundles[i];
             if (b.Loaded != 0)
             {
+                nuint reclaimedBytes = b.Arena.Capacity;
                 AssetSystem.UnloadByBundle(ref world.Assets, b.Handle);
                 AnimationSystem.UnregisterByBundle(ref world.Animations, b.Handle);
                 b.Arena.Dispose();
                 b.Loaded = 0;
                 b.RefCount = 0;
+                if (activeLog != null)
+                    LogSystem.Info(activeLog, $"Bundle '{b.NameText}' unloaded (handle={b.Handle}, reclaimed={reclaimedBytes}B)");
             }
         }
     }
@@ -248,40 +292,86 @@ public static unsafe class BundleSystem
         BundleId bundle,
         ref LinearArena bundleArena,
         ref LinearArena scratchArena,
-        ref EngineWorld world)
+        ref EngineWorld world,
+        LogState* log)
     {
         byte[] jsonBytes = File.ReadAllBytes(manifestPath);
         string baseDir = Path.GetDirectoryName(manifestPath) ?? ".";
         var r = new Utf8JsonReader(jsonBytes, isFinalBlock: true, state: default);
 
-        while (r.Read())
+        if (!r.Read() || r.TokenType != JsonTokenType.StartObject)
+            throw new InvalidDataException($"Bundle manifest '{manifestPath}' root must be a JSON object.");
+
+        while (r.Read() && r.TokenType != JsonTokenType.EndObject)
         {
-            if (r.TokenType == JsonTokenType.PropertyName && r.ValueTextEquals("assets"u8))
+            if (r.TokenType != JsonTokenType.PropertyName) continue;
+            if (r.ValueTextEquals("assets"u8))
             {
-                r.Read(); // StartArray
+                if (!r.Read() || r.TokenType != JsonTokenType.StartArray)
+                    throw new InvalidDataException($"Bundle manifest '{manifestPath}' 'assets' must be a JSON array.");
                 while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                 {
+                    if (r.TokenType != JsonTokenType.StartObject)
+                        throw new InvalidDataException($"Bundle manifest '{manifestPath}' 'assets' item must be a JSON object.");
+
                     string type = "", name = "", relPath = "";
                     float fontSize = 48f;
                     while (r.Read() && r.TokenType != JsonTokenType.EndObject)
                     {
                         if (r.TokenType != JsonTokenType.PropertyName) continue;
-                        if (r.ValueTextEquals("type"u8)) { r.Read(); type = r.GetString() ?? ""; }
-                        else if (r.ValueTextEquals("name"u8)) { r.Read(); name = r.GetString() ?? ""; }
-                        else if (r.ValueTextEquals("path"u8)) { r.Read(); relPath = r.GetString() ?? ""; }
-                        else if (r.ValueTextEquals("pixelSize"u8)) { r.Read(); fontSize = r.GetSingle(); }
+                        if (r.ValueTextEquals("type"u8))
+                        {
+                            if (!r.Read() || r.TokenType != JsonTokenType.String) throw new InvalidDataException("Expected string for asset.type.");
+                            type = r.GetString() ?? "";
+                        }
+                        else if (r.ValueTextEquals("name"u8))
+                        {
+                            if (!r.Read() || r.TokenType != JsonTokenType.String) throw new InvalidDataException("Expected string for asset.name.");
+                            name = r.GetString() ?? "";
+                        }
+                        else if (r.ValueTextEquals("path"u8))
+                        {
+                            if (!r.Read() || (r.TokenType != JsonTokenType.String && r.TokenType != JsonTokenType.Null)) throw new InvalidDataException("Expected string for asset.path.");
+                            relPath = r.TokenType == JsonTokenType.Null ? "" : (r.GetString() ?? "");
+                        }
+                        else if (r.ValueTextEquals("pixelSize"u8))
+                        {
+                            if (!r.Read() || r.TokenType != JsonTokenType.Number || !r.TryGetSingle(out fontSize))
+                                throw new InvalidDataException("Expected number for asset.pixelSize.");
+                        }
                         else { r.Read(); r.Skip(); }
                     }
 
-                    string full = string.IsNullOrEmpty(relPath) ? "" : Path.Combine(baseDir, relPath);
+                    string full = "";
+                    if (!string.IsNullOrEmpty(relPath))
+                    {
+                        if (!PackCompressionSystem.TryResolveSafeRelativePath(baseDir, relPath, out full))
+                            throw new InvalidDataException($"Unsafe asset path rejected in manifest '{manifestPath}': '{relPath}'.");
+                    }
+
                     StringId nameId = StringId.Hash(name);
-                    if (type == "gltf" && File.Exists(full))
+                    if (type == "gltf")
+                    {
+                        if (string.IsNullOrEmpty(full) || !File.Exists(full))
+                            throw new FileNotFoundException($"Manifest glTF asset '{name}' not found: '{full}'.", full);
                         GltfLoader.LoadFromFile(full, ref bundleArena, ref scratchArena, ref world.Assets, ref world.Animations, bundle, nameId);
-                    else if (type == "texture" && File.Exists(full))
+                    }
+                    else if (type == "texture")
+                    {
+                        if (string.IsNullOrEmpty(full) || !File.Exists(full))
+                            throw new FileNotFoundException($"Manifest texture asset '{name}' not found: '{full}'.", full);
                         TextureLoader.LoadFromFile(full, ref bundleArena, ref world.Assets, bundle, nameId);
+                    }
                     else if (type == "font")
-                        SdfFontLoader.BakeSdfFromSystemOrFile(full, ref bundleArena, ref world.Assets, bundle, nameId, fontSize);
+                    {
+                        SdfFontLoader.BakeSdfFromSystemOrFile(string.IsNullOrEmpty(full) ? null : full, ref bundleArena, ref world.Assets, bundle, nameId, fontSize, log: log);
+                    }
                 }
+            }
+            else
+            {
+                if (!r.Read()) throw new InvalidDataException($"Unexpected EOF in manifest '{manifestPath}'.");
+                r.Skip();
             }
         }
     }

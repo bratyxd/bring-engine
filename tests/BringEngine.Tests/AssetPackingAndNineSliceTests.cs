@@ -1,10 +1,14 @@
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.Tasks;
 using BringEngine.Assets;
 using BringEngine.Assets.Atlases;
 using BringEngine.Assets.Bundles;
 using BringEngine.Assets.Compression;
+using BringEngine.Assets.Fonts;
 using BringEngine.Assets.Gltf;
 using BringEngine.Assets.Packing;
 using BringEngine.Assets.Textures;
@@ -29,9 +33,12 @@ public static unsafe class AssetPackingAndNineSliceTests
     {
         Console.WriteLine("=== Phase 9: Unity-Style Compression (BC1/BC3, LZ4/Brotli, GLB), Default Atlasing, .bpack & 9-Slice UI ===");
         Assert.Run("TextureCompression_Bc1AndBc3_BlockSizesRoundTripQualityAndParallelEncode", &TestTextureCompressionBc1Bc3);
+        Assert.Run("TextureCompression_Non4x4_Bc1Punchthrough_AndDimensionGuards", &TestTextureNon4x4PunchthroughAndGuards);
         Assert.Run("PackCompression_Lz4AndBrotli_RoundTripAndGlbEmbeddedTextureCompression", &TestPackAndGlbCompression);
+        Assert.Run("CompressionAndContainers_CorruptLz4BrotliBpackBglbBrtx_RejectedSafely", &TestCorruptStreamsAndContainers);
         Assert.Run("AtlasPacker_DefaultAtlasingBleedPaddingNineSliceMetadataAndUnload", &TestAtlasPacker);
         Assert.Run("AssetPack_BuildDirectoryBrotliAndLz4_LoadViaBundleSystemAndZeroLooseTextures", &TestAssetPackEndToEnd);
+        Assert.Run("AssetPack_MultiPageTtfLooseGltfBglb_VerifyMissingDir_AndBringPackerCli", &TestMultiPageTtfLooseGltfAndCli);
         Assert.Run("NineSlice_BatchRenderer_SingleDrawCallCornerSizingClampAndZeroGc", &TestNineSliceHeadlessBatching);
         if (!headlessOnly)
             Assert.Run("Gpu_CompressedBc1Bc3AtlasAndNineSliceUi_SingleDrawCallAndPngCapture", &TestGpuCompressedAtlasAndNineSlice);
@@ -376,6 +383,11 @@ public static unsafe class AssetPackingAndNineSliceTests
             Assert.Near(12f, rPanel->SliceBorders.Y, 0.001f, "9-slice Bottom loaded from .bpack");
             Assert.Near(14f, rPanel->SliceBorders.Z, 0.001f, "9-slice Right loaded from .bpack");
             Assert.Near(16f, rPanel->SliceBorders.W, 0.001f, "9-slice Top loaded from .bpack");
+            Assert.Near(0f, rPanel->Pivot.X, 0.001f, "Explicit [0,0] pivot X preserved from pack.json");
+            Assert.Near(0f, rPanel->Pivot.Y, 0.001f, "Explicit [0,0] pivot Y preserved from pack.json");
+            SpriteData panelSprite = RenderComponentSystem.SpriteFromRegion(EntityId.Invalid, in *rPanel, new Vec2(100, 100));
+            Assert.Near(0f, panelSprite.Pivot.X, 0.001f, "SpriteFromRegion preserves [0,0] pivot X");
+            Assert.Near(0f, panelSprite.Pivot.Y, 0.001f, "SpriteFromRegion preserves [0,0] pivot Y");
 
             TextureHandle floorH = AssetSystem.FindTexture(in world.Assets, StringId.Hash("floor"));
             TextureAssetData* floorTex = AssetSystem.TryGetTexture(in world.Assets, floorH);
@@ -747,5 +759,322 @@ public static unsafe class AssetPackingAndNineSliceTests
         obw.Write(0x004E4942u); // "BIN\0"
         obw.Write(binBytes);
         return outMs.ToArray();
+    }
+
+    private static void TestTextureNon4x4PunchthroughAndGuards()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 256 * 1024, 512 * 1024, 128 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 64, 16);
+        var bundleArena = LinearArena.Create(512 * 1024);
+        var bundleId = BundleId.Create(6, 1);
+
+        try
+        {
+            (int w, int h)[] sizes = { (1, 1), (3, 5), (17, 13), (65, 63) };
+            for (int si = 0; si < sizes.Length; si++)
+            {
+                int w = sizes[si].w, h = sizes[si].h;
+                byte[] src = MakeSolidRgba(w, h, 80, 190, 240, 255);
+                byte[] bc1 = new byte[TextureCompressionSystem.CalcByteSize(TexturePixelFormat.Bc1Rgba, w, h)];
+                byte[] bc3 = new byte[TextureCompressionSystem.CalcByteSize(TexturePixelFormat.Bc3Rgba, w, h)];
+                byte[] dec = new byte[w * h * 4];
+
+                fixed (byte* sPtr = src)
+                fixed (byte* b1Ptr = bc1)
+                fixed (byte* b3Ptr = bc3)
+                fixed (byte* dPtr = dec)
+                {
+                    TextureCompressionSystem.EncodeBc1(sPtr, w, h, b1Ptr);
+                    TextureCompressionSystem.DecodeBc1ToRgba(b1Ptr, w, h, dPtr);
+                    Assert.True(Math.Abs(dec[0] - 80) <= 8 && Math.Abs(dec[1] - 190) <= 8 && dec[3] == 255, $"Non-4x4 BC1 ({w}x{h}) round-trip valid");
+
+                    src[3] = 64; // add alpha < 255 for BC3
+                    TextureCompressionSystem.EncodeBc3(sPtr, w, h, b3Ptr);
+                    TextureCompressionSystem.DecodeBc3ToRgba(b3Ptr, w, h, dPtr);
+                    Assert.True(Math.Abs(dec[3] - 64) <= 4, $"Non-4x4 BC3 ({w}x{h}) alpha round-trip valid");
+                }
+            }
+
+            // BC1 1-bit punchthrough alpha test (alpha < 128 -> 0, alpha >= 128 -> 255)
+            byte[] punch = MakeSolidRgba(4, 4, 200, 100, 50, 255);
+            punch[0 * 4 + 3] = 0;
+            punch[5 * 4 + 3] = 100;
+            byte[] punchBc1 = new byte[8];
+            byte[] punchDec = new byte[4 * 4 * 4];
+            fixed (byte* pPtr = punch)
+            fixed (byte* bPtr = punchBc1)
+            fixed (byte* dPtr = punchDec)
+            {
+                TextureCompressionSystem.EncodeBc1(pPtr, 4, 4, bPtr);
+                ushort c0 = *(ushort*)(bPtr + 0);
+                ushort c1 = *(ushort*)(bPtr + 2);
+                Assert.True(c0 <= c1, "BC1 punchthrough uses c0 <= c1 mode");
+                TextureCompressionSystem.DecodeBc1ToRgba(bPtr, 4, 4, dPtr);
+                Assert.Equal((byte)0, punchDec[0 * 4 + 3], "BC1 punchthrough pixel 0 alpha == 0");
+                Assert.Equal((byte)0, punchDec[5 * 4 + 3], "BC1 punchthrough pixel 5 (a=100 < 128) alpha == 0");
+                Assert.Equal((byte)255, punchDec[15 * 4 + 3], "BC1 punchthrough opaque pixel alpha == 255");
+            }
+
+            // Dimension guards <= 0
+            byte[] dummy = new byte[16];
+            fixed (byte* d = dummy)
+            {
+                byte* localD = d;
+                AssertThrows<ArgumentOutOfRangeException>(() => TextureCompressionSystem.EncodeBc1(localD, 0, 4, localD), "EncodeBc1 rejects width<=0");
+                AssertThrows<ArgumentOutOfRangeException>(() => TextureCompressionSystem.DecodeBc3ToRgba(localD, 4, -1, localD), "DecodeBc3 rejects height<=0");
+            }
+            AssertThrows<ArgumentOutOfRangeException>(() => TextureLoader.CreateFromRgba(dummy, 0, 4, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("g1")), "CreateFromRgba rejects width<=0");
+            AssertThrows<ArgumentOutOfRangeException>(() => TextureLoader.CreateRadialGlow(0, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("g2")), "CreateRadialGlow rejects size<=0");
+            AssertThrows<ArgumentOutOfRangeException>(() => TextureLoader.CreateCheckerGrid(16, 0, Color32.White, Color32.Black, new Color32(255, 0, 0, 255), ref bundleArena, ref world.Assets, bundleId, StringId.Hash("g3")), "CreateCheckerGrid rejects tiles<=0");
+            AssertThrows<ArgumentOutOfRangeException>(() => SdfFontLoader.BakeSdfFromSystemOrFile(null, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("f1"), 32f, 512, 0), "SdfFontLoader rejects sdfPadding<=0");
+            AssertThrows<ArgumentOutOfRangeException>(() => SdfFontLoader.BakeSdfFromSystemOrFile(null, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("f2"), 32f, 8, 4), "SdfFontLoader rejects atlasSize<16");
+        }
+        finally
+        {
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after non-4x4 & guards tests");
+    }
+
+    private static void TestCorruptStreamsAndContainers()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 256 * 1024, 512 * 1024, 128 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 64, 32);
+        var bundleArena = LinearArena.Create(512 * 1024);
+        var bundleId = BundleId.Create(7, 1);
+
+        try
+        {
+            byte[] outBuf = new byte[64];
+
+            // 1. Corrupt LZ4 streams (EOF 1-byte OOB cases + extended run overflow + bad offsets)
+            AssertThrows<InvalidDataException>(() => PackCompressionSystem.DecompressLz4Block(new byte[] { 0xF0 }, outBuf), "LZ4 [0xF0] rejected");
+            AssertThrows<InvalidDataException>(() => PackCompressionSystem.DecompressLz4Block(new byte[] { 0x1F, 0x00, 0x01, 0x00 }, outBuf), "LZ4 [0x1F,0,1,0] rejected");
+            AssertThrows<InvalidDataException>(() => PackCompressionSystem.DecompressLz4Block(new byte[] { 0xF0, 0xFF, 0xFF, 0xFF, 0x00 }, outBuf), "LZ4 0xFF overflow run rejected");
+            AssertThrows<InvalidDataException>(() => PackCompressionSystem.DecompressLz4Block(new byte[] { 0x10, 0xAA, 0x00, 0x00 }, outBuf), "LZ4 offset=0 rejected");
+            AssertThrows<InvalidDataException>(() => PackCompressionSystem.DecompressLz4Block(new byte[] { 0x10, 0xAA, 0x05, 0x00 }, outBuf), "LZ4 offset>op rejected");
+
+            // CompressLz4Block undersized dst
+            byte[] srcData = new byte[32];
+            for (int i = 0; i < srcData.Length; i++) srcData[i] = (byte)i;
+            AssertThrows<ArgumentException>(() => PackCompressionSystem.CompressLz4Block(srcData, new byte[4]), "CompressLz4Block rejects undersized dst");
+
+            // Decompress invalid enum & None length mismatch
+            AssertThrows<InvalidDataException>(() => PackCompressionSystem.Decompress(srcData, (PackCompressionMode)99, outBuf), "Decompress rejects invalid mode 99");
+            AssertThrows<InvalidDataException>(() => PackCompressionSystem.Decompress(srcData, PackCompressionMode.None, new byte[8]), "Decompress None rejects oversized src");
+
+            // Corrupt Brotli
+            AssertThrows<InvalidDataException>(() => PackCompressionSystem.Decompress(new byte[] { 0xFF, 0xFE, 0xFD }, PackCompressionMode.Brotli, outBuf), "Corrupt Brotli rejected");
+
+            // 2. Corrupt BRTX
+            byte[] solid4 = MakeSolidRgba(4, 4, 1, 2, 3, 255);
+            byte[] goodBrtx;
+            fixed (byte* s4Ptr = solid4)
+                goodBrtx = TextureCompressionSystem.EncodeBrtxBytes(s4Ptr, 4, 4, TextureCompressionPolicy.Bc1);
+            byte[] badVerBrtx = (byte[])goodBrtx.Clone();
+            BitConverter.TryWriteBytes(badVerBrtx.AsSpan(4, 2), (ushort)99);
+            AssertThrows<InvalidDataException>(() => TextureLoader.LoadBrtxFromMemory(badVerBrtx, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("brtx_badv")), "Bad BRTX version rejected");
+
+            byte[] badLenBrtx = (byte[])goodBrtx.Clone();
+            BitConverter.TryWriteBytes(badLenBrtx.AsSpan(16, 4), 4); // DataBytes=4 != expected 8
+            AssertThrows<InvalidDataException>(() => TextureLoader.LoadBrtxFromMemory(badLenBrtx, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("brtx_badl")), "Mismatched BRTX DataBytes rejected");
+
+            // 3. Corrupt BGLB
+            var box = GlbBuilder.CreateBoxSpec(Vec3.One, ColorF.White);
+            byte[] goodBglb = PackCompressionSystem.CompressGlb(GlbBuilder.BuildGlb(in box), PackCompressionMode.Lz4, TextureCompressionPolicy.None);
+            byte[] badBglb = (byte[])goodBglb.Clone();
+            badBglb[4] = 99; // bad Version
+            AssertThrows<InvalidDataException>(() => GltfLoader.LoadFromMemory(badBglb, null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("bglb_bad")), "Bad BGLB version rejected");
+
+            // 4. Corrupt .bpack + CRC32 bit-flip + TryReadRawBlobFromMemory safety
+            string tmpDir = Path.Combine(Path.GetTempPath(), $"bring_corrupt_bpack_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tmpDir);
+            try
+            {
+                File.WriteAllText(Path.Combine(tmpDir, "data.txt"), "hello world payload 1234567890", new UTF8Encoding(false));
+                string packPath = Path.Combine(tmpDir, "test.bpack");
+                AssetPackBuilder.BuildPackFromDirectory(tmpDir, packPath, PackCompressionMode.None);
+                byte[] packBytes = File.ReadAllBytes(packPath);
+
+                // Bit-flip inside payload -> CRC32 catches corruption!
+                byte[] flipped = (byte[])packBytes.Clone();
+                flipped[sizeof(BringPackHeader) + 2] ^= 0x01;
+                AssertThrows<InvalidDataException>(() => AssetPackLoader.LoadFromMemoryIntoBundle(flipped, ref bundleArena, ref alloc.Scratch, ref world, bundleId), "Bit-flipped .bpack rejected by CRC32");
+                Assert.True(!AssetPackLoader.TryReadRawBlobFromMemory(flipped, StringId.Hash("data.txt"), ref alloc.Scratch, out _), "TryReadRawBlobFromMemory returns false on CRC32 mismatch");
+
+                // Missing path in TryReadRawBlob returns false cleanly
+                Assert.True(!AssetPackLoader.TryReadRawBlob(Path.Combine(tmpDir, "missing.bpack"), StringId.Hash("data.txt"), ref alloc.Scratch, out _), "TryReadRawBlob returns false on missing path");
+
+                // Negative EntryCount & truncated header
+                byte[] truncPack = new byte[8];
+                AssertThrows<InvalidDataException>(() => AssetPackLoader.LoadFromMemoryIntoBundle(truncPack, ref bundleArena, ref alloc.Scratch, ref world, bundleId), "Truncated .bpack rejected");
+                Assert.True(!AssetPackLoader.TryReadRawBlobFromMemory(truncPack, StringId.Hash("data.txt"), ref alloc.Scratch, out _), "TryReadRawBlobFromMemory returns false on truncated header");
+            }
+            finally
+            {
+                if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true);
+            }
+        }
+        finally
+        {
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after corrupt stream/container tests");
+    }
+
+    private static void TestMultiPageTtfLooseGltfAndCli()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tmpRoot = Path.Combine(Path.GetTempPath(), $"bring_multipage_cli_{Guid.NewGuid():N}");
+        string rawDir = Path.Combine(tmpRoot, "raw");
+        string outDir = Path.Combine(tmpRoot, "out");
+        Directory.CreateDirectory(rawDir);
+        Directory.CreateDirectory(outDir);
+
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 512 * 1024, 2 * 1024 * 1024, 256 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 256, 128);
+        var bundleArena = LinearArena.Create(4 * 1024 * 1024);
+        var bundleId = BundleId.Create(8, 1);
+
+        try
+        {
+            // 1. Multi-page AtlasPacker with non-PoT4 sprites & explicit HasPivot=1, Pivot=(0,0)
+            byte[] sA = MakeSolidRgba(33, 29, 255, 60, 60, 255);
+            byte[] sB = MakeSolidRgba(41, 37, 60, 255, 60, 255);
+            byte[] sC = MakeSolidRgba(35, 31, 60, 60, 255, 255);
+            fixed (byte* pA = sA)
+            fixed (byte* pB = sB)
+            fixed (byte* pC = sC)
+            {
+                Span<AtlasSourceImage> srcs = stackalloc AtlasSourceImage[3];
+                srcs[0] = new AtlasSourceImage { Name = StringId.Hash("mp_a"), RgbaPixels = pA, Width = 33, Height = 29, HasPivot = 1, Pivot = Vec2.Zero };
+                srcs[1] = new AtlasSourceImage { Name = StringId.Hash("mp_b"), RgbaPixels = pB, Width = 41, Height = 37 };
+                srcs[2] = new AtlasSourceImage { Name = StringId.Hash("mp_c"), RgbaPixels = pC, Width = 35, Height = 31 };
+
+                var opts = AtlasBuildOptions.Default();
+                opts.MaxPageSize = 64; // Forces multiple pages!
+                int pageCount = AtlasPacker.BuildAndRegisterInBundle(srcs, in opts, "mp", ref bundleArena, ref world.Assets, bundleId);
+                Assert.True(pageCount >= 2, $"Small MaxPageSize=64 forced multi-page atlas ({pageCount} pages)");
+
+                SpriteRegionData* rA = AssetSystem.TryGetSpriteRegion(in world.Assets, StringId.Hash("mp_a"));
+                SpriteRegionData* rB = AssetSystem.TryGetSpriteRegion(in world.Assets, StringId.Hash("mp_b"));
+                Assert.True(rA != null && rB != null, "Multi-page regions registered");
+                Assert.Near(0f, rA->Pivot.X, 0.001f, "AtlasPacker HasPivot=1 preserves Pivot.X==0");
+                Assert.Near(0f, rA->Pivot.Y, 0.001f, "AtlasPacker HasPivot=1 preserves Pivot.Y==0");
+                Assert.Near(0.5f, rB->Pivot.X, 0.001f, "AtlasPacker default pivot X==0.5");
+            }
+
+            // 2. Pack loose .gltf + .bin + .png, .bglb, and .ttf (if system font exists) into .bpack
+            byte[] extPng = MakeTestPngBytes(16, 16, opaque: true);
+            File.WriteAllBytes(Path.Combine(rawDir, "crate_tex.png"), extPng);
+            byte[] binBuf = new byte[4 * 12 + 6 * 4];
+            float[] qPos = { -0.5f, -0.5f, 0, 0.5f, -0.5f, 0, 0.5f, 0.5f, 0, -0.5f, 0.5f, 0 };
+            Buffer.BlockCopy(qPos, 0, binBuf, 0, 48);
+            uint[] qIdx = { 0, 1, 2, 0, 2, 3 };
+            Buffer.BlockCopy(qIdx, 0, binBuf, 48, 24);
+            File.WriteAllBytes(Path.Combine(rawDir, "loose.bin"), binBuf);
+            string looseGltf = "{\"asset\":{\"version\":\"2.0\"},"
+                + "\"buffers\":[{\"uri\":\"loose.bin\",\"byteLength\":72}],"
+                + "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":48},{\"buffer\":0,\"byteOffset\":48,\"byteLength\":24}],"
+                + "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},{\"bufferView\":1,\"componentType\":5125,\"count\":6,\"type\":\"SCALAR\"}],"
+                + "\"images\":[{\"uri\":\"crate_tex.png\"}],\"textures\":[{\"source\":0}],"
+                + "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0}}}],"
+                + "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":1,\"material\":0}]}],"
+                + "\"nodes\":[{\"name\":\"LooseNode\",\"mesh\":0}]}";
+            File.WriteAllText(Path.Combine(rawDir, "loose_model.gltf"), looseGltf, new UTF8Encoding(false));
+
+            var boxSpec = GlbBuilder.CreateBoxSpec(Vec3.One, ColorF.Gold);
+            byte[] bglbBytes = PackCompressionSystem.CompressGlb(GlbBuilder.BuildGlb(in boxSpec), PackCompressionMode.Lz4, TextureCompressionPolicy.None);
+            File.WriteAllBytes(Path.Combine(rawDir, "packed_box.bglb"), bglbBytes);
+
+            string? sysTtf = SdfFontLoader.ResolveTtfPath(null);
+            bool packedTtf = sysTtf != null && sysTtf.EndsWith(".ttf", StringComparison.OrdinalIgnoreCase) && File.Exists(sysTtf);
+            if (packedTtf)
+                File.Copy(sysTtf!, Path.Combine(rawDir, "ui_test.ttf"), overwrite: true);
+
+            string packPath = Path.Combine(outDir, "combined.bpack");
+            AssetPackBuildSummary sum = AssetPackBuilder.BuildPackFromDirectory(rawDir, packPath, PackCompressionMode.Lz4);
+            Assert.Equal(2, sum.GltfModelCount, "Both loose .gltf and .bglb packed as GltfModel");
+            Assert.Equal(0, sum.AtlasedSpriteCount, "glTF external PNG was inlined into GLB and NOT duplicated in 2D atlas");
+            if (packedTtf)
+                Assert.Equal(1, sum.FontCount, ".ttf packed as SdfFont");
+
+            AssetPackLoader.LoadIntoBundle(packPath, ref bundleArena, ref alloc.Scratch, ref world, bundleId);
+            Assert.True(AssetSystem.FindGltf(in world.Assets, StringId.Hash("loose_model")).IsValid, "Loose .gltf loaded from .bpack");
+            Assert.True(AssetSystem.FindGltf(in world.Assets, StringId.Hash("packed_box")).IsValid, ".bglb loaded as GltfModel from .bpack");
+            if (packedTtf)
+                Assert.True(AssetSystem.FindFont(in world.Assets, StringId.Hash("ui_test")).IsValid, ".ttf SdfFont loaded from .bpack");
+
+            // 3. VerifyNoLooseTextures on non-existent directory returns false
+            Assert.True(!AssetPackBuilder.VerifyNoLooseTextures(Path.Combine(tmpRoot, "does_not_exist"), out _), "VerifyNoLooseTextures returns false on non-existent directory");
+
+            // 4. BringPacker CLI strict arg validation (when BringPacker.dll is present in sibling build output)
+            string? packerDll = FindBringPackerDll();
+            if (packerDll != null)
+            {
+                Assert.Equal(2, RunBringPackerCli(packerDll, "--compresson"), "BringPacker rejects unknown flag with exit 2");
+                Assert.Equal(2, RunBringPackerCli(packerDll, "--input"), "BringPacker rejects missing value with exit 2");
+                Assert.Equal(2, RunBringPackerCli(packerDll, "--compression foo"), "BringPacker rejects invalid --compression with exit 2");
+                Assert.Equal(2, RunBringPackerCli(packerDll, "--max-atlas abc"), "BringPacker rejects non-int --max-atlas with exit 2");
+                Assert.Equal(2, RunBringPackerCli(packerDll, "--padding -1"), "BringPacker rejects negative --padding with exit 2");
+                Assert.Equal(1, RunBringPackerCli(packerDll, $"--verify-no-loose-textures \"{Path.Combine(tmpRoot, "missing_dist")}\""), "BringPacker --verify-no-loose-textures missing dir returns exit 1");
+            }
+        }
+        finally
+        {
+            AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
+            bundleArena.Dispose();
+            alloc.Dispose();
+            if (Directory.Exists(tmpRoot)) Directory.Delete(tmpRoot, recursive: true);
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after multi-page/loose-gltf/CLI tests");
+    }
+
+    private static string? FindBringPackerDll()
+    {
+        string baseDir = AppContext.BaseDirectory;
+        string[] candidates =
+        {
+            Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "..", "tools", "BringPacker", "bin", "Release", "net10.0", "BringPacker.dll")),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..", "..", "tools", "BringPacker", "bin", "Debug", "net10.0", "BringPacker.dll")),
+        };
+        for (int i = 0; i < candidates.Length; i++)
+            if (File.Exists(candidates[i])) return candidates[i];
+        return null;
+    }
+
+    private static int RunBringPackerCli(string packerDll, string args)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = $"\"{packerDll}\" {args}",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        using var proc = Process.Start(psi)!;
+        Task<string> outTask = proc.StandardOutput.ReadToEndAsync();
+        Task<string> errTask = proc.StandardError.ReadToEndAsync();
+        if (!proc.WaitForExit(15000))
+        {
+            try { proc.Kill(entireProcessTree: true); } catch { }
+            proc.WaitForExit();
+        }
+        Task.WaitAll(outTask, errTask);
+        return proc.ExitCode;
+    }
+
+    private static void AssertThrows<TException>(Action act, string msg) where TException : Exception
+    {
+        bool threw = false;
+        try { act(); }
+        catch (TException) { threw = true; }
+        Assert.True(threw, msg);
     }
 }

@@ -9,6 +9,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using BringEngine.Core.Handles;
+using BringEngine.Core.Logging;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
 using BringEngine.Networking;
@@ -21,9 +22,13 @@ public static class NetworkingTests
     {
         Console.WriteLine("=== Networking: NetSerialization, LoopbackTransport, HttpSystem & WebSocketSystem ===");
         Assert.Run("NetSerialization_PrimitivesFixedMathVarintsCrcAndZeroGc", &TestNetSerialization);
+        Assert.Run("NetSerialization_EdgeCasesOverflowVarintAndCrc32", &TestNetSerializationEdgeCases);
         Assert.Run("NetTransport_Loopback_DeterministicLatencyLossOrderedAndZeroGc", &TestLoopbackTransport);
+        Assert.Run("NetTransport_LoopbackEdgeCases_SequencedMixed_Saturation_DisconnectDrain", &TestLoopbackTransportEdgeCases);
         Assert.Run("HttpSystem_LoopbackGetPostHeadersCancelTimeoutAndZeroGcPoll", &TestHttpSystem);
+        Assert.Run("HttpSystem_EdgeCases_SlotExhaustion_MaxBytes_Methods_Headers_AndStop", &TestHttpSystemEdgeCases);
         Assert.Run("WebSocketSystem_LoopbackTextBinaryFragmentedCloseAndZeroGcHotLoop", &TestWebSocketSystem);
+        Assert.Run("WebSocketSystem_EdgeCases_Timeouts_CloseDuringSend_QueueOverflow_AndStop", &TestWebSocketSystemEdgeCases);
     }
 
     // =========================================================================
@@ -802,6 +807,666 @@ public static class NetworkingTests
                     {
                         // Connection aborted/cancelled during teardown
                     }
+                }
+            }, ct);
+        }
+    }
+
+    // =========================================================================
+    // 5. NetSerialization Edge Cases (N-06, N-13, N-14, N-18 #3)
+    // =========================================================================
+
+    private static unsafe void TestNetSerializationEdgeCases()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        byte* buf = stackalloc byte[512];
+
+        // 1. VarInt32(int.MaxValue) + incremental Crc32
+        var w = NetWriter.Create(buf, 512);
+        w.WriteVarInt32(int.MaxValue);
+        w.WriteVarInt32(int.MinValue);
+        var r = NetReader.Create(buf, w.BytesWritten);
+        Assert.Equal(int.MaxValue, r.ReadVarInt32(), "VarInt32(int.MaxValue)");
+        Assert.Equal(int.MinValue, r.ReadVarInt32(), "VarInt32(int.MinValue)");
+        Assert.True(!r.HasOverflow, "VarInt32 extremes no overflow");
+
+        uint crcPart1 = NetHash.Crc32("1234"u8);
+        uint crcCombined = NetHash.Crc32("56789"u8, seed: crcPart1);
+        Assert.Equal(0xCBF43926u, crcCombined, "Incremental Crc32 matches single-pass");
+
+        // 2. Truncated, overlong, and 5th-byte overflow varints (N-14)
+        byte* badVar = stackalloc byte[5];
+        badVar[0] = 0x80;
+        var rTrunc = NetReader.Create(badVar, 1);
+        _ = rTrunc.ReadVarUInt32();
+        Assert.True(rTrunc.HasOverflow, "Truncated varint flags overflow");
+
+        for (int i = 0; i < 5; i++) badVar[i] = 0x80;
+        var rOverlong = NetReader.Create(badVar, 5);
+        _ = rOverlong.ReadVarUInt32();
+        Assert.True(rOverlong.HasOverflow, "5th-byte continuation overlong varint flags overflow");
+
+        badVar[4] = 0x10; // bits > 32-bit uint.MaxValue (0x0F max)
+        var r5thOverflow = NetReader.Create(badVar, 5);
+        _ = r5thOverflow.ReadVarUInt32();
+        Assert.True(r5thOverflow.HasOverflow, "5th-byte > 0x0F flags overflow (N-14)");
+
+        // 3. ReadBytes(maxAllowed) incl. negative maxAllowed (N-13)
+        w.Reset();
+        w.WriteBytes(new byte[] { 1, 2, 3, 4 });
+        var rNegMax = NetReader.Create(buf, w.BytesWritten);
+        _ = rNegMax.ReadBytes(maxAllowed: -1);
+        Assert.True(rNegMax.HasOverflow, "Negative maxAllowed sets overflow (N-13)");
+
+        var rTooSmallMax = NetReader.Create(buf, w.BytesWritten);
+        _ = rTooSmallMax.ReadBytes(maxAllowed: 3);
+        Assert.True(rTooSmallMax.HasOverflow, "Payload > maxAllowed sets overflow");
+
+        // 4. Signed int overflow in EnsureSpace / EnsureAvailable & ReadBytesRaw(-1) (N-06)
+        w.Reset();
+        w.WriteByte(1);
+        w.WriteBytesRaw(ReadOnlySpan<byte>.Empty);
+        Assert.True(!w.HasOverflow, "Empty WriteBytesRaw succeeds");
+        var rNegRaw = NetReader.Create(buf, 8);
+        _ = rNegRaw.ReadBytesRaw(-1);
+        Assert.True(rNegRaw.HasOverflow, "Negative ReadBytesRaw sets overflow");
+
+        var rOverflowAdd = NetReader.Create(buf, 8);
+        _ = rOverflowAdd.ReadByte(); // Position = 1
+        _ = rOverflowAdd.ReadBytesRaw(int.MaxValue); // 1 + int.MaxValue must NOT wrap around!
+        Assert.True(rOverflowAdd.HasOverflow, "EnsureAvailable rejects Position + int.MaxValue overflow (N-06)");
+
+        // Sticky HasOverflow
+        int posBefore = rOverflowAdd.Position;
+        _ = rOverflowAdd.ReadByte();
+        Assert.Equal(posBefore, rOverflowAdd.Position, "Sticky overflow prevents further reads");
+
+        // 5. FixedString64 / FixedString256 invalid length & truncation
+        buf[0] = (byte)(FixedString64.MaxBytes + 1);
+        var rBadFs64 = NetReader.Create(buf, 128);
+        _ = rBadFs64.ReadFixedString64();
+        Assert.True(rBadFs64.HasOverflow, "Invalid FixedString64 length flags overflow");
+
+        buf[0] = (byte)(FixedString256.MaxBytes + 1);
+        var rBadFs256 = NetReader.Create(buf, 255);
+        _ = rBadFs256.ReadFixedString256();
+        Assert.True(rBadFs256.HasOverflow, "Invalid FixedString256 length flags overflow");
+
+        buf[0] = 10;
+        var rTruncFs64 = NetReader.Create(buf, 4);
+        _ = rTruncFs64.ReadFixedString64();
+        Assert.True(rTruncFs64.HasOverflow, "Truncated FixedString64 flags overflow");
+
+        // Writer overflow sticks and stops advancing Position
+        var wSmall = NetWriter.Create(buf, 4);
+        wSmall.WriteInt32(42);
+        Assert.True(!wSmall.HasOverflow && wSmall.BytesWritten == 4, "Exact fit writes 4 bytes");
+        wSmall.WriteByte(9);
+        Assert.True(wSmall.HasOverflow && wSmall.BytesWritten == 4, "Overflow sticks at Position 4");
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after NetSerialization edge cases");
+    }
+
+    // =========================================================================
+    // 6. LoopbackTransport Edge Cases (N-07, N-17, N-18 #4)
+    // =========================================================================
+
+    private static unsafe void TestLoopbackTransportEdgeCases()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+
+        try
+        {
+            // 1. default(NetTransportVTable) safety
+            NetTransportVTable emptyVt = default;
+            Assert.True(!emptyVt.TrySend(0, "hi"u8), "default vtable TrySend returns false");
+            Assert.True(!emptyVt.TryPoll(out _), "default vtable TryPoll returns false");
+            emptyVt.DisconnectPeer(0, 0);
+            Assert.Equal(0, emptyVt.QueryStats().ConnectedPeers, "default vtable QueryStats returns default");
+
+            // 2. Mixed UnreliableSequenced + ReliableOrdered (N-07) + negative latency clamp (N-17)
+            var cfg = new LoopbackSimConfig
+            {
+                OneWayLatencyTicks = -5, // clamps to 0 in RttMs
+                JitterTicks = 0,
+                PacketLossPermille = 0,
+                RngSeed = 42,
+            };
+            LoopbackLink* link = alloc.Persistent.Alloc<LoopbackLink>(1, 64);
+            LoopbackTransportSystem.Init(link, ref alloc.Persistent, in cfg, queueCapacity: 8, maxPacketBytes: 64);
+            NetTransportVTable a = LoopbackTransportSystem.GetVTable(&link->PeerA);
+            NetTransportVTable b = LoopbackTransportSystem.GetVTable(&link->PeerB);
+            Assert.Equal(0, a.QueryStats().RttMs, "Negative latency clamped to 0 RttMs (N-17)");
+            Assert.True(a.TryPoll(out _) && b.TryPoll(out _), "Initial connects polled");
+
+            // Send delayed US(1), then immediate US(2): US(2) arrives first and drops older US(1)
+            byte* pkt = stackalloc byte[4];
+            link->Config.OneWayLatencyTicks = 3;
+            pkt[0] = 1; Assert.True(a.TrySend(1, new ReadOnlySpan<byte>(pkt, 1), NetDeliveryMode.UnreliableSequenced), "Send delayed US1");
+            link->Config.OneWayLatencyTicks = 0;
+            pkt[0] = 2; Assert.True(a.TrySend(1, new ReadOnlySpan<byte>(pkt, 1), NetDeliveryMode.UnreliableSequenced), "Send immediate US2");
+            pkt[0] = 3; Assert.True(a.TrySend(1, new ReadOnlySpan<byte>(pkt, 1), NetDeliveryMode.ReliableUnordered), "Send RU3");
+
+            Assert.True(b.TryPoll(out NetTransportEvent evUs2) && evUs2.AsPayloadSpan()[0] == 2, "US2 arrived first");
+            Assert.True(b.TryPoll(out NetTransportEvent evRu3) && evRu3.AsPayloadSpan()[0] == 3, "RU3 arrived");
+            for (int t = 0; t < 3; t++) LoopbackTransportSystem.AdvanceTick(link);
+            Assert.True(!b.TryPoll(out _), "Older US1 dropped relative to US2");
+            long droppedBefore = link->TotalDropped;
+            Assert.True(droppedBefore >= 1, "US1 counted as dropped");
+
+            // Now send delayed US(10), then immediate RO(11): RO(11) MUST NOT poison UnreliableSequenced (N-07)!
+            link->Config.OneWayLatencyTicks = 3;
+            pkt[0] = 10; Assert.True(a.TrySend(1, new ReadOnlySpan<byte>(pkt, 1), NetDeliveryMode.UnreliableSequenced), "Send delayed US10");
+            link->Config.OneWayLatencyTicks = 0;
+            pkt[0] = 11; Assert.True(a.TrySend(1, new ReadOnlySpan<byte>(pkt, 1), NetDeliveryMode.ReliableOrdered), "Send immediate RO11");
+            Assert.True(b.TryPoll(out NetTransportEvent evRo11) && evRo11.AsPayloadSpan()[0] == 11, "RO11 arrived first");
+            for (int t = 0; t < 3; t++) LoopbackTransportSystem.AdvanceTick(link);
+            Assert.True(b.TryPoll(out NetTransportEvent evUs10) && evUs10.AsPayloadSpan()[0] == 10, "US10 NOT falsely dropped by RO11 (N-07)");
+
+            // 3. Oversized payload rejection & queue saturation
+            byte* big = stackalloc byte[128];
+            Assert.True(!a.TrySend(1, new ReadOnlySpan<byte>(big, 128), NetDeliveryMode.ReliableOrdered), "Oversized payload rejected");
+
+            for (int i = 0; i < 8; i++)
+                Assert.True(a.TrySend(1, new ReadOnlySpan<byte>(pkt, 1), NetDeliveryMode.ReliableOrdered), $"Fill queue {i}");
+            Assert.True(!a.TrySend(1, new ReadOnlySpan<byte>(pkt, 1), NetDeliveryMode.ReliableOrdered), "Full queue TrySend returns false");
+            Assert.True(b.QueryStats().PacketsDropped > droppedBefore, "Full queue drop incremented PacketsDropped");
+
+            // 4. Disconnect drains queued packets and rejects subsequent sends (N-17)
+            a.DisconnectPeer(1, reason: 99);
+            Assert.True(!a.TrySend(1, new ReadOnlySpan<byte>(pkt, 1), NetDeliveryMode.ReliableOrdered), "Send after disconnect returns false");
+            Assert.True(b.TryPoll(out NetTransportEvent evDisc) && evDisc.Kind == NetTransportEventKind.PeerDisconnected && evDisc.DisconnectReason == 99, "PeerDisconnected delivered");
+            Assert.True(!b.TryPoll(out _), "Queued packets discarded on disconnect (N-17)");
+        }
+        finally
+        {
+            alloc.Dispose();
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after LoopbackTransport edge cases");
+    }
+
+    // =========================================================================
+    // 7. HttpSystem Edge Cases (N-01, N-08, N-10, N-11, N-12, N-15, N-18 #1)
+    // =========================================================================
+
+    private static unsafe void TestHttpSystemEdgeCases()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        string logDir = Path.Combine(Path.GetTempPath(), "BringHttpLog_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(logDir);
+
+        LogState* log = alloc.Persistent.Alloc<LogState>(1, 64);
+        LogSystem.Start(log, ref alloc.Persistent, appName: "BringHttpTest", directoryOverride: logDir, hookExceptions: false);
+
+        using var serverCts = new CancellationTokenSource();
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        Task serverTask = Task.Run(() => RunEdgeHttpServerAsync(listener, serverCts.Token));
+
+        HttpClientState* http = alloc.Persistent.Alloc<HttpClientState>(1, 64);
+        HttpSystem.Start(http, ref alloc.Persistent, maxConcurrent: 4, defaultTimeoutMs: 5000, log: log);
+
+        try
+        {
+            string baseUrl = $"http://127.0.0.1:{port}";
+
+            // 1. Put / Delete / Patch / Head + empty body
+            HttpMethodKind[] methods = { HttpMethodKind.Put, HttpMethodKind.Delete, HttpMethodKind.Patch, HttpMethodKind.Head };
+            foreach (HttpMethodKind m in methods)
+            {
+                HttpRequestHandle mh = HttpSystem.Send(http, m, $"{baseUrl}/method");
+                HttpResponse mr = WaitHttpResponse(http, mh);
+                try
+                {
+                    Assert.True(mr.IsSuccess, $"Method {m} succeeded");
+                    if (m == HttpMethodKind.Head)
+                        Assert.Equal(0, mr.BodyLength, "HEAD empty body");
+                    else
+                        Assert.Equal(m.ToString().ToUpperInvariant(), mr.BodyAsUtf8String(), $"Method {m} echoed");
+                }
+                finally
+                {
+                    HttpSystem.ReleaseResponse(ref mr);
+                }
+            }
+
+            // 2. MaxResponseBytes exceeded via Content-Length AND via chunked stream
+            HttpRequestHandle hBigCl = HttpSystem.Get(http, $"{baseUrl}/big-cl", maxResponseBytes: 128);
+            HttpResponse rBigCl = WaitHttpResponse(http, hBigCl);
+            try
+            {
+                Assert.Equal((byte)HttpRequestStatus.Failed, (byte)rBigCl.Status, "Content-Length > MaxResponseBytes failed");
+                Assert.True(rBigCl.BodyPtr == null, "No leaked body on Content-Length overrun");
+            }
+            finally
+            {
+                HttpSystem.ReleaseResponse(ref rBigCl);
+            }
+
+            HttpRequestHandle hBigChunk = HttpSystem.Get(http, $"{baseUrl}/big-chunked", maxResponseBytes: 128);
+            HttpResponse rBigChunk = WaitHttpResponse(http, hBigChunk);
+            try
+            {
+                Assert.Equal((byte)HttpRequestStatus.Failed, (byte)rBigChunk.Status, "Chunked stream > MaxResponseBytes failed");
+                Assert.True(rBigChunk.BodyPtr == null, "No leaked body on chunked overrun");
+            }
+            finally
+            {
+                HttpSystem.ReleaseResponse(ref rBigChunk);
+            }
+
+            // 3. Invalid URL & invalid content-type header (N-15)
+            HttpRequestHandle hBadUrl = HttpSystem.Get(http, "not a valid uri");
+            Assert.True(hBadUrl.IsValid, "Invalid URL returns handle to failed response");
+            HttpResponse rBadUrl = WaitHttpResponse(http, hBadUrl);
+            Assert.Equal((byte)HttpRequestStatus.Failed, (byte)rBadUrl.Status, "Invalid URL response Failed");
+            HttpSystem.ReleaseResponse(ref rBadUrl);
+
+            HttpRequestHandle hBadCt = HttpSystem.Send(http, HttpMethodKind.Post, $"{baseUrl}/method", "abc"u8, contentType: "invalid/content; =type");
+            HttpResponse rBadCt = WaitHttpResponse(http, hBadCt);
+            Assert.Equal((byte)HttpRequestStatus.Failed, (byte)rBadCt.Status, "Invalid Content-Type response Failed");
+            HttpSystem.ReleaseResponse(ref rBadCt);
+
+            // 4. Stale handle rejection
+            Assert.True(!HttpSystem.IsPending(http, hBadUrl), "Stale handle IsPending == false");
+            HttpSystem.Cancel(http, hBadUrl); // safe no-op
+
+            // 5. Slot exhaustion (maxConcurrent == 4) + recovery
+            HttpRequestHandle[] held = new HttpRequestHandle[4];
+            for (int i = 0; i < 4; i++)
+            {
+                held[i] = HttpSystem.Get(http, $"{baseUrl}/slow", timeoutMs: 5000);
+                Assert.True(held[i].IsValid, $"Slot {i} acquired");
+            }
+            HttpRequestHandle overflowH = HttpSystem.Get(http, $"{baseUrl}/method");
+            Assert.True(!overflowH.IsValid, "5th concurrent request returns Invalid on full pool");
+
+            for (int i = 0; i < 4; i++) HttpSystem.Cancel(http, held[i]);
+            for (int i = 0; i < 4; i++)
+            {
+                HttpResponse rc = WaitHttpResponse(http, held[i]);
+                HttpSystem.ReleaseResponse(ref rc);
+            }
+            HttpRequestHandle recovered = HttpSystem.Get(http, $"{baseUrl}/method");
+            Assert.True(recovered.IsValid, "Slot pool recovered after draining");
+            HttpResponse rr = WaitHttpResponse(http, recovered);
+            HttpSystem.ReleaseResponse(ref rr);
+
+            // 6. Stop() while a request is in-flight + double Stop() idempotency
+            _ = HttpSystem.Get(http, $"{baseUrl}/slow", timeoutMs: 5000);
+            HttpSystem.Stop(http);
+            HttpSystem.Stop(http); // double Stop() safe no-op
+        }
+        finally
+        {
+            HttpSystem.Stop(http);
+            serverCts.Cancel();
+            listener.Stop();
+            try { serverTask.Wait(TimeSpan.FromSeconds(3)); } catch { }
+            LogSystem.Stop(log);
+            alloc.Dispose();
+            try { Directory.Delete(logDir, true); } catch { }
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after HttpSystem edge cases");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after HttpSystem edge cases");
+    }
+
+    private static async Task RunEdgeHttpServerAsync(TcpListener listener, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            TcpClient client;
+            try { client = await listener.AcceptTcpClientAsync(ct).ConfigureAwait(false); }
+            catch { break; }
+
+            _ = Task.Run(async () =>
+            {
+                using (client)
+                using (NetworkStream stream = client.GetStream())
+                {
+                    try
+                    {
+                        string headersText = await ReadHttpHeadersAsync(stream, ct).ConfigureAwait(false);
+                        if (string.IsNullOrEmpty(headersText)) return;
+                        string[] lines = headersText.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
+                        string[] reqParts = lines[0].Split(' ');
+                        string method = reqParts.Length > 0 ? reqParts[0] : "GET";
+                        string path = reqParts.Length > 1 ? reqParts[1] : "/";
+
+                        int contentLength = 0;
+                        for (int i = 1; i < lines.Length; i++)
+                        {
+                            int colon = lines[i].IndexOf(':');
+                            if (colon > 0 && lines[i].Substring(0, colon).Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                                int.TryParse(lines[i].Substring(colon + 1).Trim(), out contentLength);
+                        }
+                        if (contentLength > 0)
+                        {
+                            byte[] sink = new byte[contentLength];
+                            int r = 0;
+                            while (r < contentLength)
+                            {
+                                int n = await stream.ReadAsync(sink.AsMemory(r, contentLength - r), ct).ConfigureAwait(false);
+                                if (n <= 0) break;
+                                r += n;
+                            }
+                        }
+
+                        if (path == "/method")
+                        {
+                            byte[] body = method == "HEAD" ? Array.Empty<byte>() : Encoding.ASCII.GetBytes(method);
+                            string hdr = $"HTTP/1.1 200 OK\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n";
+                            await stream.WriteAsync(Encoding.ASCII.GetBytes(hdr), ct).ConfigureAwait(false);
+                            if (body.Length > 0) await stream.WriteAsync(body, ct).ConfigureAwait(false);
+                        }
+                        else if (path == "/big-cl")
+                        {
+                            byte[] body = new byte[512];
+                            await WriteHttpResponseAsync(stream, 200, "OK", body, ct).ConfigureAwait(false);
+                        }
+                        else if (path == "/big-chunked")
+                        {
+                            string hdr = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                            await stream.WriteAsync(Encoding.ASCII.GetBytes(hdr), ct).ConfigureAwait(false);
+                            byte[] chunkData = new byte[256];
+                            string chunkFrame = $"{chunkData.Length:X}\r\n";
+                            await stream.WriteAsync(Encoding.ASCII.GetBytes(chunkFrame), ct).ConfigureAwait(false);
+                            await stream.WriteAsync(chunkData, ct).ConfigureAwait(false);
+                            await stream.WriteAsync("\r\n0\r\n\r\n"u8.ToArray(), ct).ConfigureAwait(false);
+                        }
+                        else if (path == "/slow")
+                        {
+                            await Task.Delay(3000, ct).ConfigureAwait(false);
+                            await WriteHttpResponseAsync(stream, 200, "OK", "late"u8.ToArray(), ct).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await WriteHttpResponseAsync(stream, 404, "Not Found", Array.Empty<byte>(), ct).ConfigureAwait(false);
+                        }
+                        await stream.FlushAsync(ct).ConfigureAwait(false);
+                    }
+                    catch { }
+                }
+            }, ct);
+        }
+    }
+
+    // =========================================================================
+    // 8. WebSocketSystem Edge Cases (N-01..N-05, N-08..N-12, N-16, N-18 #2)
+    // =========================================================================
+
+    private static unsafe void TestWebSocketSystemEdgeCases()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        string logDir = Path.Combine(Path.GetTempPath(), "BringWsLog_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(logDir);
+
+        LogState* log = alloc.Persistent.Alloc<LogState>(1, 64);
+        LogSystem.Start(log, ref alloc.Persistent, appName: "BringWsTest", directoryOverride: logDir, hookExceptions: false);
+
+        using var serverCts = new CancellationTokenSource();
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        Task serverTask = Task.Run(() => RunEdgeWsServerAsync(listener, serverCts.Token));
+
+        WebSocketClientState* ws = alloc.Persistent.Alloc<WebSocketClientState>(1, 64);
+        WebSocketSystem.Start(
+            ws,
+            ref alloc.Persistent,
+            maxConnections: 2,
+            eventQueueCapacity: 16,
+            outboundQueueCapacity: 16,
+            maxMessageBytes: 1024,
+            log: log);
+
+        try
+        {
+            string baseWsUrl = $"ws://127.0.0.1:{port}";
+
+            // 1. Invalid subProtocol / invalid header in Connect must NOT leak ClientWebSocket or slot (N-05)
+            WebSocketHandle hBadProto = WebSocketSystem.Connect(ws, $"{baseWsUrl}/echo", subProtocol: "bad protocol");
+            Assert.True(hBadProto.IsValid, "Bad subProtocol returns handle for Error event");
+            WebSocketEvent evBadProto = WaitWsEvent(ws, hBadProto);
+            Assert.Equal((byte)WebSocketEventKind.Error, (byte)evBadProto.Kind, "Bad subProtocol emits Error");
+            WebSocketSystem.ReleaseEvent(ref evBadProto);
+
+            HttpHeader* badHdr = stackalloc HttpHeader[1];
+            badHdr[0] = HttpHeader.Create("Bad\r\nName", "val");
+            WebSocketHandle hBadHdr = WebSocketSystem.Connect(ws, $"{baseWsUrl}/echo", headers: new ReadOnlySpan<HttpHeader>(badHdr, 1));
+            WebSocketEvent evBadHdr = WaitWsEvent(ws, hBadHdr);
+            Assert.Equal((byte)WebSocketEventKind.Error, (byte)evBadHdr.Kind, "Bad header emits Error");
+            WebSocketSystem.ReleaseEvent(ref evBadHdr);
+
+            // 2. connectTimeoutMs expiration -> Error (not Closed(1000)) (N-04)
+            WebSocketHandle hTimeout = WebSocketSystem.Connect(ws, $"{baseWsUrl}/slow-handshake", connectTimeoutMs: 120);
+            WebSocketEvent evTimeout = WaitWsEvent(ws, hTimeout);
+            Assert.Equal((byte)WebSocketEventKind.Error, (byte)evTimeout.Kind, "Connect timeout emits Error (N-04)");
+            Assert.Equal((byte)WebSocketStateKind.Faulted, (byte)WebSocketSystem.GetState(ws, hTimeout), "State Faulted on connect timeout");
+            WebSocketSystem.ReleaseEvent(ref evTimeout);
+
+            // 3. Slot exhaustion (maxConnections == 2) + recovery
+            WebSocketHandle c1 = WebSocketSystem.Connect(ws, $"{baseWsUrl}/echo");
+            WebSocketHandle c2 = WebSocketSystem.Connect(ws, $"{baseWsUrl}/echo");
+            WebSocketHandle cOver = WebSocketSystem.Connect(ws, $"{baseWsUrl}/echo");
+            Assert.True(!cOver.IsValid, "3rd concurrent connection rejected when maxConnections==2");
+
+            WebSocketEvent ec1 = WaitWsEvent(ws, c1);
+            Assert.Equal((byte)WebSocketEventKind.Connected, (byte)ec1.Kind, "c1 connected");
+            WebSocketSystem.ReleaseEvent(ref ec1);
+            WebSocketEvent ec2 = WaitWsEvent(ws, c2);
+            Assert.Equal((byte)WebSocketEventKind.Connected, (byte)ec2.Kind, "c2 connected");
+            WebSocketSystem.ReleaseEvent(ref ec2);
+
+            // 4. SendText > 1024 chars (<= maxMessageBytes=1024? Wait: 900 ASCII chars vs 1500? Use 1024 max, test > 1024 SendText rejected or 0-byte frame)
+            // Send 0-byte binary and 0-byte text frames
+            Assert.True(WebSocketSystem.SendBinary(ws, c1, ReadOnlySpan<byte>.Empty), "0-byte binary send");
+            WebSocketEvent evZeroBin = WaitWsEvent(ws, c1);
+            Assert.Equal((byte)WebSocketEventKind.BinaryMessage, (byte)evZeroBin.Kind, "0-byte binary received");
+            Assert.Equal(0, evZeroBin.DataLength, "0-byte binary length");
+            WebSocketSystem.ReleaseEvent(ref evZeroBin);
+
+            Assert.True(WebSocketSystem.SendText(ws, c1, ReadOnlySpan<char>.Empty), "0-byte text send");
+            WebSocketEvent evZeroTxt = WaitWsEvent(ws, c1);
+            Assert.Equal((byte)WebSocketEventKind.TextMessage, (byte)evZeroTxt.Kind, "0-byte text received");
+            Assert.Equal(0, evZeroTxt.DataLength, "0-byte text length");
+            WebSocketSystem.ReleaseEvent(ref evZeroTxt);
+
+            // Close c2 with custom closeStatus (4001) and verify custom close status + slot reuse
+            WebSocketSystem.Close(ws, c2, closeStatus: 4001, reason: "custom-bye");
+            WebSocketEvent evC2Close = WaitWsEvent(ws, c2);
+            Assert.Equal((byte)WebSocketEventKind.Closed, (byte)evC2Close.Kind, "c2 closed");
+            Assert.Equal((ushort)4001, evC2Close.CloseStatus, "Custom closeStatus 4001 preserved (N-09)");
+            WebSocketSystem.ReleaseEvent(ref evC2Close);
+
+            // Stale handle c2 rejection
+            Assert.Equal((byte)WebSocketStateKind.Disconnected, (byte)WebSocketSystem.GetState(ws, c2), "Stale handle GetState after slot reuse/close");
+            Assert.True(!WebSocketSystem.SendBinary(ws, c2, "x"u8), "SendBinary on closed/stale handle returns false");
+
+            // 5. Server sends Close while client is sending frames (N-02)
+            Assert.True(WebSocketSystem.SendText(ws, c1, "CLOSE_SOON"u8), "Trigger server close during active sends");
+            for (int i = 0; i < 10; i++)
+                _ = WebSocketSystem.SendBinary(ws, c1, "ping"u8);
+            WebSocketEvent evSrvClose = WaitWsEventKind(ws, c1, WebSocketEventKind.Closed);
+            Assert.Equal((byte)WebSocketEventKind.Closed, (byte)evSrvClose.Kind, "Server close during active sends finished cleanly (N-02)");
+            WebSocketSystem.ReleaseEvent(ref evSrvClose);
+
+            // 6. MaxMessageBytes overrun (> 1024 bytes from server) -> Error event with 0 leaks
+            WebSocketHandle cOverrun = WebSocketSystem.Connect(ws, $"{baseWsUrl}/bigmsg");
+            WebSocketEvent evConnOver = WaitWsEvent(ws, cOverrun);
+            Assert.Equal((byte)WebSocketEventKind.Connected, (byte)evConnOver.Kind, "cOverrun connected");
+            WebSocketSystem.ReleaseEvent(ref evConnOver);
+            WebSocketEvent evErrOver = WaitWsEvent(ws, cOverrun);
+            Assert.Equal((byte)WebSocketEventKind.Error, (byte)evErrOver.Kind, "MaxMessageBytes overrun emits Error");
+            WebSocketSystem.ReleaseEvent(ref evErrOver);
+
+            // 7. Unexpected server TCP drop guarantees terminal Error or Closed event (N-03)
+            WebSocketHandle cDrop = WebSocketSystem.Connect(ws, $"{baseWsUrl}/drop");
+            WebSocketEvent evConnDrop = WaitWsEvent(ws, cDrop);
+            Assert.Equal((byte)WebSocketEventKind.Connected, (byte)evConnDrop.Kind, "cDrop connected");
+            WebSocketSystem.ReleaseEvent(ref evConnDrop);
+            WebSocketEvent evDropped = WaitWsEvent(ws, cDrop);
+            Assert.True(evDropped.Kind == WebSocketEventKind.Error || evDropped.Kind == WebSocketEventKind.Closed, "Abrupt TCP drop emits terminal Error/Closed");
+            WebSocketSystem.ReleaseEvent(ref evDropped);
+
+            // 8. EventQueue overflow (capacity == 16) + OutboundQueue overflow + Stop() draining unpolled events
+            WebSocketHandle cFlood = WebSocketSystem.Connect(ws, $"{baseWsUrl}/flood");
+            WebSocketEvent evConnFlood = WaitWsEvent(ws, cFlood);
+            WebSocketSystem.ReleaseEvent(ref evConnFlood);
+
+            // Wait briefly for server flood to overflow EventQueue (16)
+            Stopwatch sw = Stopwatch.StartNew();
+            while (Interlocked.Read(ref ws->DroppedEvents.Value) == 0 && sw.ElapsedMilliseconds < 2000)
+                Thread.Sleep(5);
+            Assert.True(Interlocked.Read(ref ws->DroppedEvents.Value) > 0, "EventQueue overflow counted DroppedEvents");
+
+            // Also test SendText(>1024 chars) path with a second larger-limit WebSocketClientState
+            WebSocketClientState* wsBig = alloc.Persistent.Alloc<WebSocketClientState>(1, 64);
+            WebSocketSystem.Start(wsBig, ref alloc.Persistent, maxConnections: 1, eventQueueCapacity: 16, outboundQueueCapacity: 16, maxMessageBytes: 8192, log: log);
+            try
+            {
+                WebSocketHandle cBig = WebSocketSystem.Connect(wsBig, $"{baseWsUrl}/echo");
+                WebSocketEvent evBigConn = WaitWsEvent(wsBig, cBig);
+                WebSocketSystem.ReleaseEvent(ref evBigConn);
+
+                string bigText = new string('A', 2000);
+                Assert.True(WebSocketSystem.SendText(wsBig, cBig, bigText.AsSpan()), "SendText > 1024 chars succeeded");
+                WebSocketEvent evBigEcho = WaitWsEvent(wsBig, cBig);
+                Assert.Equal(2000, evBigEcho.DataLength, "2000-byte text echoed");
+                WebSocketSystem.ReleaseEvent(ref evBigEcho);
+
+                // Saturate outbound queue (capacity == 16) and leave queued/unpolled before Stop()
+                for (int i = 0; i < 32; i++)
+                    _ = WebSocketSystem.SendBinary(wsBig, cBig, "payload"u8);
+            }
+            finally
+            {
+                WebSocketSystem.Stop(wsBig);
+            }
+        }
+        finally
+        {
+            WebSocketSystem.Stop(ws);
+            serverCts.Cancel();
+            listener.Stop();
+            try { serverTask.Wait(TimeSpan.FromSeconds(3)); } catch { }
+            LogSystem.Stop(log);
+            alloc.Dispose();
+            try { Directory.Delete(logDir, true); } catch { }
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after WebSocketSystem edge cases");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after WebSocketSystem edge cases");
+    }
+
+    private static unsafe WebSocketEvent WaitWsEventKind(WebSocketClientState* ws, WebSocketHandle handle, WebSocketEventKind expected, int timeoutMs = 5000)
+    {
+        Stopwatch sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            if (WebSocketSystem.PollEvent(ws, out WebSocketEvent ev))
+            {
+                if (ev.Handle == handle && ev.Kind == expected)
+                    return ev;
+                WebSocketSystem.ReleaseEvent(ref ev);
+            }
+            Thread.Sleep(2);
+        }
+        throw new TimeoutException($"Timed out waiting for WebSocket event {expected} on {handle}");
+    }
+
+    private static async Task RunEdgeWsServerAsync(TcpListener listener, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            TcpClient client;
+            try { client = await listener.AcceptTcpClientAsync(ct).ConfigureAwait(false); }
+            catch { break; }
+
+            _ = Task.Run(async () =>
+            {
+                using (client)
+                using (NetworkStream stream = client.GetStream())
+                {
+                    try
+                    {
+                        string headers = await ReadHttpHeadersAsync(stream, ct).ConfigureAwait(false);
+                        string[] lines = headers.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
+                        string path = lines.Length > 0 && lines[0].Split(' ').Length > 1 ? lines[0].Split(' ')[1] : "/";
+
+                        if (path == "/slow-handshake")
+                        {
+                            await Task.Delay(1500, ct).ConfigureAwait(false);
+                            return;
+                        }
+
+                        string? secKey = null;
+                        foreach (string line in lines)
+                        {
+                            int colon = line.IndexOf(':');
+                            if (colon > 0 && line.Substring(0, colon).Trim().Equals("Sec-WebSocket-Key", StringComparison.OrdinalIgnoreCase))
+                                secKey = line.Substring(colon + 1).Trim();
+                        }
+                        if (string.IsNullOrEmpty(secKey)) return;
+
+                        string acceptKey = Convert.ToBase64String(
+                            SHA1.HashData(Encoding.ASCII.GetBytes(secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+                        string upgrade = $"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {acceptKey}\r\n\r\n";
+                        await stream.WriteAsync(Encoding.ASCII.GetBytes(upgrade), ct).ConfigureAwait(false);
+                        await stream.FlushAsync(ct).ConfigureAwait(false);
+
+                        using WebSocket srvWs = WebSocket.CreateFromStream(stream, isServer: true, subProtocol: null, keepAliveInterval: TimeSpan.FromSeconds(10));
+
+                        if (path == "/bigmsg")
+                        {
+                            byte[] big = new byte[2048];
+                            await srvWs.SendAsync(big, WebSocketMessageType.Binary, true, ct).ConfigureAwait(false);
+                            await Task.Delay(200, ct).ConfigureAwait(false);
+                            return;
+                        }
+                        if (path == "/drop")
+                        {
+                            await Task.Delay(30, ct).ConfigureAwait(false);
+                            client.Client.Close(0); // abrupt close without WS Close frame
+                            return;
+                        }
+                        if (path == "/flood")
+                        {
+                            byte[] msg = "flood"u8.ToArray();
+                            for (int i = 0; i < 32; i++)
+                                await srvWs.SendAsync(msg, WebSocketMessageType.Text, true, ct).ConfigureAwait(false);
+                            await Task.Delay(500, ct).ConfigureAwait(false);
+                            return;
+                        }
+
+                        byte[] buf = new byte[8192];
+                        while (!ct.IsCancellationRequested && srvWs.State == WebSocketState.Open)
+                        {
+                            WebSocketReceiveResult res = await srvWs.ReceiveAsync(buf, ct).ConfigureAwait(false);
+                            if (res.MessageType == WebSocketMessageType.Close)
+                            {
+                                await srvWs.CloseOutputAsync(
+                                    res.CloseStatus ?? WebSocketCloseStatus.NormalClosure,
+                                    res.CloseStatusDescription ?? string.Empty,
+                                    ct).ConfigureAwait(false);
+                                break;
+                            }
+                            if (res.MessageType == WebSocketMessageType.Text && res.Count == 10 &&
+                                Encoding.UTF8.GetString(buf, 0, 10) == "CLOSE_SOON")
+                            {
+                                await srvWs.CloseAsync(WebSocketCloseStatus.NormalClosure, "srv-close", ct).ConfigureAwait(false);
+                                break;
+                            }
+                            await srvWs.SendAsync(new ReadOnlyMemory<byte>(buf, 0, res.Count), res.MessageType, res.EndOfMessage, ct).ConfigureAwait(false);
+                        }
+                    }
+                    catch { }
                 }
             }, ct);
         }

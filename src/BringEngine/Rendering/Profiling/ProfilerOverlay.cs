@@ -127,7 +127,7 @@ public static unsafe class ProfilerOverlaySystem
         float ScaleForPx(float px) => px / bakedPx;
 
         float uiH = ProfilerOverlay.VirtualHeight;
-        float aspect = (screenHeight > 1f) ? (screenWidth / screenHeight) : (16f / 9f);
+        float aspect = (screenWidth > 1f && screenHeight > 1f) ? (screenWidth / screenHeight) : (16f / 9f);
         float uiW = uiH * aspect;
 
         // Dedicated overlay camera (DepthOrder 1000, ClearFlags.None -> never touches 3D depth!)
@@ -333,6 +333,8 @@ public static unsafe class ProfilerOverlaySystem
         }
         if (pos > 0)
             WriteText(in world.RenderComponents, ov.ScopesText, span.Slice(0, pos));
+        else
+            WriteText(in world.RenderComponents, ov.ScopesText, "SCOPES: --");
     }
 
     private static void UpdateStageBar(in RenderComponentTables rc, SpriteHandle barHandle, double stageMs, float budgetMs, float trackW, ColorF normalColor)
@@ -376,7 +378,7 @@ public static unsafe class ProfilerOverlaySystem
         ov.LastScreenH = screenH;
 
         float uiH = ProfilerOverlay.VirtualHeight;
-        float aspect = (screenHeightValid(screenH)) ? (screenW / screenH) : (16f / 9f);
+        float aspect = (screenW > 1f && screenH > 1f) ? (screenW / screenH) : (16f / 9f);
         float uiW = uiH * aspect;
 
         CameraData* cam = CameraSystem.TryGetPtr(in world.Cameras, ov.Camera);
@@ -550,6 +552,7 @@ public static unsafe class ProfilerOverlaySystem
             if (pos < dst.Length) dst[pos++] = '-';
             value = -value;
         }
+        if (value > 1e9) value = 1e9;
         long scale = decimals == 1 ? 10L : 100L;
         long scaled = (long)(value * scale + 0.5);
         long whole = scaled / scale;

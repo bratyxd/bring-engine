@@ -64,6 +64,12 @@ struct PSInput
     float4 CustomParams : TEXCOORD7;
 };
 
+float3 SafeNormalize(float3 v, float3 fallback)
+{
+    float lenSq = dot(v, v);
+    return lenSq > 1e-8 ? v * rsqrt(lenSq) : fallback;
+}
+
 PSInput VSMain(VSInput input)
 {
     Instance3D inst = Instances[BaseInstance + input.InstanceId];
@@ -74,29 +80,41 @@ PSInput VSMain(VSInput input)
     int jointOff = (int)inst.Extra.z;
     if (jointOff >= 0)
     {
-        uint j0 = (input.JointIndices) & 0xFFu;
-        uint j1 = (input.JointIndices >> 8) & 0xFFu;
-        uint j2 = (input.JointIndices >> 16) & 0xFFu;
-        uint j3 = (input.JointIndices >> 24) & 0xFFu;
+        float weightSum = input.JointWeights.x + input.JointWeights.y + input.JointWeights.z + input.JointWeights.w;
+        if (weightSum > 1e-5)
+        {
+            uint j0 = (input.JointIndices) & 0xFFu;
+            uint j1 = (input.JointIndices >> 8) & 0xFFu;
+            uint j2 = (input.JointIndices >> 16) & 0xFFu;
+            uint j3 = (input.JointIndices >> 24) & 0xFFu;
 
-        float4x4 skinMat =
-            JointPalette[jointOff + j0] * input.JointWeights.x +
-            JointPalette[jointOff + j1] * input.JointWeights.y +
-            JointPalette[jointOff + j2] * input.JointWeights.z +
-            JointPalette[jointOff + j3] * input.JointWeights.w;
+            float4x4 skinMat =
+                JointPalette[jointOff + j0] * input.JointWeights.x +
+                JointPalette[jointOff + j1] * input.JointWeights.y +
+                JointPalette[jointOff + j2] * input.JointWeights.z +
+                JointPalette[jointOff + j3] * input.JointWeights.w;
 
-        localPos = mul(skinMat, localPos);
-        localNorm = normalize(mul((float3x3)skinMat, localNorm));
+            localPos = mul(skinMat, localPos);
+            localNorm = SafeNormalize(mul((float3x3)skinMat, localNorm), input.Normal);
+        }
     }
 
     float4 worldPos = mul(inst.Model, localPos);
-    float3 worldNorm = normalize(mul((float3x3)inst.Model, localNorm));
+    float3x3 model3 = (float3x3)inst.Model;
+    float3x3 adjugate = float3x3(
+        cross(model3[1], model3[2]),
+        cross(model3[2], model3[0]),
+        cross(model3[0], model3[1])
+    );
+    float det = dot(model3[0], adjugate[0]);
+    float3 rawWorldNorm = mul(adjugate, localNorm) * (det < 0.0 ? -1.0 : 1.0);
+    float3 worldNorm = SafeNormalize(rawWorldNorm, float3(0.0, 1.0, 0.0));
 
     PSInput o;
     o.ClipPos = mul(ViewProj, worldPos);
     o.WorldPos = worldPos.xyz;
     o.WorldNormal = worldNorm;
-    o.Uv0 = input.Uv0;
+    o.Uv0 = input.Uv0 + input.TangentHint * 0.0;
     o.VertexColor = input.Color;
     o.BaseColor = inst.BaseColor;
     o.EmissiveMeta = inst.EmissiveMeta;
@@ -169,8 +187,8 @@ float4 PSMain(PSInput input) : SV_Target0
     if (input.Extra.y > 0.001 && albedo.a < input.Extra.y)
         discard;
 
-    float3 N = normalize(input.WorldNormal);
-    float3 V = normalize(PS_CameraPosTime.xyz - input.WorldPos);
+    float3 N = SafeNormalize(input.WorldNormal, float3(0.0, 1.0, 0.0));
+    float3 V = SafeNormalize(PS_CameraPosTime.xyz - input.WorldPos, float3(0.0, 0.0, 1.0));
     float roughness = clamp(input.EmissiveMeta.w, 0.08, 1.0);
     float metallic = clamp(input.Extra.x, 0.0, 1.0);
     float specPower = lerp(96.0, 8.0, roughness * roughness);
@@ -181,10 +199,10 @@ float4 PSMain(PSInput input) : SV_Target0
     float3 ambient = lerp(PS_AmbientGround.rgb, PS_AmbientSky.rgb, hemi) * albedo.rgb * (1.0 - metallic * 0.45);
 
     // Directional Sun (Blinn-PBR + 3x3 PCF Directional Shadow Map)
-    float3 L = normalize(PS_SunDirIntensity.xyz);
+    float3 L = SafeNormalize(PS_SunDirIntensity.xyz, float3(0.0, 1.0, 0.0));
     float NdotL = max(dot(N, L), 0.0);
     float shadowFactor = SampleDirectionalShadow(input.WorldPos, N, NdotL);
-    float3 H = normalize(L + V);
+    float3 H = SafeNormalize(L + V, N);
     float NdotH = max(dot(N, H), 0.0);
     float spec = pow(NdotH, specPower) * (0.25 + (1.0 - roughness) * 0.85);
     float3 sunLight = (albedo.rgb * (1.0 - metallic * 0.7) + F0 * spec * 2.2) * PS_SunColor.rgb * (NdotL * PS_SunDirIntensity.w * shadowFactor);
@@ -205,7 +223,7 @@ float4 PSMain(PSInput input) : SV_Target0
             {
                 float3 pL = toLight / max(dist, 0.001);
                 float pNdotL = max(dot(N, pL), 0.0);
-                float3 pH = normalize(pL + V);
+                float3 pH = SafeNormalize(pL + V, N);
                 float pSpec = pow(max(dot(N, pH), 0.0), specPower) * (1.0 - roughness * 0.5);
                 pointAccum += (albedo.rgb + F0 * pSpec * 2.0) * PS_PointLightColor[i].rgb * (pNdotL * atten * PS_PointLightColor[i].w);
             }
@@ -213,7 +231,7 @@ float4 PSMain(PSInput input) : SV_Target0
     }
 
     // Subtle rim highlight for crisp silhouette readability
-    float rim = pow(1.0 - max(dot(N, V), 0.0), 3.2) * 0.22;
+    float rim = pow(saturate(1.0 - max(dot(N, V), 0.0)), 3.2) * 0.22;
     float3 color = ambient + sunLight + pointAccum + input.EmissiveMeta.rgb + PS_AmbientSky.rgb * rim;
 
     // Distance fog

@@ -68,6 +68,7 @@ public unsafe struct SkeletonData
 [StructLayout(LayoutKind.Sequential)]
 public struct AnimPlayerData
 {
+    public AnimPlayerHandle Handle;
     public EntityId Entity;
     public SceneId OwnerScene;
     public SkeletonHandle Skeleton;
@@ -88,6 +89,8 @@ public struct AnimPlayerData
 public struct SpriteAnimClipData
 {
     public StringId Name;
+    public SceneId OwnerScene;
+    public BundleId OwnerBundle;
     public int StartFrame;
     public int FrameCount;
     public int Columns;
@@ -99,6 +102,7 @@ public struct SpriteAnimClipData
 [StructLayout(LayoutKind.Sequential)]
 public struct SpriteAnimPlayerData
 {
+    public SpriteAnimPlayerHandle Handle;
     public EntityId Entity;
     public SceneId OwnerScene;
     public int ClipIndex;
@@ -127,16 +131,27 @@ public unsafe struct AnimationTable
     public int MaxClips;
 
     public AnimPlayerData* Players;
+    public int* PlayerSlotToDense;
+    public uint* PlayerGens;
+    public uint* PlayerFreeSlots;
     public int PlayerCount;
     public int MaxPlayers;
+    public int PlayerFreeCount;
+    public int PlayerNextSlot;
 
     public SpriteAnimClipData* SpriteClips;
+    public byte* SpriteClipAlive;
     public int SpriteClipCount;
     public int MaxSpriteClips;
 
     public SpriteAnimPlayerData* SpritePlayers;
+    public int* SpritePlayerSlotToDense;
+    public uint* SpritePlayerGens;
+    public uint* SpritePlayerFreeSlots;
     public int SpritePlayerCount;
     public int MaxSpritePlayers;
+    public int SpritePlayerFreeCount;
+    public int SpritePlayerNextSlot;
 
     // Populated each frame in FrameArena during AnimationSystem.StepAll
     public NativeSlice<Mat4> FrameJointPalette;
@@ -154,6 +169,14 @@ public unsafe struct AnimationTable
         uint* clipGens = arena.AllocUninitialized<uint>(maxClips, 16);
         for (int i = 0; i < maxClips; i++) clipGens[i] = 1;
 
+        int* pSlotToDense = arena.AllocUninitialized<int>(maxPlayers, 64);
+        uint* pGens = arena.AllocUninitialized<uint>(maxPlayers, 64);
+        for (int i = 0; i < maxPlayers; i++) { pSlotToDense[i] = -1; pGens[i] = 1; }
+
+        int* spSlotToDense = arena.AllocUninitialized<int>(maxSpritePlayers, 64);
+        uint* spGens = arena.AllocUninitialized<uint>(maxSpritePlayers, 64);
+        for (int i = 0; i < maxSpritePlayers; i++) { spSlotToDense[i] = -1; spGens[i] = 1; }
+
         return new AnimationTable
         {
             Skeletons = arena.Alloc<SkeletonData>(maxSkeletons, 64),
@@ -167,16 +190,27 @@ public unsafe struct AnimationTable
             MaxClips = maxClips,
 
             Players = arena.Alloc<AnimPlayerData>(maxPlayers, 64),
+            PlayerSlotToDense = pSlotToDense,
+            PlayerGens = pGens,
+            PlayerFreeSlots = arena.AllocUninitialized<uint>(maxPlayers, 64),
             PlayerCount = 0,
             MaxPlayers = maxPlayers,
+            PlayerFreeCount = 0,
+            PlayerNextSlot = 0,
 
             SpriteClips = arena.Alloc<SpriteAnimClipData>(maxSpriteClips, 64),
+            SpriteClipAlive = arena.Alloc<byte>(maxSpriteClips, 16),
             SpriteClipCount = 0,
             MaxSpriteClips = maxSpriteClips,
 
             SpritePlayers = arena.Alloc<SpriteAnimPlayerData>(maxSpritePlayers, 64),
+            SpritePlayerSlotToDense = spSlotToDense,
+            SpritePlayerGens = spGens,
+            SpritePlayerFreeSlots = arena.AllocUninitialized<uint>(maxSpritePlayers, 64),
             SpritePlayerCount = 0,
             MaxSpritePlayers = maxSpritePlayers,
+            SpritePlayerFreeCount = 0,
+            SpritePlayerNextSlot = 0,
             FrameJointPalette = default,
         };
     }
@@ -236,6 +270,17 @@ public static unsafe class AnimationSystem
                 table.ClipGens[i] = g == 0 ? 1u : g;
             }
         }
+        if (bundle.IsValid)
+        {
+            for (int i = 0; i < table.MaxSpriteClips; i++)
+            {
+                if (table.SpriteClipAlive[i] != 0 && table.SpriteClips[i].OwnerBundle == bundle)
+                {
+                    table.SpriteClipAlive[i] = 0;
+                    table.SpriteClipCount--;
+                }
+            }
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -254,7 +299,7 @@ public static unsafe class AnimationSystem
         return table.Clips + handle.Index;
     }
 
-    public static int AddPlayer(
+    public static AnimPlayerHandle AddPlayer(
         ref AnimationTable table,
         EntityId entity,
         SkeletonHandle skeleton,
@@ -263,11 +308,24 @@ public static unsafe class AnimationSystem
         float speed = 1f,
         bool loop = true)
     {
-        if (table.PlayerCount >= table.MaxPlayers)
-            throw new OutOfMemoryException("AnimationTable players exhausted.");
+        uint slot;
+        if (table.PlayerFreeCount > 0)
+        {
+            slot = table.PlayerFreeSlots[--table.PlayerFreeCount];
+        }
+        else
+        {
+            if (table.PlayerNextSlot >= table.MaxPlayers)
+                throw new OutOfMemoryException("AnimationTable players exhausted.");
+            slot = (uint)table.PlayerNextSlot++;
+        }
+
+        var handle = AnimPlayerHandle.Create(slot, table.PlayerGens[slot]);
         int idx = table.PlayerCount++;
+        table.PlayerSlotToDense[slot] = idx;
         table.Players[idx] = new AnimPlayerData
         {
+            Handle = handle,
             Entity = entity,
             OwnerScene = scene,
             Skeleton = skeleton,
@@ -276,7 +334,45 @@ public static unsafe class AnimationSystem
             Loop = (byte)(loop ? 1 : 0),
             Playing = 1,
         };
-        return idx;
+        return handle;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static AnimPlayerData* TryGetPlayer(in AnimationTable table, AnimPlayerHandle handle)
+    {
+        if (!handle.IsValid) return null;
+        uint slot = handle.Index;
+        if (slot >= (uint)table.MaxPlayers) return null;
+        if (table.PlayerGens[slot] != handle.Generation) return null;
+        int d = table.PlayerSlotToDense[slot];
+        return (d >= 0 && d < table.PlayerCount) ? table.Players + d : null;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static AnimPlayerData* TryGetPlayerPtr(in AnimationTable table, AnimPlayerHandle handle)
+        => TryGetPlayer(in table, handle);
+
+    public static bool RemovePlayer(ref AnimationTable table, AnimPlayerHandle handle)
+    {
+        AnimPlayerData* ptr = TryGetPlayer(in table, handle);
+        if (ptr == null) return false;
+        RemovePlayerDenseAt(ref table, (int)(ptr - table.Players));
+        return true;
+    }
+
+    private static void RemovePlayerDenseAt(ref AnimationTable table, int denseIdx)
+    {
+        uint slot = table.Players[denseIdx].Handle.Index;
+        table.PlayerGens[slot] = HandlePacking.NextGeneration(table.PlayerGens[slot]);
+        table.PlayerSlotToDense[slot] = -1;
+        table.PlayerFreeSlots[table.PlayerFreeCount++] = slot;
+
+        int last = --table.PlayerCount;
+        if (denseIdx != last)
+        {
+            table.Players[denseIdx] = table.Players[last];
+            table.PlayerSlotToDense[table.Players[denseIdx].Handle.Index] = denseIdx;
+        }
     }
 
     public static void Crossfade(ref AnimationTable table, EntityId entity, AnimClipHandle nextClip, float duration)
@@ -294,29 +390,66 @@ public static unsafe class AnimationSystem
         }
     }
 
-    public static int FindPlayerByEntity(in AnimationTable table, EntityId entity)
+    public static void Crossfade(ref AnimationTable table, AnimPlayerHandle handle, AnimClipHandle nextClip, float duration)
+    {
+        AnimPlayerData* p = TryGetPlayer(in table, handle);
+        if (p == null) return;
+        p->NextClip = nextClip;
+        p->NextTime = 0f;
+        p->CrossfadeElapsed = 0f;
+        p->CrossfadeDuration = duration > 0f ? duration : 0.001f;
+    }
+
+    public static AnimPlayerHandle FindPlayerByEntity(in AnimationTable table, EntityId entity)
     {
         for (int i = 0; i < table.PlayerCount; i++)
-            if (table.Players[i].Entity == entity) return i;
-        return -1;
+            if (table.Players[i].Entity == entity) return table.Players[i].Handle;
+        return AnimPlayerHandle.Invalid;
     }
 
     public static int RegisterSpriteClip(ref AnimationTable table, in SpriteAnimClipData clip)
     {
-        if (table.SpriteClipCount >= table.MaxSpriteClips)
-            throw new OutOfMemoryException("SpriteAnimClips exhausted.");
-        int idx = table.SpriteClipCount++;
-        table.SpriteClips[idx] = clip;
-        return idx;
+        if (clip.Name.Value != 0)
+        {
+            for (int i = 0; i < table.MaxSpriteClips; i++)
+            {
+                if (table.SpriteClipAlive[i] != 0 && table.SpriteClips[i].Name == clip.Name)
+                    return i;
+            }
+        }
+        for (int i = 0; i < table.MaxSpriteClips; i++)
+        {
+            if (table.SpriteClipAlive[i] == 0)
+            {
+                table.SpriteClipAlive[i] = 1;
+                table.SpriteClips[i] = clip;
+                table.SpriteClipCount++;
+                return i;
+            }
+        }
+        throw new OutOfMemoryException("SpriteAnimClips exhausted.");
     }
 
-    public static int AddSpritePlayer(ref AnimationTable table, EntityId entity, int clipIndex, SceneId scene = default, float speed = 1f)
+    public static SpriteAnimPlayerHandle AddSpritePlayer(ref AnimationTable table, EntityId entity, int clipIndex, SceneId scene = default, float speed = 1f)
     {
-        if (table.SpritePlayerCount >= table.MaxSpritePlayers)
-            throw new OutOfMemoryException("SpriteAnimPlayers exhausted.");
+        uint slot;
+        if (table.SpritePlayerFreeCount > 0)
+        {
+            slot = table.SpritePlayerFreeSlots[--table.SpritePlayerFreeCount];
+        }
+        else
+        {
+            if (table.SpritePlayerNextSlot >= table.MaxSpritePlayers)
+                throw new OutOfMemoryException("SpriteAnimPlayers exhausted.");
+            slot = (uint)table.SpritePlayerNextSlot++;
+        }
+
+        var handle = SpriteAnimPlayerHandle.Create(slot, table.SpritePlayerGens[slot]);
         int idx = table.SpritePlayerCount++;
+        table.SpritePlayerSlotToDense[slot] = idx;
         table.SpritePlayers[idx] = new SpriteAnimPlayerData
         {
+            Handle = handle,
             Entity = entity,
             OwnerScene = scene,
             ClipIndex = clipIndex,
@@ -324,7 +457,45 @@ public static unsafe class AnimationSystem
             Playing = 1,
             CurrentUvRect = new Vec4(0, 0, 1, 1),
         };
-        return idx;
+        return handle;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static SpriteAnimPlayerData* TryGetSpritePlayer(in AnimationTable table, SpriteAnimPlayerHandle handle)
+    {
+        if (!handle.IsValid) return null;
+        uint slot = handle.Index;
+        if (slot >= (uint)table.MaxSpritePlayers) return null;
+        if (table.SpritePlayerGens[slot] != handle.Generation) return null;
+        int d = table.SpritePlayerSlotToDense[slot];
+        return (d >= 0 && d < table.SpritePlayerCount) ? table.SpritePlayers + d : null;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static SpriteAnimPlayerData* TryGetSpritePlayerPtr(in AnimationTable table, SpriteAnimPlayerHandle handle)
+        => TryGetSpritePlayer(in table, handle);
+
+    public static bool RemoveSpritePlayer(ref AnimationTable table, SpriteAnimPlayerHandle handle)
+    {
+        SpriteAnimPlayerData* ptr = TryGetSpritePlayer(in table, handle);
+        if (ptr == null) return false;
+        RemoveSpritePlayerDenseAt(ref table, (int)(ptr - table.SpritePlayers));
+        return true;
+    }
+
+    private static void RemoveSpritePlayerDenseAt(ref AnimationTable table, int denseIdx)
+    {
+        uint slot = table.SpritePlayers[denseIdx].Handle.Index;
+        table.SpritePlayerGens[slot] = HandlePacking.NextGeneration(table.SpritePlayerGens[slot]);
+        table.SpritePlayerSlotToDense[slot] = -1;
+        table.SpritePlayerFreeSlots[table.SpritePlayerFreeCount++] = slot;
+
+        int last = --table.SpritePlayerCount;
+        if (denseIdx != last)
+        {
+            table.SpritePlayers[denseIdx] = table.SpritePlayers[last];
+            table.SpritePlayerSlotToDense[table.SpritePlayers[denseIdx].Handle.Index] = denseIdx;
+        }
     }
 
     public static void RemoveByScene(ref AnimationTable table, SceneId scene)
@@ -332,12 +503,23 @@ public static unsafe class AnimationSystem
         for (int i = table.PlayerCount - 1; i >= 0; i--)
         {
             if (table.Players[i].OwnerScene == scene)
-                table.Players[i] = table.Players[--table.PlayerCount];
+                RemovePlayerDenseAt(ref table, i);
         }
         for (int i = table.SpritePlayerCount - 1; i >= 0; i--)
         {
             if (table.SpritePlayers[i].OwnerScene == scene)
-                table.SpritePlayers[i] = table.SpritePlayers[--table.SpritePlayerCount];
+                RemoveSpritePlayerDenseAt(ref table, i);
+        }
+        if (scene.IsValid)
+        {
+            for (int i = 0; i < table.MaxSpriteClips; i++)
+            {
+                if (table.SpriteClipAlive[i] != 0 && table.SpriteClips[i].OwnerScene == scene)
+                {
+                    table.SpriteClipAlive[i] = 0;
+                    table.SpriteClipCount--;
+                }
+            }
         }
     }
 
@@ -346,12 +528,12 @@ public static unsafe class AnimationSystem
         for (int i = table.PlayerCount - 1; i >= 0; i--)
         {
             if (table.Players[i].Entity == entity)
-                table.Players[i] = table.Players[--table.PlayerCount];
+                RemovePlayerDenseAt(ref table, i);
         }
         for (int i = table.SpritePlayerCount - 1; i >= 0; i--)
         {
             if (table.SpritePlayers[i].Entity == entity)
-                table.SpritePlayers[i] = table.SpritePlayers[--table.SpritePlayerCount];
+                RemoveSpritePlayerDenseAt(ref table, i);
         }
     }
 
@@ -404,9 +586,23 @@ public static unsafe class AnimationSystem
             AnimClipData* nextClip = TryGetClip(in table, p.NextClip);
             if (nextClip != null && p.CrossfadeDuration > 0f)
             {
-                p.NextTime += dt * p.Speed;
-                if (nextClip->Duration > 0f && p.Loop != 0) p.NextTime %= nextClip->Duration;
-                p.CrossfadeElapsed += dt;
+                if (p.Playing != 0)
+                {
+                    if (nextClip->Duration > 0f)
+                    {
+                        p.NextTime += dt * p.Speed;
+                        if (p.Loop != 0)
+                        {
+                            p.NextTime %= nextClip->Duration;
+                            if (p.NextTime < 0f) p.NextTime += nextClip->Duration;
+                        }
+                        else
+                        {
+                            p.NextTime = DetMath.Clamp(p.NextTime, 0f, nextClip->Duration);
+                        }
+                    }
+                    p.CrossfadeElapsed += dt;
+                }
                 blendAlpha = DetMath.Clamp01(p.CrossfadeElapsed / p.CrossfadeDuration);
                 if (blendAlpha >= 1f)
                 {
@@ -421,11 +617,20 @@ public static unsafe class AnimationSystem
             }
 
             int jc = skel->JointCount;
+            if (jc <= 0)
+            {
+                p.FrameJointOffset = jointCursor;
+                p.FrameJointCount = 0;
+                continue;
+            }
+
             ArenaMarker mark = scratchArena.SaveMarker();
             Vec3* pos = scratchArena.AllocUninitialized<Vec3>(jc, 16);
             Quat* rot = scratchArena.AllocUninitialized<Quat>(jc, 16);
             Vec3* scl = scratchArena.AllocUninitialized<Vec3>(jc, 16);
+            Mat4* localMats = scratchArena.AllocUninitialized<Mat4>(jc, 64);
             Mat4* worldMats = scratchArena.AllocUninitialized<Mat4>(jc, 64);
+            byte* computed = scratchArena.Alloc<byte>(jc, 16);
 
             for (int j = 0; j < jc; j++)
             {
@@ -443,13 +648,58 @@ public static unsafe class AnimationSystem
             p.FrameJointOffset = jointCursor;
             p.FrameJointCount = jc;
 
+            bool anyUnresolved = false;
             for (int j = 0; j < jc; j++)
             {
-                Mat4 local = Mat4.CreateTRS(pos[j], rot[j], scl[j]);
+                localMats[j] = Mat4.CreateTRS(pos[j], rot[j], scl[j]);
                 int parent = skel->ParentIndices[j];
-                worldMats[j] = (parent >= 0 && parent < j) ? Mat4.Multiply(in worldMats[parent], in local) : local;
-                table.FrameJointPalette[jointCursor + j] = Mat4.Multiply(in worldMats[j], in skel->InverseBindMatrices[j]);
+                if ((uint)parent >= (uint)jc || parent == j)
+                {
+                    worldMats[j] = localMats[j];
+                    computed[j] = 2;
+                }
+                else if (parent < j && computed[parent] == 2)
+                {
+                    worldMats[j] = Mat4.Multiply(in worldMats[parent], in localMats[j]);
+                    computed[j] = 2;
+                }
+                else
+                {
+                    anyUnresolved = true;
+                }
             }
+
+            if (anyUnresolved)
+            {
+                int* stack = scratchArena.AllocUninitialized<int>(jc, 16);
+                for (int j = 0; j < jc; j++)
+                {
+                    if (computed[j] == 2) continue;
+                    int sp = 0;
+                    int cur = j;
+                    while (true)
+                    {
+                        computed[cur] = 1;
+                        stack[sp++] = cur;
+                        int parent = skel->ParentIndices[cur];
+                        if ((uint)parent >= (uint)jc || parent == cur || computed[parent] == 2 || computed[parent] == 1)
+                            break;
+                        cur = parent;
+                    }
+                    for (int s = sp - 1; s >= 0; s--)
+                    {
+                        int node = stack[s];
+                        int parent = skel->ParentIndices[node];
+                        worldMats[node] = ((uint)parent < (uint)jc && computed[parent] == 2)
+                            ? Mat4.Multiply(in worldMats[parent], in localMats[node])
+                            : localMats[node];
+                        computed[node] = 2;
+                    }
+                }
+            }
+
+            for (int j = 0; j < jc; j++)
+                table.FrameJointPalette[jointCursor + j] = Mat4.Multiply(in worldMats[j], in skel->InverseBindMatrices[j]);
 
             jointCursor += jc;
             scratchArena.Rollback(mark);
@@ -459,14 +709,14 @@ public static unsafe class AnimationSystem
         for (int i = 0; i < table.SpritePlayerCount; i++)
         {
             ref SpriteAnimPlayerData sp = ref table.SpritePlayers[i];
-            if ((uint)sp.ClipIndex >= (uint)table.SpriteClipCount) continue;
+            if ((uint)sp.ClipIndex >= (uint)table.MaxSpriteClips || table.SpriteClipAlive[sp.ClipIndex] == 0) continue;
             ref SpriteAnimClipData clip = ref table.SpriteClips[sp.ClipIndex];
             if (clip.FrameCount <= 0 || clip.Columns <= 0 || clip.Rows <= 0) continue;
 
             if (sp.Playing != 0)
                 sp.Time += dt * sp.Speed;
 
-            int frameOffset = (int)(sp.Time * clip.Fps);
+            int frameOffset = (int)MathF.Floor(sp.Time * clip.Fps);
             if (clip.Loop != 0)
                 frameOffset = ((frameOffset % clip.FrameCount) + clip.FrameCount) % clip.FrameCount;
             else
@@ -531,8 +781,53 @@ public static unsafe class AnimationSystem
             float* p0 = sampler.Values + k0 * stride + valOffset;
             float* p1 = sampler.Values + k1 * stride + valOffset;
 
+            if (sampler.Interpolation == AnimInterpolation.CubicSpline && k0 != k1)
+            {
+                float t = alpha;
+                float t2 = t * t;
+                float t3 = t2 * t;
+                float h00 = 2f * t3 - 3f * t2 + 1f;
+                float h10 = (t3 - 2f * t2 + t) * keyDelta;
+                float h01 = -2f * t3 + 3f * t2;
+                float h11 = (t3 - t2) * keyDelta;
+
+                float* b0 = sampler.Values + k0 * stride + 2 * valOffset; // out-tangent of k0
+                float* a1 = sampler.Values + k1 * stride;                   // in-tangent of k1
+
+                if (ch.Path == AnimTargetPath.Translation)
+                {
+                    if (sampler.ComponentsPerValue < 3) continue;
+                    Vec3 sampled = new Vec3(
+                        h00 * p0[0] + h10 * b0[0] + h01 * p1[0] + h11 * a1[0],
+                        h00 * p0[1] + h10 * b0[1] + h01 * p1[1] + h11 * a1[1],
+                        h00 * p0[2] + h10 * b0[2] + h01 * p1[2] + h11 * a1[2]);
+                    pos[ch.TargetJointIndex] = weight >= 0.999f ? sampled : Vec3.Lerp(pos[ch.TargetJointIndex], sampled, weight);
+                }
+                else if (ch.Path == AnimTargetPath.Scale)
+                {
+                    if (sampler.ComponentsPerValue < 3) continue;
+                    Vec3 sampled = new Vec3(
+                        h00 * p0[0] + h10 * b0[0] + h01 * p1[0] + h11 * a1[0],
+                        h00 * p0[1] + h10 * b0[1] + h01 * p1[1] + h11 * a1[1],
+                        h00 * p0[2] + h10 * b0[2] + h01 * p1[2] + h11 * a1[2]);
+                    scl[ch.TargetJointIndex] = weight >= 0.999f ? sampled : Vec3.Lerp(scl[ch.TargetJointIndex], sampled, weight);
+                }
+                else if (ch.Path == AnimTargetPath.Rotation)
+                {
+                    if (sampler.ComponentsPerValue < 4) continue;
+                    Quat sampled = new Quat(
+                        h00 * p0[0] + h10 * b0[0] + h01 * p1[0] + h11 * a1[0],
+                        h00 * p0[1] + h10 * b0[1] + h01 * p1[1] + h11 * a1[1],
+                        h00 * p0[2] + h10 * b0[2] + h01 * p1[2] + h11 * a1[2],
+                        h00 * p0[3] + h10 * b0[3] + h01 * p1[3] + h11 * a1[3]).Normalized();
+                    rot[ch.TargetJointIndex] = weight >= 0.999f ? sampled : Quat.Slerp(rot[ch.TargetJointIndex], sampled, weight);
+                }
+                continue;
+            }
+
             if (ch.Path == AnimTargetPath.Translation)
             {
+                if (sampler.ComponentsPerValue < 3) continue;
                 Vec3 v0 = new Vec3(p0[0], p0[1], p0[2]);
                 Vec3 v1 = new Vec3(p1[0], p1[1], p1[2]);
                 Vec3 sampled = Vec3.Lerp(v0, v1, alpha);
@@ -540,6 +835,7 @@ public static unsafe class AnimationSystem
             }
             else if (ch.Path == AnimTargetPath.Scale)
             {
+                if (sampler.ComponentsPerValue < 3) continue;
                 Vec3 v0 = new Vec3(p0[0], p0[1], p0[2]);
                 Vec3 v1 = new Vec3(p1[0], p1[1], p1[2]);
                 Vec3 sampled = Vec3.Lerp(v0, v1, alpha);
@@ -547,9 +843,10 @@ public static unsafe class AnimationSystem
             }
             else if (ch.Path == AnimTargetPath.Rotation)
             {
-                Quat q0 = new Quat(p0[0], p0[1], p0[2], p0[3]);
-                Quat q1 = new Quat(p1[0], p1[1], p1[2], p1[3]);
-                Quat sampled = Quat.Slerp(q0, q1, alpha);
+                if (sampler.ComponentsPerValue < 4) continue;
+                Quat q0 = new Quat(p0[0], p0[1], p0[2], p0[3]).Normalized();
+                Quat q1 = new Quat(p1[0], p1[1], p1[2], p1[3]).Normalized();
+                Quat sampled = k0 == k1 ? q0 : Quat.Slerp(q0, q1, alpha);
                 rot[ch.TargetJointIndex] = weight >= 0.999f ? sampled : Quat.Slerp(rot[ch.TargetJointIndex], sampled, weight);
             }
         }

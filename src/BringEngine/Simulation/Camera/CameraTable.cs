@@ -264,29 +264,39 @@ public static unsafe class CameraSystem
             ref CameraData cam = ref table.Slots[i];
             if (cam.Enabled == 0) continue;
 
-            // Update controller mode
+            // Update controller mode (hold last valid position/target if target entity was destroyed)
             if (cam.Mode == CameraMode.FollowTarget && cam.TargetEntity.IsValid)
             {
-                Vec3 targetPos = TransformSystem.GetWorldPosition(in transforms, cam.TargetEntity);
-                Vec3 desiredPos = targetPos + cam.FollowOffset;
-                float t = cam.FollowDamping > 0f ? DetMath.Clamp01(1f - DetMath.Exp(-cam.FollowDamping * dt)) : 1f;
-                cam.Position = Vec3.Lerp(cam.Position, desiredPos, t);
-                cam.LookTarget = Vec3.Lerp(cam.LookTarget, targetPos + cam.LookOffset, t);
+                int td = TransformSystem.GetDenseIndex(in transforms, cam.TargetEntity);
+                if (td >= 0)
+                {
+                    Vec3 targetPos = transforms.WorldPosition[td];
+                    Vec3 desiredPos = targetPos + cam.FollowOffset;
+                    float t = cam.FollowDamping > 0f ? DetMath.Clamp01(1f - DetMath.Exp(-cam.FollowDamping * dt)) : 1f;
+                    cam.Position = Vec3.Lerp(cam.Position, desiredPos, t);
+                    cam.LookTarget = Vec3.Lerp(cam.LookTarget, targetPos + cam.LookOffset, t);
+                }
             }
             else if (cam.Mode == CameraMode.OrbitTarget && cam.TargetEntity.IsValid)
             {
-                Vec3 pivot = TransformSystem.GetWorldPosition(in transforms, cam.TargetEntity) + cam.LookOffset;
-                float cp = DetMath.Cos(cam.OrbitPitch);
-                Vec3 offset = new Vec3(
-                    DetMath.Sin(cam.OrbitYaw) * cp * cam.OrbitDistance,
-                    DetMath.Sin(cam.OrbitPitch) * cam.OrbitDistance,
-                    DetMath.Cos(cam.OrbitYaw) * cp * cam.OrbitDistance);
-                cam.Position = pivot + offset;
-                cam.LookTarget = pivot;
+                int td = TransformSystem.GetDenseIndex(in transforms, cam.TargetEntity);
+                if (td >= 0)
+                {
+                    Vec3 pivot = transforms.WorldPosition[td] + cam.LookOffset;
+                    float cp = DetMath.Cos(cam.OrbitPitch);
+                    Vec3 offset = new Vec3(
+                        DetMath.Sin(cam.OrbitYaw) * cp * cam.OrbitDistance,
+                        DetMath.Sin(cam.OrbitPitch) * cam.OrbitDistance,
+                        DetMath.Cos(cam.OrbitYaw) * cp * cam.OrbitDistance);
+                    cam.Position = pivot + offset;
+                    cam.LookTarget = pivot;
+                }
             }
             else if (cam.Mode == CameraMode.LookAtTarget && cam.TargetEntity.IsValid)
             {
-                cam.LookTarget = TransformSystem.GetWorldPosition(in transforms, cam.TargetEntity) + cam.LookOffset;
+                int td = TransformSystem.GetDenseIndex(in transforms, cam.TargetEntity);
+                if (td >= 0)
+                    cam.LookTarget = transforms.WorldPosition[td] + cam.LookOffset;
             }
             else if (cam.Entity.IsValid)
             {
@@ -301,6 +311,7 @@ public static unsafe class CameraSystem
 
             // Deterministic trauma screen shake (multi-frequency trigonometric noise)
             Vec3 shakeOffset = Vec3.Zero;
+            float shakeRoll = 0f;
             if (cam.Trauma > 0f)
             {
                 cam.ShakeClock += dt * 31.0f;
@@ -309,6 +320,8 @@ public static unsafe class CameraSystem
                 float sy = DetMath.Sin(cam.ShakeClock * 1.71f + 1.3f) * DetMath.Cos(cam.ShakeClock * 2.91f);
                 float sz = DetMath.Sin(cam.ShakeClock * 1.43f + 2.7f);
                 shakeOffset = new Vec3(sx, sy, sz * 0.4f) * (cam.MaxShakePos * shake);
+                if (cam.MaxShakeAngle > 0f)
+                    shakeRoll = DetMath.Sin(cam.ShakeClock * 1.93f + 0.7f) * cam.MaxShakeAngle * shake;
                 cam.Trauma = DetMath.Max(0f, cam.Trauma - cam.TraumaDecay * dt);
             }
 
@@ -317,9 +330,21 @@ public static unsafe class CameraSystem
             float vpH = viewportHeight * cam.ViewportRect.W;
             float aspect = vpH > 0f ? vpW / vpH : 16f / 9f;
 
+            Vec3 shakenTarget = cam.Projection == CameraProjection.Perspective
+                ? cam.LookTarget + shakeOffset * 0.35f
+                : cam.LookTarget + shakeOffset;
+
+            Vec3 effectiveUp = cam.Up;
+            if (shakeRoll != 0f)
+            {
+                Vec3 fwdAxis = (shakenTarget - cam.ShakenPosition).Normalized();
+                if (fwdAxis.LengthSq() > 1e-6f)
+                    effectiveUp = Quat.FromAxisAngle(fwdAxis, shakeRoll).Rotate(cam.Up);
+            }
+
             if (cam.Projection == CameraProjection.Perspective)
             {
-                cam.ViewMatrix = Mat4.CreateLookAt(cam.ShakenPosition, cam.LookTarget + shakeOffset * 0.35f, cam.Up);
+                cam.ViewMatrix = Mat4.CreateLookAt(cam.ShakenPosition, shakenTarget, effectiveUp);
                 cam.ProjMatrix = Mat4.CreatePerspective(cam.FovYDeg * DetMath.Deg2Rad, aspect, cam.NearPlane, cam.FarPlane);
             }
             else
@@ -327,7 +352,7 @@ public static unsafe class CameraSystem
                 // UI / 2D orthographic: origin top-left or centered via Position
                 float halfH = cam.OrthoHeight * 0.5f;
                 float halfW = halfH * aspect;
-                cam.ViewMatrix = Mat4.CreateLookAt(cam.ShakenPosition, cam.LookTarget, cam.Up);
+                cam.ViewMatrix = Mat4.CreateLookAt(cam.ShakenPosition, shakenTarget, effectiveUp);
                 cam.ProjMatrix = Mat4.CreateOrtho(-halfW, halfW, -halfH, halfH, cam.NearPlane, cam.FarPlane);
             }
 
@@ -347,6 +372,8 @@ public static unsafe class CameraSystem
     /// </summary>
     public static Ray ScreenToWorldRay(in CameraData cam, float screenX, float screenY, float screenW, float screenH)
     {
+        if (screenW < 1f) screenW = 1f;
+        if (screenH < 1f) screenH = 1f;
         float ndcX = (screenX / screenW) * 2f - 1f;
         float ndcY = 1f - (screenY / screenH) * 2f;
 

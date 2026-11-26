@@ -135,7 +135,8 @@ public unsafe struct LoopbackEndpoint
     internal int DisconnectReason;
     internal int MaxPacketBytes;
     internal byte* PollScratch;
-    internal uint LastSeqReceived;
+    internal uint LastUnreliableSequencedSeq;
+    internal byte HasUnreliableSequenced;
     internal int LastOrderedDeliverTick;
     internal long PacketsSent;
     internal long PacketsReceived;
@@ -324,58 +325,70 @@ public static unsafe class LoopbackTransportSystem
             return true;
         }
 
-        LoopbackLink* link = ep->Link;
-        int bestIdx = -1;
-        uint bestSeq = uint.MaxValue;
-
-        for (int i = 0; i < link->QueueCapacity; i++)
-        {
-            ref LoopbackQueuedPacket q = ref link->Queue[i];
-            if (q.Active == 0 || q.DestEndpoint != ep->EndpointIndex) continue;
-            if (q.DeliverAtTick > link->CurrentTick) continue;
-
-            // ReliableOrdered preserves send sequence order; pick earliest eligible sequence
-            if (bestIdx < 0 || q.Sequence < bestSeq)
-            {
-                bestIdx = i;
-                bestSeq = q.Sequence;
-            }
-        }
-
-        if (bestIdx < 0)
+        if (ep->Connected == 0)
         {
             ev = default;
             return false;
         }
 
-        LoopbackQueuedPacket pkt = link->Queue[bestIdx];
-        link->Queue[bestIdx].Active = 0;
-
-        // Drop stale out-of-order packets for UnreliableSequenced
-        if (pkt.Delivery == NetDeliveryMode.UnreliableSequenced && pkt.Sequence < ep->LastSeqReceived)
+        LoopbackLink* link = ep->Link;
+        while (true)
         {
-            link->TotalDropped++;
-            return PollImpl(ctx, out ev);
+            int bestIdx = -1;
+            uint bestSeq = 0;
+
+            for (int i = 0; i < link->QueueCapacity; i++)
+            {
+                ref LoopbackQueuedPacket q = ref link->Queue[i];
+                if (q.Active == 0 || q.DestEndpoint != ep->EndpointIndex) continue;
+                if (q.DeliverAtTick > link->CurrentTick) continue;
+
+                // ReliableOrdered preserves send sequence order; pick earliest eligible sequence (wraparound-safe)
+                if (bestIdx < 0 || (int)(q.Sequence - bestSeq) < 0)
+                {
+                    bestIdx = i;
+                    bestSeq = q.Sequence;
+                }
+            }
+
+            if (bestIdx < 0)
+            {
+                ev = default;
+                return false;
+            }
+
+            LoopbackQueuedPacket pkt = link->Queue[bestIdx];
+            link->Queue[bestIdx].Active = 0;
+
+            // Drop stale out-of-order packets for UnreliableSequenced independently from other delivery modes
+            if (pkt.Delivery == NetDeliveryMode.UnreliableSequenced)
+            {
+                if (ep->HasUnreliableSequenced != 0 && (int)(pkt.Sequence - ep->LastUnreliableSequencedSeq) < 0)
+                {
+                    link->TotalDropped++;
+                    continue;
+                }
+                ep->HasUnreliableSequenced = 1;
+                ep->LastUnreliableSequencedSeq = pkt.Sequence;
+            }
+
+            if (pkt.Length > 0)
+                Buffer.MemoryCopy(link->PayloadPool + pkt.DataOffset, ep->PollScratch, ep->MaxPacketBytes, pkt.Length);
+
+            ep->PacketsReceived++;
+            ep->BytesReceived += pkt.Length;
+
+            ev = new NetTransportEvent
+            {
+                Kind = NetTransportEventKind.PacketReceived,
+                Delivery = pkt.Delivery,
+                Channel = pkt.Channel,
+                PeerId = remoteId,
+                PayloadPtr = pkt.Length > 0 ? ep->PollScratch : null,
+                PayloadLength = pkt.Length,
+            };
+            return true;
         }
-        if (pkt.Sequence > ep->LastSeqReceived)
-            ep->LastSeqReceived = pkt.Sequence;
-
-        if (pkt.Length > 0)
-            Buffer.MemoryCopy(link->PayloadPool + pkt.DataOffset, ep->PollScratch, ep->MaxPacketBytes, pkt.Length);
-
-        ep->PacketsReceived++;
-        ep->BytesReceived += pkt.Length;
-
-        ev = new NetTransportEvent
-        {
-            Kind = NetTransportEventKind.PacketReceived,
-            Delivery = pkt.Delivery,
-            Channel = pkt.Channel,
-            PeerId = remoteId,
-            PayloadPtr = pkt.Length > 0 ? ep->PollScratch : null,
-            PayloadLength = pkt.Length,
-        };
-        return true;
     }
 
     private static void DisconnectImpl(void* ctx, uint peerId, int reason)
@@ -396,6 +409,10 @@ public static unsafe class LoopbackTransportSystem
             other->PendingDisconnectEvent = 1;
             other->DisconnectReason = reason;
         }
+
+        // Discard any in-flight queued packets on disconnect so post-disconnect polls deliver nothing
+        for (int i = 0; i < link->QueueCapacity; i++)
+            link->Queue[i].Active = 0;
     }
 
     private static NetTransportStats GetStatsImpl(void* ctx)
@@ -403,11 +420,15 @@ public static unsafe class LoopbackTransportSystem
         LoopbackEndpoint* ep = (LoopbackEndpoint*)ctx;
         if (ep == null || ep->Link == null) return default;
         LoopbackLink* link = ep->Link;
+        int latencyTicks = link->Config.OneWayLatencyTicks > 0 ? link->Config.OneWayLatencyTicks : 0;
+        float lossRatio = link->Config.PacketLossPermille <= 0
+            ? 0f
+            : (link->Config.PacketLossPermille >= 1000 ? 1f : link->Config.PacketLossPermille / 1000f);
         return new NetTransportStats
         {
             ConnectedPeers = ep->Connected,
-            RttMs = (link->Config.OneWayLatencyTicks * 2) * 16,
-            PacketLossRatio = link->Config.PacketLossPermille / 1000f,
+            RttMs = (latencyTicks * 2) * 16,
+            PacketLossRatio = lossRatio,
             PacketsSent = ep->PacketsSent,
             PacketsReceived = ep->PacketsReceived,
             PacketsDropped = link->TotalDropped,

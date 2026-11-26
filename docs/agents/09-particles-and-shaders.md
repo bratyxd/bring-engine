@@ -11,6 +11,7 @@ cfg.EmitRate = 60f;
 cfg.StartColor = ColorF.Cyan;
 cfg.EndColor = new ColorF(0.1f, 0.2f, 1f, 0f);
 cfg.FollowEntity = playerEntity; // optional entity tracking
+cfg.StretchedBillboard = 1;       // optional velocity/streak billboard stretch (RotExtra.y)
 
 EmitterHandle emitter = ParticleSystem.CreateEmitter(ref particles, in cfg, sceneId);
 
@@ -23,9 +24,9 @@ ParticleSystem.Step(ref particles, in transforms, dt);
 
 ## Custom Shaders (`ShaderSystem` — Added in Phase 6-7)
 Bring Engine uses **HLSL** as its unified cross-platform shader language, compiled automatically via **`SDL_shadercross`** into DXIL (D3D12), SPIR-V (Vulkan), or MSL (Metal) matching the active GPU backend:
-- Built-in shaders: `pbr_mesh.hlsl`, `sprite_3d.hlsl`, `sdf_text.hlsl`, `particle.hlsl`.
-- Games can register custom HLSL shaders via `ShaderSystem.CompileFromFile(...)` and attach them to:
-  - 3D `MaterialData.CustomShader` + `CustomParams` (`Vec4` animatable with `TweenSystem`!)
+- Built-in shaders: `pbr_mesh.hlsl`, `shadow_depth.hlsl`, `shadow_depth_mask.hlsl`, `sprite_3d.hlsl`, `sdf_text.hlsl`, `particle.hlsl`.
+- Games can register custom HLSL shaders via `ShaderSystem.CompileFromFile(...)` / `ShaderSystem.CompileFromSource(...)` (and unload via `ShaderSystem.ReleaseShader(...)`) and attach them to:
+  - 3D `MaterialAssetData.CustomShader` + `CustomParams` (`Vec4` animatable with `TweenSystem`!)
   - 2D `SpriteData.CustomShader` + `CustomParams`
-  - SDF `TextData.CustomShader` + `EffectParams`
+  - SDF `TextData.CustomShader` + `CustomParams` (forwarded to `GlyphGpuInstance`)
   - `ParticleEmitterData.CustomShader`

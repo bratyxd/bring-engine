@@ -60,31 +60,41 @@ public static unsafe class TextureCompressionSystem
     public static int CalcByteSize(TexturePixelFormat fmt, int width, int height)
     {
         if (width <= 0 || height <= 0) return 0;
+        long bytes;
         switch (fmt)
         {
             case TexturePixelFormat.R8:
-                return width * height;
+                bytes = (long)width * height;
+                break;
             case TexturePixelFormat.Bc1Rgba:
             {
-                int bx = (width + 3) >> 2;
-                int by = (height + 3) >> 2;
-                return bx * by * 8;
+                long bx = (width + 3L) >> 2;
+                long by = (height + 3L) >> 2;
+                bytes = bx * by * 8L;
+                break;
             }
             case TexturePixelFormat.Bc3Rgba:
             {
-                int bx = (width + 3) >> 2;
-                int by = (height + 3) >> 2;
-                return bx * by * 16;
+                long bx = (width + 3L) >> 2;
+                long by = (height + 3L) >> 2;
+                bytes = bx * by * 16L;
+                break;
             }
             default:
-                return width * height * 4;
+                bytes = (long)width * height * 4L;
+                break;
         }
+        if (bytes > int.MaxValue)
+            throw new OverflowException($"Texture byte size exceeds 2GB ({width}x{height}, {fmt}).");
+        return (int)bytes;
     }
 
     public static bool HasTransparency(byte* rgba, int width, int height)
     {
-        int count = width * height;
-        for (int i = 0; i < count; i++)
+        if (rgba == null) throw new ArgumentNullException(nameof(rgba));
+        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+        long count = (long)width * height;
+        for (long i = 0; i < count; i++)
         {
             if (rgba[i * 4 + 3] < 255) return true;
         }
@@ -144,6 +154,10 @@ public static unsafe class TextureCompressionSystem
 
     public static void EncodeBc1(byte* rgba, int width, int height, byte* dstBlocks, JobScheduler* jobs = null)
     {
+        if (rgba == null) throw new ArgumentNullException(nameof(rgba));
+        if (dstBlocks == null) throw new ArgumentNullException(nameof(dstBlocks));
+        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+
         int bx = (width + 3) >> 2;
         int by = (height + 3) >> 2;
         var ctx = new BcEncodeJobCtx { SrcRgba = rgba, DstBlocks = dstBlocks, Width = width, Height = height, BlocksX = bx, IsBc3 = 0 };
@@ -152,6 +166,10 @@ public static unsafe class TextureCompressionSystem
 
     public static void EncodeBc3(byte* rgba, int width, int height, byte* dstBlocks, JobScheduler* jobs = null)
     {
+        if (rgba == null) throw new ArgumentNullException(nameof(rgba));
+        if (dstBlocks == null) throw new ArgumentNullException(nameof(dstBlocks));
+        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+
         int bx = (width + 3) >> 2;
         int by = (height + 3) >> 2;
         var ctx = new BcEncodeJobCtx { SrcRgba = rgba, DstBlocks = dstBlocks, Width = width, Height = height, BlocksX = bx, IsBc3 = 1 };
@@ -170,6 +188,9 @@ public static unsafe class TextureCompressionSystem
         out int outBytes,
         JobScheduler* jobs = null)
     {
+        if (rgba == null) throw new ArgumentNullException(nameof(rgba));
+        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+
         outBytes = CalcByteSize(targetFormat, width, height);
         byte* dst = dstArena.AllocUninitialized<byte>(outBytes, 64);
         if (targetFormat == TexturePixelFormat.Bc1Rgba)
@@ -194,6 +215,9 @@ public static unsafe class TextureCompressionSystem
         bool nearest = false,
         JobScheduler* jobs = null)
     {
+        if (rgba == null) throw new ArgumentNullException(nameof(rgba));
+        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+
         TexturePixelFormat fmt = ResolveFormat(policy, rgba, width, height);
         int dataBytes = CalcByteSize(fmt, width, height);
         int headerSize = sizeof(BrtxHeader);
@@ -227,6 +251,10 @@ public static unsafe class TextureCompressionSystem
 
     public static void DecodeBc1ToRgba(byte* srcBlocks, int width, int height, byte* dstRgba)
     {
+        if (srcBlocks == null) throw new ArgumentNullException(nameof(srcBlocks));
+        if (dstRgba == null) throw new ArgumentNullException(nameof(dstRgba));
+        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+
         int bxCount = (width + 3) >> 2;
         int byCount = (height + 3) >> 2;
         byte* blockOut = stackalloc byte[64];
@@ -243,6 +271,10 @@ public static unsafe class TextureCompressionSystem
 
     public static void DecodeBc3ToRgba(byte* srcBlocks, int width, int height, byte* dstRgba)
     {
+        if (srcBlocks == null) throw new ArgumentNullException(nameof(srcBlocks));
+        if (dstRgba == null) throw new ArgumentNullException(nameof(dstRgba));
+        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+
         int bxCount = (width + 3) >> 2;
         int byCount = (height + 3) >> 2;
         byte* blockOut = stackalloc byte[64];

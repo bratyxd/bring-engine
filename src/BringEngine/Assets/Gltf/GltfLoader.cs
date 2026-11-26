@@ -29,7 +29,7 @@ public static unsafe class GltfLoader
     private struct RawBuffer { public byte* Ptr; public int Length; }
     private struct RawBufferView { public int Buffer; public int ByteOffset; public int ByteLength; public int ByteStride; }
     private struct RawAccessor { public int BufferView; public int ByteOffset; public int ComponentType; public int Count; public byte TypeComponents; public byte Normalized; }
-    private struct RawImage { public int BufferView; public FixedString256 Uri; }
+    private struct RawImage { public int BufferView; public byte* UriOrDataPtr; public int UriOrDataLen; public byte IsDataUri; }
     private struct RawTexture { public int Source; }
     private struct RawMat
     {
@@ -64,7 +64,7 @@ public static unsafe class GltfLoader
     }
     private struct RawSkin { public int IbmAcc; public int JointStart; public int JointCount; }
     private struct RawAnimSampler { public int InputAcc; public int OutputAcc; public AnimInterpolation Interp; }
-    private struct RawAnimChannel { public int SamplerIdx; public int TargetNode; public AnimTargetPath Path; }
+    private struct RawAnimChannel { public int SamplerIdx; public int TargetNode; public AnimTargetPath Path; public byte HasPath; }
     private struct RawAnim { public FixedString64 Name; public int SamplerStart, SamplerCount, ChannelStart, ChannelCount; }
 
     public static GltfHandle LoadFromFile(
@@ -91,22 +91,49 @@ public static unsafe class GltfLoader
         BundleId bundle,
         StringId assetName)
     {
+        return LoadFromMemoryCore(fileBytes, baseDirectory, ref bundleArena, ref scratchArena, ref assets, ref animations, bundle, assetName, allowBglb: true);
+    }
+
+    private static GltfHandle LoadFromMemoryCore(
+        ReadOnlySpan<byte> fileBytes,
+        string? baseDirectory,
+        ref LinearArena bundleArena,
+        ref LinearArena scratchArena,
+        ref AssetRegistry assets,
+        ref AnimationTable animations,
+        BundleId bundle,
+        StringId assetName,
+        bool allowBglb)
+    {
         // Transparently decompress Bring Compressed GLB ("BGLB" — LZ4 or Brotli compressed .glb)
-        ArenaMarker bglbMark = scratchArena.SaveMarker();
         if (fileBytes.Length >= sizeof(BglbHeader) &&
             MemoryMarshal.Read<uint>(fileBytes) == BglbHeader.MagicValue)
         {
+            if (!allowBglb)
+                throw new InvalidDataException("Nested BGLB compressed containers are not permitted.");
+
             BglbHeader hdr = MemoryMarshal.Read<BglbHeader>(fileBytes);
+            if (hdr.Version != BglbHeader.CurrentVersion)
+                throw new InvalidDataException($"Unsupported BGLB version {hdr.Version}.");
+            if (hdr.Compression is not (PackCompressionMode.None or PackCompressionMode.Lz4 or PackCompressionMode.Brotli))
+                throw new InvalidDataException($"Unsupported BGLB compression mode {hdr.Compression}.");
+
             int payloadOff = sizeof(BglbHeader);
-            if (payloadOff + hdr.CompressedBytes > fileBytes.Length || hdr.UncompressedBytes <= 0)
+            if (hdr.UncompressedBytes <= 0 || hdr.CompressedBytes < 0 ||
+                (long)payloadOff + hdr.CompressedBytes > fileBytes.Length ||
+                (hdr.Compression == PackCompressionMode.None && hdr.CompressedBytes != hdr.UncompressedBytes))
                 throw new InvalidDataException("Corrupt BGLB compressed glTF payload.");
 
-            byte* decompressedPtr = scratchArena.AllocUninitialized<byte>(hdr.UncompressedBytes, 64);
-            var decompressedSpan = new Span<byte>(decompressedPtr, hdr.UncompressedBytes);
-            PackCompressionSystem.Decompress(fileBytes.Slice(payloadOff, hdr.CompressedBytes), hdr.Compression, decompressedSpan);
+            ArenaMarker bglbMark = scratchArena.SaveMarker();
             try
             {
-                return LoadFromMemory(decompressedSpan, baseDirectory, ref bundleArena, ref scratchArena, ref assets, ref animations, bundle, assetName);
+                byte* decompressedPtr = scratchArena.AllocUninitialized<byte>(hdr.UncompressedBytes, 64);
+                var decompressedSpan = new Span<byte>(decompressedPtr, hdr.UncompressedBytes);
+                int written = PackCompressionSystem.Decompress(fileBytes.Slice(payloadOff, hdr.CompressedBytes), hdr.Compression, decompressedSpan);
+                if (written != hdr.UncompressedBytes)
+                    throw new InvalidDataException($"BGLB decompressed byte count mismatch (expected {hdr.UncompressedBytes}, got {written}).");
+
+                return LoadFromMemoryCore(decompressedSpan, baseDirectory, ref bundleArena, ref scratchArena, ref assets, ref animations, bundle, assetName, allowBglb: false);
             }
             finally
             {
@@ -129,11 +156,13 @@ public static unsafe class GltfLoader
                 uint chunkLen = MemoryMarshal.Read<uint>(fileBytes.Slice(offset));
                 uint chunkType = MemoryMarshal.Read<uint>(fileBytes.Slice(offset + 4));
                 offset += 8;
-                if (offset + (int)chunkLen > fileBytes.Length) break;
+                if (chunkLen > (uint)(fileBytes.Length - offset))
+                    throw new InvalidDataException("GLB chunk length exceeds file bounds.");
 
-                if (chunkType == ChunkJson) jsonSpan = fileBytes.Slice(offset, (int)chunkLen);
-                else if (chunkType == ChunkBin) glbBinSpan = fileBytes.Slice(offset, (int)chunkLen);
-                offset += (int)chunkLen;
+                int len = (int)chunkLen;
+                if (chunkType == ChunkJson) jsonSpan = fileBytes.Slice(offset, len);
+                else if (chunkType == ChunkBin) glbBinSpan = fileBytes.Slice(offset, len);
+                offset += len;
             }
             if (jsonSpan.IsEmpty) throw new InvalidDataException("GLB missing JSON chunk.");
         }
@@ -199,32 +228,34 @@ public static unsafe class GltfLoader
                 ref RawImage img = ref images[src];
                 var texName = StringId.Hash($"{assetName.Value}_tex_{t}");
 
-                if (img.BufferView >= 0 && img.BufferView < views.Count)
+                if (img.BufferView >= 0)
                 {
+                    if ((uint)img.BufferView >= (uint)views.Count)
+                        throw new InvalidDataException($"Image {src} bufferView {img.BufferView} out of range.");
                     RawBufferView bv = views[img.BufferView];
+                    if ((uint)bv.Buffer >= (uint)buffers.Count)
+                        throw new InvalidDataException($"Image bufferView {img.BufferView} buffer {bv.Buffer} out of range.");
                     RawBuffer buf = buffers[bv.Buffer];
+                    if (buf.Ptr == null || bv.ByteOffset < 0 || bv.ByteLength <= 0 || (long)bv.ByteOffset + bv.ByteLength > buf.Length)
+                        throw new InvalidDataException($"Image bufferView {img.BufferView} exceeds buffer bounds.");
                     loadedTextures[t] = TextureLoader.LoadFromMemory(
                         new ReadOnlySpan<byte>(buf.Ptr + bv.ByteOffset, bv.ByteLength),
                         ref bundleArena, ref assets, bundle, texName);
                 }
-                else if (img.Uri.Length > 0 && baseDirectory != null)
+                else if (img.IsDataUri != 0 && img.UriOrDataPtr != null && img.UriOrDataLen > 0)
                 {
-                    string uriStr = img.Uri.ToString();
-                    if (uriStr.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        int comma = uriStr.IndexOf(',');
-                        if (comma > 0)
-                        {
-                            byte[] decoded = Convert.FromBase64String(uriStr.Substring(comma + 1));
-                            loadedTextures[t] = TextureLoader.LoadFromMemory(decoded, ref bundleArena, ref assets, bundle, texName);
-                        }
-                    }
-                    else
-                    {
-                        string fullPath = Path.Combine(baseDirectory, uriStr);
-                        if (File.Exists(fullPath))
-                            loadedTextures[t] = TextureLoader.LoadFromFile(fullPath, ref bundleArena, ref assets, bundle, texName);
-                    }
+                    loadedTextures[t] = TextureLoader.LoadFromMemory(
+                        new ReadOnlySpan<byte>(img.UriOrDataPtr, img.UriOrDataLen),
+                        ref bundleArena, ref assets, bundle, texName);
+                }
+                else if (img.IsDataUri == 0 && img.UriOrDataLen > 0 && baseDirectory != null)
+                {
+                    string uriStr = Encoding.UTF8.GetString(img.UriOrDataPtr, img.UriOrDataLen);
+                    if (!PackCompressionSystem.TryResolveSafeRelativePath(baseDirectory, uriStr, out string fullPath))
+                        throw new InvalidDataException($"Unsafe external glTF image URI rejected: '{uriStr}'.");
+                    if (!File.Exists(fullPath))
+                        throw new FileNotFoundException($"External glTF image file not found: '{fullPath}'.", fullPath);
+                    loadedTextures[t] = TextureLoader.LoadFromFile(fullPath, ref bundleArena, ref assets, bundle, texName);
                 }
             }
 
@@ -248,6 +279,96 @@ public static unsafe class GltfLoader
                     AlphaCutoff = rm.AlphaCutoff,
                     DoubleSided = rm.DoubleSided,
                 });
+            }
+
+            // 2.5 Topologically sort skin joints (parent-before-child) before building skinned meshes
+            int* nodeToJoint = nodes.Count > 0 ? scratchArena.AllocUninitialized<int>(nodes.Count) : null;
+            for (int n = 0; n < nodes.Count; n++) nodeToJoint[n] = -1;
+
+            int* skinOldToNew = skinJoints.Count > 0 ? scratchArena.AllocUninitialized<int>(skinJoints.Count) : null;
+            int* skinNewToOld = skinJoints.Count > 0 ? scratchArena.AllocUninitialized<int>(skinJoints.Count) : null;
+            int* skinParentNew = skinJoints.Count > 0 ? scratchArena.AllocUninitialized<int>(skinJoints.Count) : null;
+
+            for (int s = 0; s < skins.Count; s++)
+            {
+                ref RawSkin rs = ref skins[s];
+                int jc = rs.JointCount;
+                if (jc < 0 || rs.JointStart < 0 || rs.JointStart + jc > skinJoints.Count)
+                    throw new InvalidDataException($"Corrupt skin {s} joint range.");
+                if (jc == 0) continue;
+
+                int* oldParent = scratchArena.AllocUninitialized<int>(jc);
+                byte* placed = scratchArena.Alloc<byte>(jc);
+                int* oldToNew = skinOldToNew + rs.JointStart;
+                int* newToOld = skinNewToOld + rs.JointStart;
+                int* parentNew = skinParentNew + rs.JointStart;
+
+                for (int j = 0; j < jc; j++)
+                {
+                    int nodeIdx = skinJoints[rs.JointStart + j];
+                    if ((uint)nodeIdx >= (uint)nodes.Count)
+                        throw new InvalidDataException($"Skin {s} joint {j} references invalid node {nodeIdx}.");
+
+                    int parentNode = nodes[nodeIdx].ParentIndex;
+                    int pjFound = -1;
+                    if (parentNode >= 0)
+                    {
+                        for (int pj = 0; pj < jc; pj++)
+                        {
+                            if (skinJoints[rs.JointStart + pj] == parentNode) { pjFound = pj; break; }
+                        }
+                    }
+                    oldParent[j] = pjFound;
+                }
+
+                int written = 0;
+                while (written < jc)
+                {
+                    int prevWritten = written;
+                    for (int j = 0; j < jc; j++)
+                    {
+                        if (placed[j] != 0) continue;
+                        int p = oldParent[j];
+                        if (p < 0 || placed[p] != 0)
+                        {
+                            newToOld[written] = j;
+                            oldToNew[j] = written;
+                            placed[j] = 1;
+                            written++;
+                        }
+                    }
+                    if (written == prevWritten)
+                        throw new InvalidDataException($"Cycle detected in glTF skin {s} joint hierarchy.");
+                }
+
+                for (int newJ = 0; newJ < jc; newJ++)
+                {
+                    int oldJ = newToOld[newJ];
+                    parentNew[newJ] = oldParent[oldJ] >= 0 ? oldToNew[oldParent[oldJ]] : -1;
+                    int nodeIdx = skinJoints[rs.JointStart + oldJ];
+                    nodeToJoint[nodeIdx] = newJ;
+                }
+            }
+
+            int* primToSkin = prims.Count > 0 ? scratchArena.AllocUninitialized<int>(prims.Count) : null;
+            for (int p = 0; p < prims.Count; p++) primToSkin[p] = -1;
+            for (int n = 0; n < nodes.Count; n++)
+            {
+                if (nodes[n].SkinIndex >= 0)
+                {
+                    if (nodes[n].SkinIndex >= skins.Count)
+                        throw new InvalidDataException($"Node {n} references invalid skin index {nodes[n].SkinIndex}.");
+                    if (nodes[n].MeshIndex >= 0 && nodes[n].MeshIndex < meshes.Count)
+                    {
+                        ref RawMesh rm = ref meshes[nodes[n].MeshIndex];
+                        for (int k = 0; k < rm.PrimCount; k++)
+                        {
+                            int pi = rm.PrimStart + k;
+                            if ((uint)pi < (uint)prims.Count)
+                                primToSkin[pi] = nodes[n].SkinIndex;
+                        }
+                    }
+                }
             }
 
             // Default fallback material if a primitive has material = -1
@@ -276,8 +397,14 @@ public static unsafe class GltfLoader
                 ref RawPrim rp = ref prims[p];
                 if (rp.PosAcc < 0 || rp.PosAcc >= accessors.Count) continue;
 
+                int skinIdx = primToSkin != null ? primToSkin[p] : -1;
+                int* jointRemap = (skinIdx >= 0 && skins[skinIdx].JointCount > 0)
+                    ? skinOldToNew + skins[skinIdx].JointStart : null;
+                int jointRemapCount = skinIdx >= 0 ? skins[skinIdx].JointCount : 0;
+
                 MeshHandle meshHandle = BuildMeshFromPrimitive(
                     in rp, in buffers, in views, in accessors,
+                    jointRemap, jointRemapCount,
                     ref bundleArena, ref assets, bundle,
                     StringId.Hash($"{assetName.Value}_prim_{p}"),
                     out Bounds3 primBounds);
@@ -374,46 +501,37 @@ public static unsafe class GltfLoader
                 }
             }
 
-            // 5. Build Skins -> SkeletonData in bundleArena
+            // 5. Build Skins -> SkeletonData in bundleArena (topologically sorted parent < child)
             SkeletonHandle* outSkins = skins.Count > 0 ? bundleArena.Alloc<SkeletonHandle>(skins.Count, 16) : null;
-            // Map node index -> joint index for first skin (for animation channels)
-            int* nodeToJoint = nodes.Count > 0 ? scratchArena.AllocUninitialized<int>(nodes.Count) : null;
-            for (int n = 0; n < nodes.Count; n++) nodeToJoint[n] = -1;
-
             for (int s = 0; s < skins.Count; s++)
             {
                 ref RawSkin rs = ref skins[s];
                 int jc = rs.JointCount;
-                int* parentIndices = bundleArena.AllocUninitialized<int>(jc, 16);
-                Mat4* ibms = bundleArena.AllocUninitialized<Mat4>(jc, 64);
-                Vec3* bindPos = bundleArena.AllocUninitialized<Vec3>(jc, 16);
-                Quat* bindRot = bundleArena.AllocUninitialized<Quat>(jc, 16);
-                Vec3* bindScl = bundleArena.AllocUninitialized<Vec3>(jc, 16);
-
-                for (int j = 0; j < jc; j++)
+                if (rs.IbmAcc >= 0)
                 {
-                    int nodeIdx = skinJoints[rs.JointStart + j];
-                    if (s == 0 && (uint)nodeIdx < (uint)nodes.Count)
-                        nodeToJoint[nodeIdx] = j;
+                    ValidateAccessor(in buffers, in views, in accessors, rs.IbmAcc, expectedComponents: 16, requireFloat: true);
+                    if (accessors[rs.IbmAcc].Count < jc)
+                        throw new InvalidDataException($"Skin {s} IBM accessor count ({accessors[rs.IbmAcc].Count}) < jointCount ({jc}).");
                 }
 
-                for (int j = 0; j < jc; j++)
+                int* parentIndices = jc > 0 ? bundleArena.AllocUninitialized<int>(jc, 16) : null;
+                Mat4* ibms = jc > 0 ? bundleArena.AllocUninitialized<Mat4>(jc, 64) : null;
+                Vec3* bindPos = jc > 0 ? bundleArena.AllocUninitialized<Vec3>(jc, 16) : null;
+                Quat* bindRot = jc > 0 ? bundleArena.AllocUninitialized<Quat>(jc, 16) : null;
+                Vec3* bindScl = jc > 0 ? bundleArena.AllocUninitialized<Vec3>(jc, 16) : null;
+
+                int* newToOld = jc > 0 ? skinNewToOld + rs.JointStart : null;
+                int* parentNew = jc > 0 ? skinParentNew + rs.JointStart : null;
+
+                for (int newJ = 0; newJ < jc; newJ++)
                 {
-                    int nodeIdx = skinJoints[rs.JointStart + j];
-                    int parentNode = (uint)nodeIdx < (uint)nodes.Count ? nodes[nodeIdx].ParentIndex : -1;
-                    int parentJoint = -1;
-                    if (parentNode >= 0)
-                    {
-                        for (int pj = 0; pj < jc; pj++)
-                        {
-                            if (skinJoints[rs.JointStart + pj] == parentNode) { parentJoint = pj; break; }
-                        }
-                    }
-                    parentIndices[j] = parentJoint;
-                    bindPos[j] = (uint)nodeIdx < (uint)outNodeCount ? outNodes[nodeIdx].LocalPosition : Vec3.Zero;
-                    bindRot[j] = (uint)nodeIdx < (uint)outNodeCount ? outNodes[nodeIdx].LocalRotation : Quat.Identity;
-                    bindScl[j] = (uint)nodeIdx < (uint)outNodeCount ? outNodes[nodeIdx].LocalScale : Vec3.One;
-                    ibms[j] = rs.IbmAcc >= 0 ? ReadAccessorMat4(in buffers, in views, in accessors, rs.IbmAcc, j) : Mat4.Identity;
+                    int oldJ = newToOld[newJ];
+                    int nodeIdx = skinJoints[rs.JointStart + oldJ];
+                    parentIndices[newJ] = parentNew[newJ];
+                    bindPos[newJ] = (uint)nodeIdx < (uint)outNodeCount ? outNodes[nodeIdx].LocalPosition : Vec3.Zero;
+                    bindRot[newJ] = (uint)nodeIdx < (uint)outNodeCount ? outNodes[nodeIdx].LocalRotation : Quat.Identity;
+                    bindScl[newJ] = (uint)nodeIdx < (uint)outNodeCount ? outNodes[nodeIdx].LocalScale : Vec3.One;
+                    ibms[newJ] = rs.IbmAcc >= 0 ? ReadAccessorMat4(in buffers, in views, in accessors, rs.IbmAcc, oldJ) : Mat4.Identity;
                 }
 
                 outSkins[s] = AnimationSystem.RegisterSkeleton(ref animations, new SkeletonData
@@ -440,8 +558,18 @@ public static unsafe class GltfLoader
                 for (int si = 0; si < ra.SamplerCount; si++)
                 {
                     RawAnimSampler ras = animSamplers[ra.SamplerStart + si];
+                    ValidateAccessor(in buffers, in views, in accessors, ras.InputAcc, expectedComponents: 1);
+                    ValidateAccessor(in buffers, in views, in accessors, ras.OutputAcc);
                     RawAccessor inAcc = accessors[ras.InputAcc];
                     RawAccessor outAcc = accessors[ras.OutputAcc];
+
+                    if (inAcc.Count <= 0)
+                        throw new InvalidDataException($"Animation {a} sampler {si} has non-positive keyframe count {inAcc.Count}.");
+                    if (outAcc.TypeComponents != 3 && outAcc.TypeComponents != 4)
+                        throw new InvalidDataException($"Animation {a} sampler {si} output must be VEC3 or VEC4 (got {outAcc.TypeComponents}).");
+                    long reqOut = ras.Interp == AnimInterpolation.CubicSpline ? (long)inAcc.Count * 3L : inAcc.Count;
+                    if (outAcc.Count < reqOut)
+                        throw new InvalidDataException($"Animation {a} sampler {si} output count ({outAcc.Count}) < required ({reqOut}).");
 
                     float* times = bundleArena.AllocUninitialized<float>(inAcc.Count, 16);
                     for (int k = 0; k < inAcc.Count; k++)
@@ -451,7 +579,7 @@ public static unsafe class GltfLoader
                     }
 
                     byte comps = outAcc.TypeComponents;
-                    int totalFloats = outAcc.Count * comps;
+                    int totalFloats = checked(outAcc.Count * comps);
                     float* vals = bundleArena.AllocUninitialized<float>(totalFloats, 16);
                     for (int k = 0; k < outAcc.Count; k++)
                     {
@@ -471,8 +599,17 @@ public static unsafe class GltfLoader
                 for (int ci = 0; ci < ra.ChannelCount; ci++)
                 {
                     RawAnimChannel rac = animChannels[ra.ChannelStart + ci];
-                    int targetJoint = (nodeToJoint != null && (uint)rac.TargetNode < (uint)nodes.Count && nodeToJoint[rac.TargetNode] >= 0)
-                        ? nodeToJoint[rac.TargetNode] : rac.TargetNode;
+                    if ((uint)rac.SamplerIdx >= (uint)ra.SamplerCount)
+                        throw new InvalidDataException($"Animation {a} channel {ci} sampler index {rac.SamplerIdx} out of range.");
+                    if (rac.HasPath != 0)
+                    {
+                        byte reqComps = rac.Path == AnimTargetPath.Rotation ? (byte)4 : (byte)3;
+                        if (sArr[rac.SamplerIdx].ComponentsPerValue != reqComps)
+                            throw new InvalidDataException($"Animation {a} channel {ci} path {rac.Path} expects {reqComps} components, sampler has {sArr[rac.SamplerIdx].ComponentsPerValue}.");
+                    }
+
+                    int targetJoint = (rac.HasPath != 0 && nodeToJoint != null && (uint)rac.TargetNode < (uint)nodes.Count)
+                        ? nodeToJoint[rac.TargetNode] : -1;
                     cArr[ci] = new AnimChannelData
                     {
                         SamplerIndex = rac.SamplerIdx,
@@ -521,19 +658,69 @@ public static unsafe class GltfLoader
         in NativeList<RawBuffer> buffers,
         in NativeList<RawBufferView> views,
         in NativeList<RawAccessor> accessors,
+        int* jointRemap,
+        int jointRemapCount,
         ref LinearArena bundleArena,
         ref AssetRegistry assets,
         BundleId bundle,
         StringId name,
         out Bounds3 bounds)
     {
+        ValidateAccessor(in buffers, in views, in accessors, rp.PosAcc, expectedComponents: 3);
         int vertCount = accessors[rp.PosAcc].Count;
+        if (vertCount <= 0)
+            throw new InvalidDataException("glTF primitive POSITION accessor must have count > 0.");
+
+        bool hasNormals = rp.NormAcc >= 0;
+        if (hasNormals)
+        {
+            ValidateAccessor(in buffers, in views, in accessors, rp.NormAcc, expectedComponents: 3);
+            if (accessors[rp.NormAcc].Count < vertCount)
+                throw new InvalidDataException("glTF primitive NORMAL accessor count < POSITION count.");
+        }
+
+        bool hasUv = rp.UvAcc >= 0;
+        if (hasUv)
+        {
+            ValidateAccessor(in buffers, in views, in accessors, rp.UvAcc, expectedComponents: 2);
+            if (accessors[rp.UvAcc].Count < vertCount)
+                throw new InvalidDataException("glTF primitive TEXCOORD_0 accessor count < POSITION count.");
+        }
+
+        bool hasColor = rp.ColorAcc >= 0;
+        int colorComps = 0;
+        if (hasColor)
+        {
+            ValidateAccessor(in buffers, in views, in accessors, rp.ColorAcc);
+            colorComps = accessors[rp.ColorAcc].TypeComponents;
+            if (colorComps != 3 && colorComps != 4)
+                throw new InvalidDataException($"glTF primitive COLOR_0 accessor must be VEC3 or VEC4 (got {colorComps} components).");
+            if (accessors[rp.ColorAcc].Count < vertCount)
+                throw new InvalidDataException("glTF primitive COLOR_0 accessor count < POSITION count.");
+        }
+
+        bool hasSkin = rp.JointsAcc >= 0 && rp.WeightsAcc >= 0;
+        if (hasSkin)
+        {
+            ValidateAccessor(in buffers, in views, in accessors, rp.JointsAcc, expectedComponents: 4);
+            ValidateAccessor(in buffers, in views, in accessors, rp.WeightsAcc, expectedComponents: 4);
+            if (accessors[rp.JointsAcc].Count < vertCount || accessors[rp.WeightsAcc].Count < vertCount)
+                throw new InvalidDataException("glTF primitive skinning accessor count < POSITION count.");
+            int jct = accessors[rp.JointsAcc].ComponentType;
+            if (jct != 5121 && jct != 5123 && jct != 5125)
+                throw new InvalidDataException($"glTF JOINTS_0 unsupported componentType {jct}.");
+        }
+
+        if (rp.IndicesAcc >= 0)
+        {
+            ValidateAccessor(in buffers, in views, in accessors, rp.IndicesAcc, expectedComponents: 1);
+            int ict = accessors[rp.IndicesAcc].ComponentType;
+            if (ict != 5121 && ict != 5123 && ict != 5125)
+                throw new InvalidDataException($"glTF indices unsupported componentType {ict}.");
+        }
+
         Vertex3D* verts = bundleArena.Alloc<Vertex3D>(vertCount, 64);
         bounds = Bounds3.Empty;
-        bool hasNormals = rp.NormAcc >= 0;
-        bool hasUv = rp.UvAcc >= 0;
-        bool hasColor = rp.ColorAcc >= 0;
-        bool hasSkin = rp.JointsAcc >= 0 && rp.WeightsAcc >= 0;
 
         float* tmp4 = stackalloc float[4];
         for (int v = 0; v < vertCount; v++)
@@ -559,9 +746,8 @@ public static unsafe class GltfLoader
             Color32 col = Color32.White;
             if (hasColor)
             {
-                int cc = accessors[rp.ColorAcc].TypeComponents;
                 tmp4[3] = 1f;
-                ReadAccessorFloats(in buffers, in views, in accessors, rp.ColorAcc, v, tmp4, cc);
+                ReadAccessorFloats(in buffers, in views, in accessors, rp.ColorAcc, v, tmp4, colorComps);
                 col = Color32.FromFloat(tmp4[0], tmp4[1], tmp4[2], tmp4[3]);
             }
 
@@ -573,6 +759,13 @@ public static unsafe class GltfLoader
                 uint j1 = ReadAccessorComponentUInt(in buffers, in views, in accessors, rp.JointsAcc, v, 1);
                 uint j2 = ReadAccessorComponentUInt(in buffers, in views, in accessors, rp.JointsAcc, v, 2);
                 uint j3 = ReadAccessorComponentUInt(in buffers, in views, in accessors, rp.JointsAcc, v, 3);
+                if (jointRemap != null)
+                {
+                    if (j0 < (uint)jointRemapCount) j0 = (uint)jointRemap[j0];
+                    if (j1 < (uint)jointRemapCount) j1 = (uint)jointRemap[j1];
+                    if (j2 < (uint)jointRemapCount) j2 = (uint)jointRemap[j2];
+                    if (j3 < (uint)jointRemapCount) j3 = (uint)jointRemap[j3];
+                }
                 jointsPacked = Vertex3D.PackJoints((byte)j0, (byte)j1, (byte)j2, (byte)j3);
 
                 ReadAccessorFloats(in buffers, in views, in accessors, rp.WeightsAcc, v, tmp4, 4);
@@ -600,7 +793,12 @@ public static unsafe class GltfLoader
         if (rp.IndicesAcc >= 0)
         {
             for (int i = 0; i < idxCount; i++)
-                indices[i] = ReadAccessorComponentUInt(in buffers, in views, in accessors, rp.IndicesAcc, i, 0);
+            {
+                uint iv = ReadAccessorComponentUInt(in buffers, in views, in accessors, rp.IndicesAcc, i, 0);
+                if (iv >= (uint)vertCount)
+                    throw new InvalidDataException($"glTF primitive index {iv} out of vertex range [0..{vertCount}).");
+                indices[i] = iv;
+            }
         }
         else
         {
@@ -639,6 +837,57 @@ public static unsafe class GltfLoader
         });
     }
 
+    private static void ValidateAccessor(
+        in NativeList<RawBuffer> buffers, in NativeList<RawBufferView> views, in NativeList<RawAccessor> accessors,
+        int accIdx, int expectedComponents = 0, bool requireFloat = false)
+    {
+        if ((uint)accIdx >= (uint)accessors.Count)
+            throw new InvalidDataException($"glTF accessor index {accIdx} out of range (count={accessors.Count}).");
+
+        RawAccessor acc = accessors[accIdx];
+        if (acc.Count < 0 || acc.ByteOffset < 0 || acc.TypeComponents <= 0)
+            throw new InvalidDataException($"glTF accessor {accIdx} has invalid count/offset/type.");
+        if (expectedComponents > 0 && acc.TypeComponents != expectedComponents)
+            throw new InvalidDataException($"glTF accessor {accIdx} expected {expectedComponents} components, got {acc.TypeComponents}.");
+        if (requireFloat && acc.ComponentType != 5126)
+            throw new InvalidDataException($"glTF accessor {accIdx} requires FLOAT (5126), got {acc.ComponentType}.");
+
+        int compSize = acc.ComponentType switch
+        {
+            5120 or 5121 => 1,
+            5122 or 5123 => 2,
+            5125 or 5126 => 4,
+            _ => throw new InvalidDataException($"glTF accessor {accIdx} unsupported componentType {acc.ComponentType}."),
+        };
+
+        if ((uint)acc.BufferView >= (uint)views.Count)
+            throw new InvalidDataException($"glTF accessor {accIdx} bufferView {acc.BufferView} out of range.");
+
+        RawBufferView bv = views[acc.BufferView];
+        if (bv.ByteOffset < 0 || bv.ByteLength < 0 || bv.ByteStride < 0)
+            throw new InvalidDataException($"glTF bufferView {acc.BufferView} has negative offset/length/stride.");
+        if ((uint)bv.Buffer >= (uint)buffers.Count)
+            throw new InvalidDataException($"glTF bufferView {acc.BufferView} buffer {bv.Buffer} out of range.");
+
+        RawBuffer buf = buffers[bv.Buffer];
+        if (buf.Ptr == null || buf.Length < 0)
+            throw new InvalidDataException($"glTF buffer {bv.Buffer} has no backing data.");
+        if ((long)bv.ByteOffset + bv.ByteLength > buf.Length)
+            throw new InvalidDataException($"glTF bufferView {acc.BufferView} exceeds buffer {bv.Buffer} bounds.");
+
+        int elemSize = compSize * acc.TypeComponents;
+        int stride = bv.ByteStride > 0 ? bv.ByteStride : elemSize;
+        if (stride < elemSize)
+            throw new InvalidDataException($"glTF bufferView {acc.BufferView} byteStride ({stride}) < element size ({elemSize}).");
+
+        if (acc.Count > 0)
+        {
+            long endInView = (long)acc.ByteOffset + (long)(acc.Count - 1) * stride + elemSize;
+            if (endInView > bv.ByteLength || (long)bv.ByteOffset + endInView > buf.Length)
+                throw new InvalidDataException($"glTF accessor {accIdx} span exceeds bufferView/buffer bounds.");
+        }
+    }
+
     private static byte* GetAccessorElementPtr(
         in NativeList<RawBuffer> buffers, in NativeList<RawBufferView> views, in NativeList<RawAccessor> accessors,
         int accIdx, int elemIndex, out int componentType, out bool normalized)
@@ -655,7 +904,7 @@ public static unsafe class GltfLoader
             _ => 4,            // UINT / FLOAT
         };
         int stride = bv.ByteStride > 0 ? bv.ByteStride : (compSize * acc.TypeComponents);
-        return buf.Ptr + bv.ByteOffset + acc.ByteOffset + elemIndex * stride;
+        return buf.Ptr + bv.ByteOffset + acc.ByteOffset + (long)elemIndex * stride;
     }
 
     private static float ReadComponentAsFloat(byte* ptr, int compType, bool norm) => compType switch
@@ -720,14 +969,98 @@ public static unsafe class GltfLoader
         Vec3 c0 = new Vec3(m.C0.X, m.C0.Y, m.C0.Z);
         Vec3 c1 = new Vec3(m.C1.X, m.C1.Y, m.C1.Z);
         Vec3 c2 = new Vec3(m.C2.X, m.C2.Y, m.C2.Z);
-        scale = new Vec3(c0.Length(), c1.Length(), c2.Length());
-        Vec3 r = scale.X > 1e-6f ? c0 / scale.X : Vec3.UnitX;
-        Vec3 u = scale.Y > 1e-6f ? c1 / scale.Y : Vec3.UnitY;
-        Vec3 f = scale.Z > 1e-6f ? -c2 / scale.Z : Vec3.Forward;
-        rot = Quat.LookRotation(f, u);
+
+        float sx = c0.Length();
+        float sy = c1.Length();
+        float sz = c2.Length();
+        float det = Vec3.Dot(c0, Vec3.Cross(c1, c2));
+        if (det < 0f) sx = -sx;
+        scale = new Vec3(sx, sy, sz);
+
+        Vec3 r = DetMath.Abs(sx) > 1e-6f ? c0 / sx : Vec3.UnitX;
+        Vec3 u = DetMath.Abs(sy) > 1e-6f ? c1 / sy : Vec3.UnitY;
+        Vec3 zAxis = DetMath.Abs(sz) > 1e-6f ? c2 / sz : Vec3.UnitZ;
+
+        if (DetMath.Abs(sx) <= 1e-6f && DetMath.Abs(sy) > 1e-6f && DetMath.Abs(sz) > 1e-6f)
+            r = Vec3.Cross(u, zAxis).Normalized();
+        else if (DetMath.Abs(sy) <= 1e-6f && DetMath.Abs(sx) > 1e-6f && DetMath.Abs(sz) > 1e-6f)
+            u = Vec3.Cross(zAxis, r).Normalized();
+        else if (DetMath.Abs(sz) <= 1e-6f && DetMath.Abs(sx) > 1e-6f && DetMath.Abs(sy) > 1e-6f)
+            zAxis = Vec3.Cross(r, u).Normalized();
+
+        r = r.Normalized();
+        if (r.LengthSq() < 1e-8f) r = Vec3.UnitX;
+        u = (u - r * Vec3.Dot(r, u)).Normalized();
+        if (u.LengthSq() < 1e-8f)
+        {
+            u = Vec3.Cross(zAxis, r).Normalized();
+            if (u.LengthSq() < 1e-8f) u = Vec3.Cross(Vec3.UnitZ, r).Normalized();
+            if (u.LengthSq() < 1e-8f) u = Vec3.Cross(Vec3.UnitX, r).Normalized();
+        }
+        zAxis = Vec3.Cross(r, u).Normalized();
+
+        float m00 = r.X, m01 = u.X, m02 = zAxis.X;
+        float m10 = r.Y, m11 = u.Y, m12 = zAxis.Y;
+        float m20 = r.Z, m21 = u.Z, m22 = zAxis.Z;
+
+        float trace = m00 + m11 + m22;
+        if (trace > 0f)
+        {
+            float s = DetMath.Sqrt(trace + 1f) * 2f;
+            rot = new Quat((m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25f * s).Normalized();
+        }
+        else if (m00 > m11 && m00 > m22)
+        {
+            float s = DetMath.Sqrt(1f + m00 - m11 - m22) * 2f;
+            rot = new Quat(0.25f * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s).Normalized();
+        }
+        else if (m11 > m22)
+        {
+            float s = DetMath.Sqrt(1f + m11 - m00 - m22) * 2f;
+            rot = new Quat((m01 + m10) / s, 0.25f * s, (m12 + m21) / s, (m02 - m20) / s).Normalized();
+        }
+        else
+        {
+            float s = DetMath.Sqrt(1f + m22 - m00 - m11) * 2f;
+            rot = new Quat((m02 + m20) / s, (m12 + m21) / s, 0.25f * s, (m10 - m01) / s).Normalized();
+        }
     }
 
     // --- Streaming Utf8JsonReader Parsers (100% Zero Reflection) ---
+
+    private static void ExpectToken(ref Utf8JsonReader r, JsonTokenType expected, string context)
+    {
+        if (!r.Read() || r.TokenType != expected)
+            throw new InvalidDataException($"Expected {expected} in glTF {context}.");
+    }
+
+    private static int ReadInt32Checked(ref Utf8JsonReader r, string context)
+    {
+        if (!r.Read() || r.TokenType != JsonTokenType.Number || !r.TryGetInt32(out int v))
+            throw new InvalidDataException($"Expected integer in glTF {context}.");
+        return v;
+    }
+
+    private static float ReadSingleChecked(ref Utf8JsonReader r, string context)
+    {
+        if (!r.Read() || r.TokenType != JsonTokenType.Number || !r.TryGetSingle(out float v))
+            throw new InvalidDataException($"Expected number in glTF {context}.");
+        return v;
+    }
+
+    private static bool ReadBoolChecked(ref Utf8JsonReader r, string context)
+    {
+        if (!r.Read() || (r.TokenType != JsonTokenType.True && r.TokenType != JsonTokenType.False))
+            throw new InvalidDataException($"Expected boolean in glTF {context}.");
+        return r.GetBoolean();
+    }
+
+    private static string? ReadStringChecked(ref Utf8JsonReader r, string context)
+    {
+        if (!r.Read() || (r.TokenType != JsonTokenType.String && r.TokenType != JsonTokenType.Null))
+            throw new InvalidDataException($"Expected string in glTF {context}.");
+        return r.TokenType == JsonTokenType.Null ? null : r.GetString();
+    }
 
     private static void ParseRootJson(
         ref Utf8JsonReader r, string? baseDir, byte* glbBinPtr, int glbBinLen, ref LinearArena scratch,
@@ -737,38 +1070,43 @@ public static unsafe class GltfLoader
         ref NativeList<int> nodeChildren, ref NativeList<RawSkin> skins, ref NativeList<int> skinJoints,
         ref NativeList<RawAnim> anims, ref NativeList<RawAnimSampler> animSamplers, ref NativeList<RawAnimChannel> animChannels)
     {
-        while (r.Read() && r.TokenType != JsonTokenType.StartObject) { }
+        ExpectToken(ref r, JsonTokenType.StartObject, "root");
         while (r.Read() && r.TokenType != JsonTokenType.EndObject)
         {
             if (r.TokenType != JsonTokenType.PropertyName) continue;
             if (r.ValueTextEquals("buffers"u8)) ParseBuffers(ref r, baseDir, glbBinPtr, glbBinLen, ref scratch, ref buffers);
             else if (r.ValueTextEquals("bufferViews"u8)) ParseBufferViews(ref r, ref views);
             else if (r.ValueTextEquals("accessors"u8)) ParseAccessors(ref r, ref accessors);
-            else if (r.ValueTextEquals("images"u8)) ParseImages(ref r, ref images);
+            else if (r.ValueTextEquals("images"u8)) ParseImages(ref r, ref scratch, ref images);
             else if (r.ValueTextEquals("textures"u8)) ParseTextures(ref r, ref textures);
             else if (r.ValueTextEquals("materials"u8)) ParseMaterials(ref r, ref materials);
             else if (r.ValueTextEquals("meshes"u8)) ParseMeshes(ref r, ref prims, ref meshes);
             else if (r.ValueTextEquals("nodes"u8)) ParseNodes(ref r, ref nodes, ref nodeChildren);
             else if (r.ValueTextEquals("skins"u8)) ParseSkins(ref r, ref skins, ref skinJoints);
             else if (r.ValueTextEquals("animations"u8)) ParseAnimations(ref r, ref anims, ref animSamplers, ref animChannels);
-            else { r.Read(); r.Skip(); }
+            else { if (!r.Read()) throw new InvalidDataException("Unexpected EOF in glTF root."); r.Skip(); }
         }
     }
 
     private static void ParseBuffers(ref Utf8JsonReader r, string? baseDir, byte* glbBinPtr, int glbBinLen, ref LinearArena scratch, ref NativeList<RawBuffer> buffers)
     {
-        r.Read(); // StartArray
+        ExpectToken(ref r, JsonTokenType.StartArray, "buffers");
         while (r.Read() && r.TokenType != JsonTokenType.EndArray)
         {
+            if (r.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("Expected object in glTF buffers array.");
             int byteLen = 0;
             string? uri = null;
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
-                if (r.ValueTextEquals("byteLength"u8)) { r.Read(); byteLen = r.GetInt32(); }
-                else if (r.ValueTextEquals("uri"u8)) { r.Read(); uri = r.GetString(); }
+                if (r.ValueTextEquals("byteLength"u8)) byteLen = ReadInt32Checked(ref r, "buffer.byteLength");
+                else if (r.ValueTextEquals("uri"u8)) uri = ReadStringChecked(ref r, "buffer.uri");
                 else { r.Read(); r.Skip(); }
             }
+
+            if (byteLen < 0)
+                throw new InvalidDataException($"glTF buffer byteLength cannot be negative ({byteLen}).");
 
             if (uri == null && glbBinPtr != null)
             {
@@ -777,16 +1115,22 @@ public static unsafe class GltfLoader
             else if (uri != null && uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
             {
                 int comma = uri.IndexOf(',');
+                if (comma <= 0)
+                    throw new InvalidDataException("Malformed data URI in glTF buffer.");
                 byte[] decoded = Convert.FromBase64String(uri.Substring(comma + 1));
-                byte* ptr = scratch.AllocUninitialized<byte>(decoded.Length, 16);
-                decoded.CopyTo(new Span<byte>(ptr, decoded.Length));
+                byte* ptr = scratch.AllocUninitialized<byte>(Math.Max(1, decoded.Length), 16);
+                if (decoded.Length > 0) decoded.CopyTo(new Span<byte>(ptr, decoded.Length));
                 buffers.Add(new RawBuffer { Ptr = ptr, Length = decoded.Length });
             }
             else if (uri != null && baseDir != null)
             {
-                byte[] external = File.ReadAllBytes(Path.Combine(baseDir, uri));
-                byte* ptr = scratch.AllocUninitialized<byte>(external.Length, 16);
-                external.CopyTo(new Span<byte>(ptr, external.Length));
+                if (!PackCompressionSystem.TryResolveSafeRelativePath(baseDir, uri, out string fullPath))
+                    throw new InvalidDataException($"Unsafe external glTF buffer URI rejected: '{uri}'.");
+                if (!File.Exists(fullPath))
+                    throw new FileNotFoundException($"External glTF buffer file not found: '{fullPath}'.", fullPath);
+                byte[] external = File.ReadAllBytes(fullPath);
+                byte* ptr = scratch.AllocUninitialized<byte>(Math.Max(1, external.Length), 16);
+                if (external.Length > 0) external.CopyTo(new Span<byte>(ptr, external.Length));
                 buffers.Add(new RawBuffer { Ptr = ptr, Length = external.Length });
             }
             else
@@ -798,17 +1142,19 @@ public static unsafe class GltfLoader
 
     private static void ParseBufferViews(ref Utf8JsonReader r, ref NativeList<RawBufferView> views)
     {
-        r.Read();
+        ExpectToken(ref r, JsonTokenType.StartArray, "bufferViews");
         while (r.Read() && r.TokenType != JsonTokenType.EndArray)
         {
+            if (r.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("Expected object in glTF bufferViews array.");
             RawBufferView bv = default;
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
-                if (r.ValueTextEquals("buffer"u8)) { r.Read(); bv.Buffer = r.GetInt32(); }
-                else if (r.ValueTextEquals("byteOffset"u8)) { r.Read(); bv.ByteOffset = r.GetInt32(); }
-                else if (r.ValueTextEquals("byteLength"u8)) { r.Read(); bv.ByteLength = r.GetInt32(); }
-                else if (r.ValueTextEquals("byteStride"u8)) { r.Read(); bv.ByteStride = r.GetInt32(); }
+                if (r.ValueTextEquals("buffer"u8)) bv.Buffer = ReadInt32Checked(ref r, "bufferView.buffer");
+                else if (r.ValueTextEquals("byteOffset"u8)) bv.ByteOffset = ReadInt32Checked(ref r, "bufferView.byteOffset");
+                else if (r.ValueTextEquals("byteLength"u8)) bv.ByteLength = ReadInt32Checked(ref r, "bufferView.byteLength");
+                else if (r.ValueTextEquals("byteStride"u8)) bv.ByteStride = ReadInt32Checked(ref r, "bufferView.byteStride");
                 else { r.Read(); r.Skip(); }
             }
             views.Add(bv);
@@ -817,21 +1163,24 @@ public static unsafe class GltfLoader
 
     private static void ParseAccessors(ref Utf8JsonReader r, ref NativeList<RawAccessor> accessors)
     {
-        r.Read();
+        ExpectToken(ref r, JsonTokenType.StartArray, "accessors");
         while (r.Read() && r.TokenType != JsonTokenType.EndArray)
         {
-            RawAccessor a = new RawAccessor { TypeComponents = 1 };
+            if (r.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("Expected object in glTF accessors array.");
+            RawAccessor a = new RawAccessor { BufferView = -1, TypeComponents = 1 };
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
-                if (r.ValueTextEquals("bufferView"u8)) { r.Read(); a.BufferView = r.GetInt32(); }
-                else if (r.ValueTextEquals("byteOffset"u8)) { r.Read(); a.ByteOffset = r.GetInt32(); }
-                else if (r.ValueTextEquals("componentType"u8)) { r.Read(); a.ComponentType = r.GetInt32(); }
-                else if (r.ValueTextEquals("count"u8)) { r.Read(); a.Count = r.GetInt32(); }
-                else if (r.ValueTextEquals("normalized"u8)) { r.Read(); a.Normalized = (byte)(r.GetBoolean() ? 1 : 0); }
+                if (r.ValueTextEquals("bufferView"u8)) a.BufferView = ReadInt32Checked(ref r, "accessor.bufferView");
+                else if (r.ValueTextEquals("byteOffset"u8)) a.ByteOffset = ReadInt32Checked(ref r, "accessor.byteOffset");
+                else if (r.ValueTextEquals("componentType"u8)) a.ComponentType = ReadInt32Checked(ref r, "accessor.componentType");
+                else if (r.ValueTextEquals("count"u8)) a.Count = ReadInt32Checked(ref r, "accessor.count");
+                else if (r.ValueTextEquals("normalized"u8)) a.Normalized = (byte)(ReadBoolChecked(ref r, "accessor.normalized") ? 1 : 0);
                 else if (r.ValueTextEquals("type"u8))
                 {
-                    r.Read();
+                    if (!r.Read() || r.TokenType != JsonTokenType.String)
+                        throw new InvalidDataException("Expected string for glTF accessor.type.");
                     if (r.ValueTextEquals("SCALAR"u8)) a.TypeComponents = 1;
                     else if (r.ValueTextEquals("VEC2"u8)) a.TypeComponents = 2;
                     else if (r.ValueTextEquals("VEC3"u8)) a.TypeComponents = 3;
@@ -844,17 +1193,49 @@ public static unsafe class GltfLoader
         }
     }
 
-    private static void ParseImages(ref Utf8JsonReader r, ref NativeList<RawImage> images)
+    private static void ParseImages(ref Utf8JsonReader r, ref LinearArena scratch, ref NativeList<RawImage> images)
     {
-        r.Read();
+        ExpectToken(ref r, JsonTokenType.StartArray, "images");
         while (r.Read() && r.TokenType != JsonTokenType.EndArray)
         {
+            if (r.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("Expected object in glTF images array.");
             RawImage img = new RawImage { BufferView = -1 };
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
-                if (r.ValueTextEquals("bufferView"u8)) { r.Read(); img.BufferView = r.GetInt32(); }
-                else if (r.ValueTextEquals("uri"u8)) { r.Read(); img.Uri = FixedString256.FromUtf8(r.ValueSpan); }
+                if (r.ValueTextEquals("bufferView"u8)) img.BufferView = ReadInt32Checked(ref r, "image.bufferView");
+                else if (r.ValueTextEquals("uri"u8))
+                {
+                    string? uriStr = ReadStringChecked(ref r, "image.uri");
+                    if (!string.IsNullOrEmpty(uriStr))
+                    {
+                        if (uriStr.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            int comma = uriStr.IndexOf(',');
+                            if (comma <= 0)
+                                throw new InvalidDataException("Malformed data URI in glTF image.");
+                            byte[] decoded = Convert.FromBase64String(uriStr.Substring(comma + 1));
+                            if (decoded.Length > 0)
+                            {
+                                byte* ptr = scratch.AllocUninitialized<byte>(decoded.Length, 16);
+                                decoded.CopyTo(new Span<byte>(ptr, decoded.Length));
+                                img.UriOrDataPtr = ptr;
+                                img.UriOrDataLen = decoded.Length;
+                                img.IsDataUri = 1;
+                            }
+                        }
+                        else
+                        {
+                            int byteCount = Encoding.UTF8.GetByteCount(uriStr);
+                            byte* ptr = scratch.AllocUninitialized<byte>(byteCount, 4);
+                            Encoding.UTF8.GetBytes(uriStr, new Span<byte>(ptr, byteCount));
+                            img.UriOrDataPtr = ptr;
+                            img.UriOrDataLen = byteCount;
+                            img.IsDataUri = 0;
+                        }
+                    }
+                }
                 else { r.Read(); r.Skip(); }
             }
             images.Add(img);
@@ -863,14 +1244,16 @@ public static unsafe class GltfLoader
 
     private static void ParseTextures(ref Utf8JsonReader r, ref NativeList<RawTexture> textures)
     {
-        r.Read();
+        ExpectToken(ref r, JsonTokenType.StartArray, "textures");
         while (r.Read() && r.TokenType != JsonTokenType.EndArray)
         {
+            if (r.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("Expected object in glTF textures array.");
             RawTexture tex = new RawTexture { Source = -1 };
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
-                if (r.ValueTextEquals("source"u8)) { r.Read(); tex.Source = r.GetInt32(); }
+                if (r.ValueTextEquals("source"u8)) tex.Source = ReadInt32Checked(ref r, "texture.source");
                 else { r.Read(); r.Skip(); }
             }
             textures.Add(tex);
@@ -879,9 +1262,11 @@ public static unsafe class GltfLoader
 
     private static void ParseMaterials(ref Utf8JsonReader r, ref NativeList<RawMat> materials)
     {
-        r.Read();
+        ExpectToken(ref r, JsonTokenType.StartArray, "materials");
         while (r.Read() && r.TokenType != JsonTokenType.EndArray)
         {
+            if (r.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("Expected object in glTF materials array.");
             RawMat m = new RawMat
             {
                 BaseColor = ColorF.White,
@@ -893,12 +1278,18 @@ public static unsafe class GltfLoader
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
-                if (r.ValueTextEquals("name"u8)) { r.Read(); m.Name = FixedString64.FromUtf8(r.ValueSpan); }
-                else if (r.ValueTextEquals("doubleSided"u8)) { r.Read(); m.DoubleSided = (byte)(r.GetBoolean() ? 1 : 0); }
-                else if (r.ValueTextEquals("alphaCutoff"u8)) { r.Read(); m.AlphaCutoff = r.GetSingle(); }
+                if (r.ValueTextEquals("name"u8))
+                {
+                    if (!r.Read() || r.TokenType != JsonTokenType.String)
+                        throw new InvalidDataException("Expected string for glTF material.name.");
+                    m.Name = FixedString64.FromUtf8(r.ValueSpan);
+                }
+                else if (r.ValueTextEquals("doubleSided"u8)) m.DoubleSided = (byte)(ReadBoolChecked(ref r, "material.doubleSided") ? 1 : 0);
+                else if (r.ValueTextEquals("alphaCutoff"u8)) m.AlphaCutoff = ReadSingleChecked(ref r, "material.alphaCutoff");
                 else if (r.ValueTextEquals("alphaMode"u8))
                 {
-                    r.Read();
+                    if (!r.Read() || r.TokenType != JsonTokenType.String)
+                        throw new InvalidDataException("Expected string for glTF material.alphaMode.");
                     if (r.ValueTextEquals("MASK"u8)) m.AlphaMode = MaterialAlphaMode.Mask;
                     else if (r.ValueTextEquals("BLEND"u8)) m.AlphaMode = MaterialAlphaMode.Blend;
                 }
@@ -908,7 +1299,7 @@ public static unsafe class GltfLoader
                 }
                 else if (r.ValueTextEquals("pbrMetallicRoughness"u8))
                 {
-                    r.Read(); // StartObject
+                    ExpectToken(ref r, JsonTokenType.StartObject, "material.pbrMetallicRoughness");
                     while (r.Read() && r.TokenType != JsonTokenType.EndObject)
                     {
                         if (r.TokenType != JsonTokenType.PropertyName) continue;
@@ -917,15 +1308,15 @@ public static unsafe class GltfLoader
                             Vec4 c = ReadVec4Array(ref r);
                             m.BaseColor = new ColorF(c.X, c.Y, c.Z, c.W);
                         }
-                        else if (r.ValueTextEquals("metallicFactor"u8)) { r.Read(); m.Metallic = r.GetSingle(); }
-                        else if (r.ValueTextEquals("roughnessFactor"u8)) { r.Read(); m.Roughness = r.GetSingle(); }
+                        else if (r.ValueTextEquals("metallicFactor"u8)) m.Metallic = ReadSingleChecked(ref r, "pbrMetallicRoughness.metallicFactor");
+                        else if (r.ValueTextEquals("roughnessFactor"u8)) m.Roughness = ReadSingleChecked(ref r, "pbrMetallicRoughness.roughnessFactor");
                         else if (r.ValueTextEquals("baseColorTexture"u8))
                         {
-                            r.Read();
+                            ExpectToken(ref r, JsonTokenType.StartObject, "pbrMetallicRoughness.baseColorTexture");
                             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
                             {
                                 if (r.TokenType == JsonTokenType.PropertyName && r.ValueTextEquals("index"u8))
-                                { r.Read(); m.BaseColorTex = r.GetInt32(); }
+                                    m.BaseColorTex = ReadInt32Checked(ref r, "baseColorTexture.index");
                                 else if (r.TokenType == JsonTokenType.PropertyName) { r.Read(); r.Skip(); }
                             }
                         }
@@ -940,36 +1331,40 @@ public static unsafe class GltfLoader
 
     private static void ParseMeshes(ref Utf8JsonReader r, ref NativeList<RawPrim> prims, ref NativeList<RawMesh> meshes)
     {
-        r.Read();
+        ExpectToken(ref r, JsonTokenType.StartArray, "meshes");
         while (r.Read() && r.TokenType != JsonTokenType.EndArray)
         {
+            if (r.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("Expected object in glTF meshes array.");
             RawMesh mesh = new RawMesh { PrimStart = prims.Count, PrimCount = 0 };
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
                 if (r.ValueTextEquals("primitives"u8))
                 {
-                    r.Read(); // StartArray
+                    ExpectToken(ref r, JsonTokenType.StartArray, "mesh.primitives");
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {
+                        if (r.TokenType != JsonTokenType.StartObject)
+                            throw new InvalidDataException("Expected object in glTF mesh.primitives array.");
                         RawPrim p = new RawPrim { PosAcc = -1, NormAcc = -1, UvAcc = -1, ColorAcc = -1, JointsAcc = -1, WeightsAcc = -1, IndicesAcc = -1, MaterialIdx = -1 };
                         while (r.Read() && r.TokenType != JsonTokenType.EndObject)
                         {
                             if (r.TokenType != JsonTokenType.PropertyName) continue;
-                            if (r.ValueTextEquals("indices"u8)) { r.Read(); p.IndicesAcc = r.GetInt32(); }
-                            else if (r.ValueTextEquals("material"u8)) { r.Read(); p.MaterialIdx = r.GetInt32(); }
+                            if (r.ValueTextEquals("indices"u8)) p.IndicesAcc = ReadInt32Checked(ref r, "primitive.indices");
+                            else if (r.ValueTextEquals("material"u8)) p.MaterialIdx = ReadInt32Checked(ref r, "primitive.material");
                             else if (r.ValueTextEquals("attributes"u8))
                             {
-                                r.Read();
+                                ExpectToken(ref r, JsonTokenType.StartObject, "primitive.attributes");
                                 while (r.Read() && r.TokenType != JsonTokenType.EndObject)
                                 {
                                     if (r.TokenType != JsonTokenType.PropertyName) continue;
-                                    if (r.ValueTextEquals("POSITION"u8)) { r.Read(); p.PosAcc = r.GetInt32(); }
-                                    else if (r.ValueTextEquals("NORMAL"u8)) { r.Read(); p.NormAcc = r.GetInt32(); }
-                                    else if (r.ValueTextEquals("TEXCOORD_0"u8)) { r.Read(); p.UvAcc = r.GetInt32(); }
-                                    else if (r.ValueTextEquals("COLOR_0"u8)) { r.Read(); p.ColorAcc = r.GetInt32(); }
-                                    else if (r.ValueTextEquals("JOINTS_0"u8)) { r.Read(); p.JointsAcc = r.GetInt32(); }
-                                    else if (r.ValueTextEquals("WEIGHTS_0"u8)) { r.Read(); p.WeightsAcc = r.GetInt32(); }
+                                    if (r.ValueTextEquals("POSITION"u8)) p.PosAcc = ReadInt32Checked(ref r, "attributes.POSITION");
+                                    else if (r.ValueTextEquals("NORMAL"u8)) p.NormAcc = ReadInt32Checked(ref r, "attributes.NORMAL");
+                                    else if (r.ValueTextEquals("TEXCOORD_0"u8)) p.UvAcc = ReadInt32Checked(ref r, "attributes.TEXCOORD_0");
+                                    else if (r.ValueTextEquals("COLOR_0"u8)) p.ColorAcc = ReadInt32Checked(ref r, "attributes.COLOR_0");
+                                    else if (r.ValueTextEquals("JOINTS_0"u8)) p.JointsAcc = ReadInt32Checked(ref r, "attributes.JOINTS_0");
+                                    else if (r.ValueTextEquals("WEIGHTS_0"u8)) p.WeightsAcc = ReadInt32Checked(ref r, "attributes.WEIGHTS_0");
                                     else { r.Read(); r.Skip(); }
                                 }
                             }
@@ -987,9 +1382,11 @@ public static unsafe class GltfLoader
 
     private static void ParseNodes(ref Utf8JsonReader r, ref NativeList<RawNode> nodes, ref NativeList<int> children)
     {
-        r.Read();
+        ExpectToken(ref r, JsonTokenType.StartArray, "nodes");
         while (r.Read() && r.TokenType != JsonTokenType.EndArray)
         {
+            if (r.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("Expected object in glTF nodes array.");
             RawNode n = new RawNode
             {
                 MeshIndex = -1,
@@ -1002,9 +1399,14 @@ public static unsafe class GltfLoader
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
-                if (r.ValueTextEquals("name"u8)) { r.Read(); n.Name = FixedString64.FromUtf8(r.ValueSpan); }
-                else if (r.ValueTextEquals("mesh"u8)) { r.Read(); n.MeshIndex = r.GetInt32(); }
-                else if (r.ValueTextEquals("skin"u8)) { r.Read(); n.SkinIndex = r.GetInt32(); }
+                if (r.ValueTextEquals("name"u8))
+                {
+                    if (!r.Read() || r.TokenType != JsonTokenType.String)
+                        throw new InvalidDataException("Expected string for glTF node.name.");
+                    n.Name = FixedString64.FromUtf8(r.ValueSpan);
+                }
+                else if (r.ValueTextEquals("mesh"u8)) n.MeshIndex = ReadInt32Checked(ref r, "node.mesh");
+                else if (r.ValueTextEquals("skin"u8)) n.SkinIndex = ReadInt32Checked(ref r, "node.skin");
                 else if (r.ValueTextEquals("translation"u8)) n.Translation = ReadVec3Array(ref r);
                 else if (r.ValueTextEquals("scale"u8)) n.Scale = ReadVec3Array(ref r);
                 else if (r.ValueTextEquals("rotation"u8))
@@ -1020,10 +1422,12 @@ public static unsafe class GltfLoader
                 else if (r.ValueTextEquals("children"u8))
                 {
                     n.ChildStart = children.Count;
-                    r.Read();
+                    ExpectToken(ref r, JsonTokenType.StartArray, "node.children");
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {
-                        children.Add(r.GetInt32());
+                        if (r.TokenType != JsonTokenType.Number || !r.TryGetInt32(out int childIdx))
+                            throw new InvalidDataException("Expected integer in glTF node.children array.");
+                        children.Add(childIdx);
                         n.ChildCount++;
                     }
                 }
@@ -1035,21 +1439,25 @@ public static unsafe class GltfLoader
 
     private static void ParseSkins(ref Utf8JsonReader r, ref NativeList<RawSkin> skins, ref NativeList<int> joints)
     {
-        r.Read();
+        ExpectToken(ref r, JsonTokenType.StartArray, "skins");
         while (r.Read() && r.TokenType != JsonTokenType.EndArray)
         {
+            if (r.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("Expected object in glTF skins array.");
             RawSkin s = new RawSkin { IbmAcc = -1, JointStart = joints.Count };
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
-                if (r.ValueTextEquals("inverseBindMatrices"u8)) { r.Read(); s.IbmAcc = r.GetInt32(); }
+                if (r.ValueTextEquals("inverseBindMatrices"u8)) s.IbmAcc = ReadInt32Checked(ref r, "skin.inverseBindMatrices");
                 else if (r.ValueTextEquals("joints"u8))
                 {
                     s.JointStart = joints.Count;
-                    r.Read();
+                    ExpectToken(ref r, JsonTokenType.StartArray, "skin.joints");
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {
-                        joints.Add(r.GetInt32());
+                        if (r.TokenType != JsonTokenType.Number || !r.TryGetInt32(out int jIdx))
+                            throw new InvalidDataException("Expected integer in glTF skin.joints array.");
+                        joints.Add(jIdx);
                         s.JointCount++;
                     }
                 }
@@ -1061,29 +1469,39 @@ public static unsafe class GltfLoader
 
     private static void ParseAnimations(ref Utf8JsonReader r, ref NativeList<RawAnim> anims, ref NativeList<RawAnimSampler> samplers, ref NativeList<RawAnimChannel> channels)
     {
-        r.Read();
+        ExpectToken(ref r, JsonTokenType.StartArray, "animations");
         while (r.Read() && r.TokenType != JsonTokenType.EndArray)
         {
+            if (r.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("Expected object in glTF animations array.");
             RawAnim a = new RawAnim { SamplerStart = samplers.Count, ChannelStart = channels.Count };
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
-                if (r.ValueTextEquals("name"u8)) { r.Read(); a.Name = FixedString64.FromUtf8(r.ValueSpan); }
+                if (r.ValueTextEquals("name"u8))
+                {
+                    if (!r.Read() || r.TokenType != JsonTokenType.String)
+                        throw new InvalidDataException("Expected string for glTF animation.name.");
+                    a.Name = FixedString64.FromUtf8(r.ValueSpan);
+                }
                 else if (r.ValueTextEquals("samplers"u8))
                 {
                     a.SamplerStart = samplers.Count;
-                    r.Read();
+                    ExpectToken(ref r, JsonTokenType.StartArray, "animation.samplers");
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {
-                        RawAnimSampler s = new RawAnimSampler { Interp = AnimInterpolation.Linear };
+                        if (r.TokenType != JsonTokenType.StartObject)
+                            throw new InvalidDataException("Expected object in glTF animation.samplers array.");
+                        RawAnimSampler s = new RawAnimSampler { InputAcc = -1, OutputAcc = -1, Interp = AnimInterpolation.Linear };
                         while (r.Read() && r.TokenType != JsonTokenType.EndObject)
                         {
                             if (r.TokenType != JsonTokenType.PropertyName) continue;
-                            if (r.ValueTextEquals("input"u8)) { r.Read(); s.InputAcc = r.GetInt32(); }
-                            else if (r.ValueTextEquals("output"u8)) { r.Read(); s.OutputAcc = r.GetInt32(); }
+                            if (r.ValueTextEquals("input"u8)) s.InputAcc = ReadInt32Checked(ref r, "sampler.input");
+                            else if (r.ValueTextEquals("output"u8)) s.OutputAcc = ReadInt32Checked(ref r, "sampler.output");
                             else if (r.ValueTextEquals("interpolation"u8))
                             {
-                                r.Read();
+                                if (!r.Read() || r.TokenType != JsonTokenType.String)
+                                    throw new InvalidDataException("Expected string for glTF sampler.interpolation.");
                                 if (r.ValueTextEquals("STEP"u8)) s.Interp = AnimInterpolation.Step;
                                 else if (r.ValueTextEquals("CUBICSPLINE"u8)) s.Interp = AnimInterpolation.CubicSpline;
                             }
@@ -1096,27 +1514,30 @@ public static unsafe class GltfLoader
                 else if (r.ValueTextEquals("channels"u8))
                 {
                     a.ChannelStart = channels.Count;
-                    r.Read();
+                    ExpectToken(ref r, JsonTokenType.StartArray, "animation.channels");
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {
-                        RawAnimChannel c = default;
+                        if (r.TokenType != JsonTokenType.StartObject)
+                            throw new InvalidDataException("Expected object in glTF animation.channels array.");
+                        RawAnimChannel c = new RawAnimChannel { SamplerIdx = -1, TargetNode = -1 };
                         while (r.Read() && r.TokenType != JsonTokenType.EndObject)
                         {
                             if (r.TokenType != JsonTokenType.PropertyName) continue;
-                            if (r.ValueTextEquals("sampler"u8)) { r.Read(); c.SamplerIdx = r.GetInt32(); }
+                            if (r.ValueTextEquals("sampler"u8)) c.SamplerIdx = ReadInt32Checked(ref r, "channel.sampler");
                             else if (r.ValueTextEquals("target"u8))
                             {
-                                r.Read();
+                                ExpectToken(ref r, JsonTokenType.StartObject, "channel.target");
                                 while (r.Read() && r.TokenType != JsonTokenType.EndObject)
                                 {
                                     if (r.TokenType != JsonTokenType.PropertyName) continue;
-                                    if (r.ValueTextEquals("node"u8)) { r.Read(); c.TargetNode = r.GetInt32(); }
+                                    if (r.ValueTextEquals("node"u8)) c.TargetNode = ReadInt32Checked(ref r, "target.node");
                                     else if (r.ValueTextEquals("path"u8))
                                     {
-                                        r.Read();
-                                        if (r.ValueTextEquals("translation"u8)) c.Path = AnimTargetPath.Translation;
-                                        else if (r.ValueTextEquals("rotation"u8)) c.Path = AnimTargetPath.Rotation;
-                                        else if (r.ValueTextEquals("scale"u8)) c.Path = AnimTargetPath.Scale;
+                                        if (!r.Read() || r.TokenType != JsonTokenType.String)
+                                            throw new InvalidDataException("Expected string for glTF target.path.");
+                                        if (r.ValueTextEquals("translation"u8)) { c.Path = AnimTargetPath.Translation; c.HasPath = 1; }
+                                        else if (r.ValueTextEquals("rotation"u8)) { c.Path = AnimTargetPath.Rotation; c.HasPath = 1; }
+                                        else if (r.ValueTextEquals("scale"u8)) { c.Path = AnimTargetPath.Scale; c.HasPath = 1; }
                                     }
                                     else { r.Read(); r.Skip(); }
                                 }
@@ -1135,31 +1556,32 @@ public static unsafe class GltfLoader
 
     private static Vec3 ReadVec3Array(ref Utf8JsonReader r)
     {
-        r.Read(); // StartArray
-        r.Read(); float x = r.GetSingle();
-        r.Read(); float y = r.GetSingle();
-        r.Read(); float z = r.GetSingle();
-        while (r.Read() && r.TokenType != JsonTokenType.EndArray) { }
+        ExpectToken(ref r, JsonTokenType.StartArray, "vec3");
+        float x = ReadSingleChecked(ref r, "vec3[0]");
+        float y = ReadSingleChecked(ref r, "vec3[1]");
+        float z = ReadSingleChecked(ref r, "vec3[2]");
+        ExpectToken(ref r, JsonTokenType.EndArray, "vec3 end");
         return new Vec3(x, y, z);
     }
 
     private static Vec4 ReadVec4Array(ref Utf8JsonReader r)
     {
-        r.Read();
-        r.Read(); float x = r.GetSingle();
-        r.Read(); float y = r.GetSingle();
-        r.Read(); float z = r.GetSingle();
-        r.Read(); float w = r.GetSingle();
-        while (r.Read() && r.TokenType != JsonTokenType.EndArray) { }
+        ExpectToken(ref r, JsonTokenType.StartArray, "vec4");
+        float x = ReadSingleChecked(ref r, "vec4[0]");
+        float y = ReadSingleChecked(ref r, "vec4[1]");
+        float z = ReadSingleChecked(ref r, "vec4[2]");
+        float w = ReadSingleChecked(ref r, "vec4[3]");
+        ExpectToken(ref r, JsonTokenType.EndArray, "vec4 end");
         return new Vec4(x, y, z, w);
     }
 
     private static Mat4 ReadMat4Array(ref Utf8JsonReader r)
     {
         float* f = stackalloc float[16];
-        r.Read();
-        for (int i = 0; i < 16; i++) { r.Read(); f[i] = r.GetSingle(); }
-        while (r.Read() && r.TokenType != JsonTokenType.EndArray) { }
+        ExpectToken(ref r, JsonTokenType.StartArray, "mat4");
+        for (int i = 0; i < 16; i++)
+            f[i] = ReadSingleChecked(ref r, "mat4 element");
+        ExpectToken(ref r, JsonTokenType.EndArray, "mat4 end");
         return new Mat4
         {
             C0 = new Vec4(f[0], f[1], f[2], f[3]),
@@ -1190,44 +1612,70 @@ public static unsafe class GltfLoader
         if (model == null) return EntityId.Invalid;
 
         EntityId root = EntitySystem.Spawn(ref world.Entities, ownerScene);
-        TransformSystem.Add(ref world.Transforms, root, position, rotation, scale);
-
-        if (model->NodeCount == 0) return root;
-
         ArenaMarker mark = scratchArena.SaveMarker();
-        EntityId* nodeEntities = scratchArena.Alloc<EntityId>(model->NodeCount);
-        int* skinAnimPlayers = model->SkinCount > 0 ? scratchArena.AllocUninitialized<int>(model->SkinCount) : null;
+        EntityId* nodeEntities = null;
+        int spawnedNodeCount = 0;
 
-        for (int s = 0; s < model->SkinCount; s++)
+        try
         {
-            AnimClipHandle clip = (autoPlayFirstAnimation && model->AnimationCount > 0)
-                ? model->Animations[0] : AnimClipHandle.Invalid;
-            skinAnimPlayers[s] = AnimationSystem.AddPlayer(ref world.Animations, root, model->Skins[s], clip, ownerScene);
-        }
+            TransformSystem.Add(ref world.Transforms, root, position, rotation, scale);
 
-        // First pass: spawn entities for every node
-        for (int n = 0; n < model->NodeCount; n++)
-            nodeEntities[n] = EntitySystem.Spawn(ref world.Entities, ownerScene);
+            if (model->NodeCount == 0) return root;
 
-        // Second pass: add transforms & mesh renderers
-        for (int n = 0; n < model->NodeCount; n++)
-        {
-            GltfNodeData nd = model->Nodes[n];
-            EntityId parent = (nd.ParentIndex >= 0 && nd.ParentIndex < model->NodeCount)
-                ? nodeEntities[nd.ParentIndex] : root;
-            TransformSystem.Add(ref world.Transforms, nodeEntities[n], nd.LocalPosition, nd.LocalRotation, nd.LocalScale, parent);
+            nodeEntities = scratchArena.Alloc<EntityId>(model->NodeCount);
+            AnimPlayerHandle* skinAnimPlayers = model->SkinCount > 0 ? scratchArena.AllocUninitialized<AnimPlayerHandle>(model->SkinCount) : null;
 
-            int animPlayerIdx = (nd.SkinIndex >= 0 && nd.SkinIndex < model->SkinCount) ? skinAnimPlayers[nd.SkinIndex] : -1;
-            for (int p = 0; p < nd.PrimitiveCount; p++)
+            for (int s = 0; s < model->SkinCount; s++)
             {
-                GltfPrimitiveRef pr = model->Primitives[nd.PrimitiveStart + p];
-                RenderComponentSystem.AddMeshRenderer(
-                    ref world.RenderComponents, nodeEntities[n], pr.Mesh, pr.Material,
-                    ownerScene, tint, layerMask, animPlayerIdx);
+                AnimClipHandle clip = (autoPlayFirstAnimation && model->AnimationCount > 0)
+                    ? model->Animations[0] : AnimClipHandle.Invalid;
+                skinAnimPlayers[s] = AnimationSystem.AddPlayer(ref world.Animations, root, model->Skins[s], clip, ownerScene);
             }
-        }
 
-        scratchArena.Rollback(mark);
-        return root;
+            // First pass: spawn entities for every node
+            for (int n = 0; n < model->NodeCount; n++)
+            {
+                nodeEntities[n] = EntitySystem.Spawn(ref world.Entities, ownerScene);
+                spawnedNodeCount++;
+            }
+
+            // Second pass: add transforms & mesh renderers
+            for (int n = 0; n < model->NodeCount; n++)
+            {
+                GltfNodeData nd = model->Nodes[n];
+                EntityId parent = (nd.ParentIndex >= 0 && nd.ParentIndex < model->NodeCount)
+                    ? nodeEntities[nd.ParentIndex] : root;
+                TransformSystem.Add(ref world.Transforms, nodeEntities[n], nd.LocalPosition, nd.LocalRotation, nd.LocalScale, parent);
+
+                AnimPlayerHandle animPlayer = (nd.SkinIndex >= 0 && nd.SkinIndex < model->SkinCount) ? skinAnimPlayers[nd.SkinIndex] : AnimPlayerHandle.Invalid;
+                for (int p = 0; p < nd.PrimitiveCount; p++)
+                {
+                    GltfPrimitiveRef pr = model->Primitives[nd.PrimitiveStart + p];
+                    RenderComponentSystem.AddMeshRenderer(
+                        ref world.RenderComponents, nodeEntities[n], pr.Mesh, pr.Material,
+                        ownerScene, tint, layerMask, animPlayer);
+                }
+            }
+
+            return root;
+        }
+        catch
+        {
+            if (nodeEntities != null)
+            {
+                for (int n = 0; n < spawnedNodeCount; n++)
+                {
+                    if (EntitySystem.IsAlive(in world.Entities, nodeEntities[n]))
+                        EngineWorldSystem.DestroyEntity(ref world, nodeEntities[n]);
+                }
+            }
+            if (EntitySystem.IsAlive(in world.Entities, root))
+                EngineWorldSystem.DestroyEntity(ref world, root);
+            throw;
+        }
+        finally
+        {
+            scratchArena.Rollback(mark);
+        }
     }
 }

@@ -49,22 +49,28 @@ VSOutput VSMain(VSInput input)
 {
     Instance3D inst = Instances[BaseInstance + input.InstanceId];
     float4 localPos = float4(input.Position, 1.0);
+    // Reference all 7 Mesh3D VSInput attributes so SPIR-V/DXIL/MSL reflection keeps exact vertex layout
+    localPos.xyz += (input.Normal + float3(input.Uv0 + input.TangentHint, 0.0) + input.Color.xyz) * 0.0;
 
     int jointOff = (int)inst.Extra.z;
     if (jointOff >= 0)
     {
-        uint j0 = (input.JointIndices) & 0xFFu;
-        uint j1 = (input.JointIndices >> 8) & 0xFFu;
-        uint j2 = (input.JointIndices >> 16) & 0xFFu;
-        uint j3 = (input.JointIndices >> 24) & 0xFFu;
+        float weightSum = input.JointWeights.x + input.JointWeights.y + input.JointWeights.z + input.JointWeights.w;
+        if (weightSum > 1e-5)
+        {
+            uint j0 = (input.JointIndices) & 0xFFu;
+            uint j1 = (input.JointIndices >> 8) & 0xFFu;
+            uint j2 = (input.JointIndices >> 16) & 0xFFu;
+            uint j3 = (input.JointIndices >> 24) & 0xFFu;
 
-        float4x4 skinMat =
-            JointPalette[jointOff + j0] * input.JointWeights.x +
-            JointPalette[jointOff + j1] * input.JointWeights.y +
-            JointPalette[jointOff + j2] * input.JointWeights.z +
-            JointPalette[jointOff + j3] * input.JointWeights.w;
+            float4x4 skinMat =
+                JointPalette[jointOff + j0] * input.JointWeights.x +
+                JointPalette[jointOff + j1] * input.JointWeights.y +
+                JointPalette[jointOff + j2] * input.JointWeights.z +
+                JointPalette[jointOff + j3] * input.JointWeights.w;
 
-        localPos = mul(skinMat, localPos);
+            localPos = mul(skinMat, localPos);
+        }
     }
 
     float4 worldPos = mul(inst.Model, localPos);

@@ -55,45 +55,60 @@ public static unsafe class PackCompressionSystem
 
     public static byte[] Compress(ReadOnlySpan<byte> src, PackCompressionMode mode)
     {
-        if (src.IsEmpty || mode == PackCompressionMode.None)
-            return src.ToArray();
-
-        if (mode == PackCompressionMode.Brotli)
+        switch (mode)
         {
-            int maxLen = BrotliEncoder.GetMaxCompressedLength(src.Length);
-            byte[] buf = new byte[maxLen];
-            if (!BrotliEncoder.TryCompress(src, buf, out int written, quality: 6, window: 22))
-                throw new InvalidOperationException("Brotli compression failed.");
-            byte[] trimmed = new byte[written];
-            Buffer.BlockCopy(buf, 0, trimmed, 0, written);
-            return trimmed;
-        }
+            case PackCompressionMode.None:
+                return src.ToArray();
 
-        // LZ4 block compression
-        int bound = src.Length + (src.Length / 255) + 32;
-        byte[] lz4Buf = new byte[bound];
-        int lz4Written = CompressLz4Block(src, lz4Buf);
-        byte[] lz4Trimmed = new byte[lz4Written];
-        Buffer.BlockCopy(lz4Buf, 0, lz4Trimmed, 0, lz4Written);
-        return lz4Trimmed;
+            case PackCompressionMode.Brotli:
+            {
+                if (src.IsEmpty) return Array.Empty<byte>();
+                int maxLen = BrotliEncoder.GetMaxCompressedLength(src.Length);
+                byte[] buf = new byte[maxLen];
+                if (!BrotliEncoder.TryCompress(src, buf, out int written, quality: 6, window: 22))
+                    throw new InvalidOperationException("Brotli compression failed.");
+                byte[] trimmed = new byte[written];
+                Buffer.BlockCopy(buf, 0, trimmed, 0, written);
+                return trimmed;
+            }
+
+            case PackCompressionMode.Lz4:
+            {
+                if (src.IsEmpty) return Array.Empty<byte>();
+                int bound = checked(src.Length + (src.Length / 255) + 32);
+                byte[] lz4Buf = new byte[bound];
+                int lz4Written = CompressLz4Block(src, lz4Buf);
+                byte[] lz4Trimmed = new byte[lz4Written];
+                Buffer.BlockCopy(lz4Buf, 0, lz4Trimmed, 0, lz4Written);
+                return lz4Trimmed;
+            }
+
+            default:
+                throw new InvalidDataException($"Unsupported compression mode: {mode}.");
+        }
     }
 
     public static int Decompress(ReadOnlySpan<byte> src, PackCompressionMode mode, Span<byte> dst)
     {
-        if (mode == PackCompressionMode.None)
+        switch (mode)
         {
-            src.CopyTo(dst);
-            return src.Length;
-        }
+            case PackCompressionMode.None:
+                if (src.Length > dst.Length)
+                    throw new InvalidDataException("Uncompressed payload exceeds destination capacity.");
+                src.CopyTo(dst);
+                return src.Length;
 
-        if (mode == PackCompressionMode.Brotli)
-        {
-            if (!BrotliDecoder.TryDecompress(src, dst, out int written))
-                throw new InvalidDataException("Brotli decompression failed.");
-            return written;
-        }
+            case PackCompressionMode.Brotli:
+                if (!BrotliDecoder.TryDecompress(src, dst, out int written))
+                    throw new InvalidDataException("Brotli decompression failed.");
+                return written;
 
-        return DecompressLz4Block(src, dst);
+            case PackCompressionMode.Lz4:
+                return DecompressLz4Block(src, dst);
+
+            default:
+                throw new InvalidDataException($"Unsupported compression mode: {mode}.");
+        }
     }
 
     /// <summary>
@@ -103,6 +118,7 @@ public static unsafe class PackCompressionSystem
     {
         int srcLen = src.Length;
         if (srcLen == 0) return 0;
+        int dstLen = dst.Length;
 
         int* hashTable = stackalloc int[Lz4HashSize];
         for (int i = 0; i < Lz4HashSize; i++) hashTable[i] = -1;
@@ -128,21 +144,30 @@ public static unsafe class PackCompressionSystem
                     if (refPos >= 0 && (ip - refPos) <= Lz4MaxDistance && *(uint*)(sBase + refPos) == seq)
                     {
                         int litLen = ip - anchor;
+                        if (op >= dstLen)
+                            throw new ArgumentException("Destination buffer is too small for LZ4 compression.", nameof(dst));
                         int tokenPos = op++;
                         int tokenLit = litLen >= 15 ? 15 : litLen;
                         if (litLen >= 15)
                         {
                             int rem = litLen - 15;
+                            int extBytes = (rem / 255) + 1;
+                            if (extBytes > dstLen - op)
+                                throw new ArgumentException("Destination buffer is too small for LZ4 compression.", nameof(dst));
                             while (rem >= 255) { dBase[op++] = 255; rem -= 255; }
                             dBase[op++] = (byte)rem;
                         }
                         if (litLen > 0)
                         {
-                            Buffer.MemoryCopy(sBase + anchor, dBase + op, dst.Length - op, litLen);
+                            if (litLen > dstLen - op)
+                                throw new ArgumentException("Destination buffer is too small for LZ4 compression.", nameof(dst));
+                            Buffer.MemoryCopy(sBase + anchor, dBase + op, dstLen - op, litLen);
                             op += litLen;
                         }
 
                         // Write 16-bit LE offset
+                        if (2 > dstLen - op)
+                            throw new ArgumentException("Destination buffer is too small for LZ4 compression.", nameof(dst));
                         int offset = ip - refPos;
                         dBase[op++] = (byte)(offset & 0xFF);
                         dBase[op++] = (byte)((offset >> 8) & 0xFF);
@@ -158,6 +183,9 @@ public static unsafe class PackCompressionSystem
                         if (mlCode >= 15)
                         {
                             int rem = mlCode - 15;
+                            int extBytes = (rem / 255) + 1;
+                            if (extBytes > dstLen - op)
+                                throw new ArgumentException("Destination buffer is too small for LZ4 compression.", nameof(dst));
                             while (rem >= 255) { dBase[op++] = 255; rem -= 255; }
                             dBase[op++] = (byte)rem;
                         }
@@ -176,19 +204,26 @@ public static unsafe class PackCompressionSystem
             int lastLit = srcLen - anchor;
             if (lastLit >= 15)
             {
-                dBase[op++] = 0xF0;
                 int rem = lastLit - 15;
+                int extBytes = (rem / 255) + 1;
+                if (1 + extBytes > dstLen - op)
+                    throw new ArgumentException("Destination buffer is too small for LZ4 compression.", nameof(dst));
+                dBase[op++] = 0xF0;
                 while (rem >= 255) { dBase[op++] = 255; rem -= 255; }
                 dBase[op++] = (byte)rem;
             }
             else
             {
+                if (op >= dstLen)
+                    throw new ArgumentException("Destination buffer is too small for LZ4 compression.", nameof(dst));
                 dBase[op++] = (byte)(lastLit << 4);
             }
 
             if (lastLit > 0)
             {
-                Buffer.MemoryCopy(sBase + anchor, dBase + op, dst.Length - op, lastLit);
+                if (lastLit > dstLen - op)
+                    throw new ArgumentException("Destination buffer is too small for LZ4 compression.", nameof(dst));
+                Buffer.MemoryCopy(sBase + anchor, dBase + op, dstLen - op, lastLit);
                 op += lastLit;
             }
             return op;
@@ -216,10 +251,18 @@ public static unsafe class PackCompressionSystem
                 int litLen = token >> 4;
                 if (litLen == 15)
                 {
-                    byte b;
-                    do { b = sBase[ip++]; litLen += b; } while (b == 255 && ip < srcLen);
+                    while (true)
+                    {
+                        if (ip >= srcLen)
+                            throw new InvalidDataException("Truncated LZ4 literal length.");
+                        byte b = sBase[ip++];
+                        if (litLen > dstLen - op - b)
+                            throw new InvalidDataException("Corrupt LZ4 literal length.");
+                        litLen += b;
+                        if (b != 255) break;
+                    }
                 }
-                if (ip + litLen > srcLen || op + litLen > dstLen)
+                if (litLen > srcLen - ip || litLen > dstLen - op)
                     throw new InvalidDataException("Corrupt LZ4 literal stream.");
                 if (litLen > 0)
                 {
@@ -229,7 +272,7 @@ public static unsafe class PackCompressionSystem
                 }
                 if (ip >= srcLen) break;
 
-                if (ip + 2 > srcLen)
+                if (2 > srcLen - ip)
                     throw new InvalidDataException("Corrupt LZ4 offset.");
                 int offset = sBase[ip] | (sBase[ip + 1] << 8);
                 ip += 2;
@@ -239,10 +282,18 @@ public static unsafe class PackCompressionSystem
                 int matchLen = (token & 0x0F) + Lz4MinMatch;
                 if ((token & 0x0F) == 15)
                 {
-                    byte b;
-                    do { b = sBase[ip++]; matchLen += b; } while (b == 255 && ip < srcLen);
+                    while (true)
+                    {
+                        if (ip >= srcLen)
+                            throw new InvalidDataException("Truncated LZ4 match length.");
+                        byte b = sBase[ip++];
+                        if (matchLen > dstLen - op - b)
+                            throw new InvalidDataException("Corrupt LZ4 match length.");
+                        matchLen += b;
+                        if (b != 255) break;
+                    }
                 }
-                if (op + matchLen > dstLen)
+                if (matchLen > dstLen - op)
                     throw new InvalidDataException("Corrupt LZ4 match exceeds output capacity.");
 
                 int refPos = op - offset;
@@ -337,16 +388,20 @@ public static unsafe class PackCompressionSystem
             uint len = MemoryMarshal.Read<uint>(glbBytes.Slice(off));
             uint type = MemoryMarshal.Read<uint>(glbBytes.Slice(off + 4));
             off += 8;
-            if (off + (int)len > glbBytes.Length) break;
-            if (type == ChunkJson) jsonSpan = glbBytes.Slice(off, (int)len);
-            else if (type == ChunkBin) binSpan = glbBytes.Slice(off, (int)len);
-            off += (int)len;
+            if (len > (uint)(glbBytes.Length - off))
+                throw new InvalidDataException("GLB chunk length exceeds file bounds.");
+            int chunkLen = (int)len;
+            if (type == ChunkJson) jsonSpan = glbBytes.Slice(off, chunkLen);
+            else if (type == ChunkBin) binSpan = glbBytes.Slice(off, chunkLen);
+            off += chunkLen;
         }
         if (jsonSpan.IsEmpty || binSpan.IsEmpty) return glbBytes.ToArray();
 
         // Parse image bufferView indices via JsonDocument (zero reflection, NativeAOT safe)
         ReadOnlyMemory<byte> jsonMem = StripUtf8Bom(jsonSpan.ToArray());
         using var doc = JsonDocument.Parse(jsonMem);
+        if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("GLB JSON root must be an object.");
         if (!doc.RootElement.TryGetProperty("images", out JsonElement imagesEl) ||
             imagesEl.ValueKind != JsonValueKind.Array || imagesEl.GetArrayLength() == 0)
             return glbBytes.ToArray();
@@ -361,10 +416,14 @@ public static unsafe class PackCompressionSystem
 
         foreach (JsonElement img in imagesEl.EnumerateArray())
         {
-            if (img.TryGetProperty("bufferView", out JsonElement bvEl))
+            if (img.ValueKind == JsonValueKind.Object &&
+                img.TryGetProperty("bufferView", out JsonElement bvEl) &&
+                bvEl.ValueKind == JsonValueKind.Number &&
+                bvEl.TryGetInt32(out int bv) &&
+                (uint)bv < (uint)viewCount)
             {
-                int bv = bvEl.GetInt32();
-                if ((uint)bv < (uint)viewCount) { isImageView[bv] = true; anyImageView = true; }
+                isImageView[bv] = true;
+                anyImageView = true;
             }
         }
         if (!anyImageView) return glbBytes.ToArray();
@@ -377,14 +436,17 @@ public static unsafe class PackCompressionSystem
         int vIdx = 0;
         foreach (JsonElement bv in viewsEl.EnumerateArray())
         {
-            int oldOff = bv.TryGetProperty("byteOffset", out var oEl) ? oEl.GetInt32() : 0;
+            int oldOff = (bv.TryGetProperty("byteOffset", out var oEl) && oEl.ValueKind == JsonValueKind.Number) ? oEl.GetInt32() : 0;
             int oldLen = bv.GetProperty("byteLength").GetInt32();
+            if (oldOff < 0 || oldLen < 0 || (long)oldOff + oldLen > binSpan.Length)
+                throw new InvalidDataException($"GLB bufferView {vIdx} exceeds BIN chunk bounds.");
+
             int curPos = (int)newBin.Position;
             int pad = (4 - (curPos & 3)) & 3;
             for (int p = 0; p < pad; p++) newBin.WriteByte(0);
             newOffsets[vIdx] = (int)newBin.Position;
 
-            if (isImageView[vIdx] && oldOff + oldLen <= binSpan.Length)
+            if (isImageView[vIdx])
             {
                 ReadOnlySpan<byte> imgRaw = binSpan.Slice(oldOff, oldLen);
                 if (imgRaw.Length >= sizeof(BrtxHeader) && MemoryMarshal.Read<uint>(imgRaw) == BrtxHeader.MagicValue)
@@ -402,7 +464,7 @@ public static unsafe class PackCompressionSystem
                     newLengths[vIdx] = brtx.Length;
                 }
             }
-            else if (oldOff + oldLen <= binSpan.Length)
+            else
             {
                 newBin.Write(binSpan.Slice(oldOff, oldLen));
                 newLengths[vIdx] = oldLen;
@@ -630,15 +692,63 @@ public static unsafe class PackCompressionSystem
             ? new ReadOnlyMemory<byte>(data, 3, data.Length - 3)
             : new ReadOnlyMemory<byte>(data);
 
+    internal static bool TryResolveSafeRelativePath(string baseDir, string uri, out string fullPath)
+    {
+        fullPath = string.Empty;
+        if (string.IsNullOrWhiteSpace(baseDir) || string.IsNullOrWhiteSpace(uri))
+            return false;
+
+        string unescaped;
+        try
+        {
+            unescaped = Uri.UnescapeDataString(uri.Trim());
+        }
+        catch (UriFormatException)
+        {
+            return false;
+        }
+
+        if (unescaped.IndexOf('\0') >= 0)
+            return false;
+
+        // Reject rooted paths on any OS (Unix leading '/', Windows '\\', drive letter 'C:', UNC)
+        if (Path.IsPathRooted(unescaped) ||
+            unescaped.StartsWith('/') ||
+            unescaped.StartsWith('\\') ||
+            (unescaped.Length >= 2 && unescaped[1] == ':' && char.IsLetter(unescaped[0])))
+        {
+            return false;
+        }
+
+        string normalizedRel = unescaped.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+        string fullBase = Path.GetFullPath(baseDir);
+        string fullBaseWithSep = (fullBase.EndsWith(Path.DirectorySeparatorChar) || fullBase.EndsWith(Path.AltDirectorySeparatorChar))
+            ? fullBase
+            : fullBase + Path.DirectorySeparatorChar;
+
+        string combined = Path.GetFullPath(Path.Combine(fullBase, normalizedRel));
+        StringComparison cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (!combined.StartsWith(fullBaseWithSep, cmp))
+            return false;
+
+        fullPath = combined;
+        return true;
+    }
+
     private static byte[] ResolveUriBytes(string uri, string baseDir)
     {
         if (uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
         {
             int comma = uri.IndexOf(',');
-            return comma > 0 ? Convert.FromBase64String(uri.Substring(comma + 1)) : Array.Empty<byte>();
+            if (comma <= 0)
+                throw new InvalidDataException("Malformed data URI in glTF.");
+            return Convert.FromBase64String(uri.Substring(comma + 1));
         }
-        string full = Path.Combine(baseDir, uri);
-        return File.Exists(full) ? File.ReadAllBytes(full) : Array.Empty<byte>();
+        if (!TryResolveSafeRelativePath(baseDir, uri, out string full))
+            throw new InvalidDataException($"Unsafe external glTF URI rejected: '{uri}'.");
+        if (!File.Exists(full))
+            throw new FileNotFoundException($"Referenced external glTF resource not found: '{full}'.", full);
+        return File.ReadAllBytes(full);
     }
 
     private static byte[] AssembleGlb(byte[] jsonRaw, byte[] binRaw)

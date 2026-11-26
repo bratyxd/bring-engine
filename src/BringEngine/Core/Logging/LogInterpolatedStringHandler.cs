@@ -1,8 +1,10 @@
 using System;
+using System.Buffers;
 using System.Buffers.Text;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Unicode;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
@@ -86,21 +88,22 @@ public unsafe ref struct LogUtf8Builder
             return;
         }
 
-        // General UTF-8 path for non-ASCII characters
+        // General UTF-8 path for non-ASCII characters (O(cap - Length), zero GC, rune-boundary safe)
         ReadOnlySpan<char> tail = chars.Slice(i);
         Span<byte> dstSpan = new Span<byte>(_dst + Length, _cap - Length);
-        if (Encoding.UTF8.TryGetBytes(tail, dstSpan, out int written))
+        OperationStatus status = Utf8.FromUtf16(
+            tail, dstSpan, out int charsRead, out int written,
+            replaceInvalidSequences: true, isFinalBlock: false);
+        Length += written;
+        if (status == OperationStatus.NeedMoreData && Length < _cap)
         {
-            Length += written;
+            Utf8.FromUtf16(
+                tail.Slice(charsRead), new Span<byte>(_dst + Length, _cap - Length),
+                out _, out int extra, replaceInvalidSequences: true, isFinalBlock: true);
+            Length += extra;
         }
-        else
+        else if (status != OperationStatus.Done)
         {
-            // Fit as many whole chars as possible without throwing
-            int fit = tail.Length;
-            while (fit > 0 && Encoding.UTF8.GetByteCount(tail.Slice(0, fit)) > dstSpan.Length)
-                fit--;
-            if (fit > 0)
-                Length += Encoding.UTF8.GetBytes(tail.Slice(0, fit), dstSpan);
             Truncated = 1;
         }
     }
@@ -154,7 +157,7 @@ public unsafe ref struct LogUtf8Builder
 
     private void AppendHandle(ReadOnlySpan<byte> prefix, uint raw)
     {
-        if (raw == 0)
+        if ((raw >> HandlePacking.GenerationShift) == 0)
         {
             AppendUtf8(prefix);
             AppendUtf8("(Invalid)"u8);
@@ -245,10 +248,28 @@ public unsafe ref struct LogUtf8Builder
         if (typeof(T) == typeof(EntityId)) { AppendHandle("Entity"u8, Unsafe.As<T, EntityId>(ref value).Raw); return; }
         if (typeof(T) == typeof(SceneId)) { AppendHandle("Scene"u8, Unsafe.As<T, SceneId>(ref value).Raw); return; }
         if (typeof(T) == typeof(BundleId)) { AppendHandle("Bundle"u8, Unsafe.As<T, BundleId>(ref value).Raw); return; }
+        if (typeof(T) == typeof(MeshHandle)) { AppendHandle("Mesh"u8, Unsafe.As<T, MeshHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(TextureHandle)) { AppendHandle("Texture"u8, Unsafe.As<T, TextureHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(MaterialHandle)) { AppendHandle("Material"u8, Unsafe.As<T, MaterialHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(ShaderHandle)) { AppendHandle("Shader"u8, Unsafe.As<T, ShaderHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(FontHandle)) { AppendHandle("Font"u8, Unsafe.As<T, FontHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(GltfHandle)) { AppendHandle("Gltf"u8, Unsafe.As<T, GltfHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(AnimClipHandle)) { AppendHandle("AnimClip"u8, Unsafe.As<T, AnimClipHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(SkeletonHandle)) { AppendHandle("Skeleton"u8, Unsafe.As<T, SkeletonHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(AnimPlayerHandle)) { AppendHandle("AnimPlayer"u8, Unsafe.As<T, AnimPlayerHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(SpriteAnimPlayerHandle)) { AppendHandle("SpriteAnimPlayer"u8, Unsafe.As<T, SpriteAnimPlayerHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(TweenHandle)) { AppendHandle("Tween"u8, Unsafe.As<T, TweenHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(EmitterHandle)) { AppendHandle("Emitter"u8, Unsafe.As<T, EmitterHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(CameraHandle)) { AppendHandle("Camera"u8, Unsafe.As<T, CameraHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(SpriteHandle)) { AppendHandle("Sprite"u8, Unsafe.As<T, SpriteHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(TextHandle)) { AppendHandle("Text"u8, Unsafe.As<T, TextHandle>(ref value).Raw); return; }
         if (typeof(T) == typeof(JobHandle)) { AppendHandle("Job"u8, Unsafe.As<T, JobHandle>(ref value).Raw); return; }
         if (typeof(T) == typeof(HttpRequestHandle)) { AppendHandle("HttpReq"u8, Unsafe.As<T, HttpRequestHandle>(ref value).Raw); return; }
         if (typeof(T) == typeof(WebSocketHandle)) { AppendHandle("WebSocket"u8, Unsafe.As<T, WebSocketHandle>(ref value).Raw); return; }
         if (typeof(T) == typeof(LogFileHandle)) { AppendHandle("LogFile"u8, Unsafe.As<T, LogFileHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(SaveOpHandle)) { AppendHandle("SaveOp"u8, Unsafe.As<T, SaveOpHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(AudioClipHandle)) { AppendHandle("AudioClip"u8, Unsafe.As<T, AudioClipHandle>(ref value).Raw); return; }
+        if (typeof(T) == typeof(AudioVoiceHandle)) { AppendHandle("AudioVoice"u8, Unsafe.As<T, AudioVoiceHandle>(ref value).Raw); return; }
         if (typeof(T) == typeof(LogLevel))
         {
             AppendUtf8(LogSystem.GetLevelTagUtf8(Unsafe.As<T, LogLevel>(ref value)));

@@ -27,10 +27,13 @@ public static unsafe class NativeMemoryTracker
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void* AlignedAlloc(nuint byteCount, nuint alignment = 64)
     {
-        if (byteCount == 0)
-            byteCount = alignment;
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0)
+            throw new ArgumentOutOfRangeException(nameof(alignment), "Alignment must be a non-zero power of 2.");
+        if ((ulong)byteCount > (ulong)long.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(byteCount), "Allocation size exceeds Int64.MaxValue.");
 
-        void* ptr = NativeMemory.AlignedAlloc(byteCount, alignment);
+        nuint nativeSize = byteCount == 0 ? alignment : byteCount;
+        void* ptr = NativeMemory.AlignedAlloc(nativeSize, alignment);
         long size = (long)byteCount;
         Interlocked.Add(ref s_totalAllocatedBytes, size);
         long live = Interlocked.Add(ref s_liveBytes, size);

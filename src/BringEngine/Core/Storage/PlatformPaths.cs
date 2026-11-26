@@ -59,25 +59,51 @@ public static class PlatformPaths
 
     public static string SanitizeSegment(ReadOnlySpan<char> input, string fallback)
     {
-        if (input.IsEmpty) return fallback;
-        int cap = input.Length < 128 ? input.Length : 128;
-        Span<char> buf = stackalloc char[cap];
-        int len = 0;
-        for (int i = 0; i < input.Length && len < buf.Length; i++)
-        {
-            char c = input[i];
-            if (char.IsLetterOrDigit(c) || c == '-' || c == '_' || c == '.' || c == ' ')
-                buf[len++] = c;
-        }
-        string result = new string(buf.Slice(0, len)).Trim().Trim('.');
-        return string.IsNullOrWhiteSpace(result) ? fallback : result;
+        Span<char> buf = stackalloc char[128];
+        int len = SanitizeSegmentToSpan(input, fallback.AsSpan(), buf);
+        return new string(buf.Slice(0, len));
     }
 
     public static string SanitizeFileName(ReadOnlySpan<char> input, string fallback)
     {
         if (input.IsEmpty) return fallback;
-        string name = Path.GetFileName(new string(input));
-        string safe = SanitizeSegment(name.AsSpan(), fallback);
-        return string.IsNullOrWhiteSpace(safe) ? fallback : safe;
+        ReadOnlySpan<char> name = Path.GetFileName(input);
+        Span<char> buf = stackalloc char[128];
+        int len = SanitizeSegmentToSpan(name, fallback.AsSpan(), buf);
+        return new string(buf.Slice(0, len));
+    }
+
+    /// <summary>
+    /// Zero-GC filename sanitization into a caller-provided buffer (at least 128 chars recommended).
+    /// Produces the exact same output as SanitizeFileName(input, fallback).
+    /// </summary>
+    internal static int SanitizeFileNameToSpan(ReadOnlySpan<char> input, ReadOnlySpan<char> fallback, Span<char> dst)
+    {
+        ReadOnlySpan<char> name = input.IsEmpty ? ReadOnlySpan<char>.Empty : Path.GetFileName(input);
+        return SanitizeSegmentToSpan(name, fallback, dst);
+    }
+
+    private static int SanitizeSegmentToSpan(ReadOnlySpan<char> input, ReadOnlySpan<char> fallback, Span<char> dst)
+    {
+        if (!input.IsEmpty && dst.Length > 0)
+        {
+            int cap = dst.Length < 128 ? dst.Length : 128;
+            int len = 0;
+            for (int i = 0; i < input.Length && len < cap; i++)
+            {
+                char c = input[i];
+                if (char.IsLetterOrDigit(c) || c == '-' || c == '_' || c == '.' || c == ' ')
+                    dst[len++] = c;
+            }
+            ReadOnlySpan<char> trimmed = dst.Slice(0, len).Trim().Trim('.');
+            if (!trimmed.IsEmpty && !trimmed.IsWhiteSpace())
+            {
+                trimmed.CopyTo(dst);
+                return trimmed.Length;
+            }
+        }
+        int fbLen = fallback.Length < dst.Length ? fallback.Length : dst.Length;
+        fallback.Slice(0, fbLen).CopyTo(dst);
+        return fbLen;
     }
 }

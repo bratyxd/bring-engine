@@ -200,10 +200,13 @@ public static unsafe class AudioSystem
     /// </summary>
     public static AudioState* Start(ref LinearArena persistentArena, in AudioConfig config, LogState* log = null)
     {
+        int maxHandleSlots = (int)HandlePacking.IndexMask + 1;
         int sampleRate = config.SampleRate > 0 ? config.SampleRate : 48000;
-        int channels = config.Channels <= 1 ? 1 : 2;
+        int channels = config.Channels <= 0 ? 2 : (config.Channels == 1 ? 1 : 2);
         int maxClips = config.MaxClips > 0 ? config.MaxClips : 128;
+        if (maxClips > maxHandleSlots) maxClips = maxHandleSlots;
         int maxVoices = config.MaxVoices > 0 ? config.MaxVoices : 64;
+        if (maxVoices > maxHandleSlots) maxVoices = maxHandleSlots;
         int mixFrames = config.MixBufferFrames >= 64 ? config.MixBufferFrames : 512;
 
         int syncSlot = -1;
@@ -223,81 +226,111 @@ public static unsafe class AudioSystem
         if (syncSlot < 0)
             throw new InvalidOperationException("Maximum concurrent AudioSystem instances exceeded.");
 
-        AudioState* state = persistentArena.Alloc<AudioState>(1, 64);
-        state->Clips = persistentArena.Alloc<AudioClipSlot>(maxClips, 64);
-        state->ClipGens = persistentArena.AllocUninitialized<uint>(maxClips, 16);
-        for (int i = 0; i < maxClips; i++) state->ClipGens[i] = 1;
-
-        state->Voices = persistentArena.Alloc<AudioVoiceSlot>(maxVoices, 64);
-        state->VoiceGens = persistentArena.AllocUninitialized<uint>(maxVoices, 16);
-        for (int i = 0; i < maxVoices; i++) state->VoiceGens[i] = 1;
-
-        state->MaxClips = maxClips;
-        state->MaxVoices = maxVoices;
-        state->MixBufferFrames = mixFrames;
-        state->SampleRate = sampleRate;
-        state->Channels = channels;
-        state->SyncSlot = syncSlot;
-        state->NextStartOrder = 1;
-        state->Log = log;
-        nuint scratchBytes = (nuint)((long)mixFrames * channels * sizeof(float));
-        state->MixScratchBytes = scratchBytes;
-        state->MixScratch = (float*)NativeMemoryTracker.AlignedAlloc(scratchBytes, 64);
-
-        for (int b = 0; b < (int)AudioBus.Count; b++)
+        AudioState* state = null;
+        try
         {
-            state->BusVolumes[b] = 1.0f;
-            state->BusMuted[b] = 0;
+            state = persistentArena.Alloc<AudioState>(1, 64);
+            state->Clips = persistentArena.Alloc<AudioClipSlot>(maxClips, 64);
+            state->ClipGens = persistentArena.AllocUninitialized<uint>(maxClips, 16);
+            for (int i = 0; i < maxClips; i++) state->ClipGens[i] = 1;
+
+            state->Voices = persistentArena.Alloc<AudioVoiceSlot>(maxVoices, 64);
+            state->VoiceGens = persistentArena.AllocUninitialized<uint>(maxVoices, 16);
+            for (int i = 0; i < maxVoices; i++) state->VoiceGens[i] = 1;
+
+            state->MaxClips = maxClips;
+            state->MaxVoices = maxVoices;
+            state->MixBufferFrames = mixFrames;
+            state->SampleRate = sampleRate;
+            state->Channels = channels;
+            state->SyncSlot = syncSlot;
+            state->NextStartOrder = 1;
+            state->Log = log;
+            nuint scratchBytes = (nuint)((long)mixFrames * channels * sizeof(float));
+            state->MixScratchBytes = scratchBytes;
+            state->MixScratch = (float*)NativeMemoryTracker.AlignedAlloc(scratchBytes, 64);
+
+            for (int b = 0; b < (int)AudioBus.Count; b++)
+            {
+                Volatile.Write(ref state->BusVolumes[b], 1.0f);
+                Volatile.Write(ref state->BusMuted[b], 0);
+            }
+
+            if (config.ForceHeadless != 0)
+            {
+                state->IsHeadless = 1;
+            }
+            else
+            {
+                TryInitSdlAudio(state, config.HeadlessFallback != 0);
+            }
+
+            Volatile.Write(ref state->ShutdownFlag, 0);
+            Volatile.Write(ref state->Active, 1);
+
+            nint rawState = (nint)state;
+            var thread = new Thread(MixerThreadEntry)
+            {
+                Name = "BringEngine.AudioMixer",
+                IsBackground = true,
+                Priority = ThreadPriority.AboveNormal,
+            };
+            s_sync[syncSlot].MixerThread = thread;
+            Volatile.Write(ref state->MixerThreadId, thread.ManagedThreadId);
+            thread.Start(rawState);
+
+            if (state->Log != null && state->Log->Active != 0)
+            {
+                LogSystem.Info(state->Log,
+                    $"AudioSystem started (mode={(state->IsHeadless != 0 ? "headless" : "sdl3")}, rate={sampleRate}Hz, ch={channels}, maxClips={maxClips}, maxVoices={maxVoices})");
+            }
+
+            return state;
         }
-
-        if (config.ForceHeadless != 0)
+        catch
         {
-            state->IsHeadless = 1;
+            if (state != null)
+            {
+                Volatile.Write(ref state->Active, 0);
+                if (state->AudioStream != nint.Zero)
+                {
+                    SDL.DestroyAudioStream(state->AudioStream);
+                    state->AudioStream = nint.Zero;
+                }
+                if (state->DeviceId != 0)
+                {
+                    SDL.CloseAudioDevice(state->DeviceId);
+                    state->DeviceId = 0;
+                }
+                if (state->SdlAudioInitialized != 0)
+                {
+                    SDL.QuitSubSystem(SDL.InitFlags.Audio);
+                    state->SdlAudioInitialized = 0;
+                }
+                if (state->MixScratch != null)
+                {
+                    NativeMemoryTracker.AlignedFree(state->MixScratch, state->MixScratchBytes);
+                    state->MixScratch = null;
+                    state->MixScratchBytes = 0;
+                }
+            }
+            lock (s_syncLock)
+            {
+                s_sync[syncSlot].StopSignal?.Dispose();
+                s_sync[syncSlot] = default;
+            }
+            throw;
         }
-        else
-        {
-            TryInitSdlAudio(state, config.HeadlessFallback != 0);
-        }
-
-        state->Active = 1;
-        state->ShutdownFlag = 0;
-
-        nint rawState = (nint)state;
-        var thread = new Thread(MixerThreadEntry)
-        {
-            Name = "BringEngine.AudioMixer",
-            IsBackground = true,
-            Priority = ThreadPriority.AboveNormal,
-        };
-        s_sync[syncSlot].MixerThread = thread;
-        thread.Start(rawState);
-
-        // Wait briefly so MixerThreadId is visible immediately after Start() returns
-        int spins = 0;
-        while (Volatile.Read(ref state->MixerThreadId) == 0 && spins++ < 500)
-            Thread.Sleep(1);
-
-        if (state->Log != null && state->Log->Active != 0)
-        {
-            LogSystem.Info(state->Log,
-                $"AudioSystem started (mode={(state->IsHeadless != 0 ? "headless" : "sdl3")}, rate={sampleRate}Hz, ch={channels}, maxClips={maxClips}, maxVoices={maxVoices})");
-        }
-
-        return state;
     }
 
     private static void TryInitSdlAudio(AudioState* state, bool allowFallback)
     {
-        bool alreadyInit = (SDL.WasInit(SDL.InitFlags.Audio) & SDL.InitFlags.Audio) != 0;
-        if (!alreadyInit)
+        if (!SDL.InitSubSystem(SDL.InitFlags.Audio))
         {
-            if (!SDL.InitSubSystem(SDL.InitFlags.Audio))
-            {
-                HandleAudioInitFailure(state, allowFallback, "SDL_InitSubSystem(Audio)");
-                return;
-            }
-            state->SdlAudioInitialized = 1;
+            HandleAudioInitFailure(state, allowFallback, "SDL_InitSubSystem(Audio)");
+            return;
         }
+        state->SdlAudioInitialized = 1;
 
         var spec = new SDL.AudioSpec
         {
@@ -360,6 +393,7 @@ public static unsafe class AudioSystem
         int bytesPerFrame = state->Channels * sizeof(float);
         int chunkBytes = chunkFrames * bytesPerFrame;
         int targetQueuedBytes = chunkBytes * 3; // ~32ms buffered at 48kHz / 512 frames
+        bool warnedPutFailure = false;
 
         while (Volatile.Read(ref state->ShutdownFlag) == 0)
         {
@@ -370,7 +404,15 @@ public static unsafe class AudioSystem
                 while (queued >= 0 && queued < targetQueuedBytes && safetyChunks < 4 && Volatile.Read(ref state->ShutdownFlag) == 0)
                 {
                     RenderMixFrames(state, state->MixScratch, chunkFrames);
-                    SDL.PutAudioStreamData(state->AudioStream, (nint)state->MixScratch, chunkBytes);
+                    if (!SDL.PutAudioStreamData(state->AudioStream, (nint)state->MixScratch, chunkBytes))
+                    {
+                        if (!warnedPutFailure && state->Log != null && state->Log->Active != 0)
+                        {
+                            warnedPutFailure = true;
+                            LogSystem.Warn(state->Log, $"SDL_PutAudioStreamData failed: {SDL.GetError() ?? "unknown"}");
+                        }
+                        break;
+                    }
                     queued += chunkBytes;
                     safetyChunks++;
                 }
@@ -389,10 +431,21 @@ public static unsafe class AudioSystem
     /// </summary>
     public static void Stop(AudioState* audio)
     {
-        if (audio == null || audio->Active == 0) return;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0) return;
 
-        int syncSlot = audio->SyncSlot;
-        Volatile.Write(ref audio->ShutdownFlag, 1);
+        int syncSlot;
+        AcquireLock(audio);
+        try
+        {
+            if (Volatile.Read(ref audio->Active) == 0) return;
+            Volatile.Write(ref audio->Active, 0);
+            Volatile.Write(ref audio->ShutdownFlag, 1);
+            syncSlot = audio->SyncSlot;
+        }
+        finally
+        {
+            ReleaseLock(audio);
+        }
 
         if ((uint)syncSlot < MaxAudioInstances)
         {
@@ -405,45 +458,53 @@ public static unsafe class AudioSystem
             }
         }
 
-        if (audio->AudioStream != nint.Zero)
+        // Barrier with SpinLock so any concurrent caller (e.g. SetPaused) finishes before SDL/native teardown
+        AcquireLock(audio);
+        try
         {
-            SDL.DestroyAudioStream(audio->AudioStream);
-            audio->AudioStream = nint.Zero;
-        }
-        if (audio->DeviceId != 0)
-        {
-            SDL.CloseAudioDevice(audio->DeviceId);
-            audio->DeviceId = 0;
-        }
-        if (audio->SdlAudioInitialized != 0)
-        {
-            SDL.QuitSubSystem(SDL.InitFlags.Audio);
-            audio->SdlAudioInitialized = 0;
-        }
-
-        // Free all loaded native clip buffers and mix scratch buffer
-        for (int i = 0; i < audio->MaxClips; i++)
-        {
-            if (audio->Clips[i].Alive != 0 && audio->Clips[i].Samples != null)
+            if (audio->AudioStream != nint.Zero)
             {
-                NativeMemoryTracker.AlignedFree(audio->Clips[i].Samples, audio->Clips[i].AllocBytes);
-                audio->Clips[i] = default;
+                SDL.DestroyAudioStream(audio->AudioStream);
+                audio->AudioStream = nint.Zero;
+            }
+            if (audio->DeviceId != 0)
+            {
+                SDL.CloseAudioDevice(audio->DeviceId);
+                audio->DeviceId = 0;
+            }
+            if (audio->SdlAudioInitialized != 0)
+            {
+                SDL.QuitSubSystem(SDL.InitFlags.Audio);
+                audio->SdlAudioInitialized = 0;
+            }
+
+            // Free all loaded native clip buffers and mix scratch buffer
+            for (int i = 0; i < audio->MaxClips; i++)
+            {
+                if (audio->Clips[i].Alive != 0 && audio->Clips[i].Samples != null)
+                {
+                    NativeMemoryTracker.AlignedFree(audio->Clips[i].Samples, audio->Clips[i].AllocBytes);
+                    audio->Clips[i] = default;
+                }
+            }
+            Volatile.Write(ref audio->LoadedClipCount, 0);
+
+            for (int i = 0; i < audio->MaxVoices; i++)
+                audio->Voices[i] = default;
+            Volatile.Write(ref audio->ActiveVoiceCount, 0);
+
+            if (audio->MixScratch != null)
+            {
+                NativeMemoryTracker.AlignedFree(audio->MixScratch, audio->MixScratchBytes);
+                audio->MixScratch = null;
+                audio->MixScratchBytes = 0;
             }
         }
-        audio->LoadedClipCount = 0;
-
-        for (int i = 0; i < audio->MaxVoices; i++)
-            audio->Voices[i] = default;
-        audio->ActiveVoiceCount = 0;
-
-        if (audio->MixScratch != null)
+        finally
         {
-            NativeMemoryTracker.AlignedFree(audio->MixScratch, audio->MixScratchBytes);
-            audio->MixScratch = null;
-            audio->MixScratchBytes = 0;
+            ReleaseLock(audio);
         }
 
-        audio->Active = 0;
         if (audio->Log != null && audio->Log->Active != 0)
             LogSystem.Info(audio->Log, $"AudioSystem stopped (totalMixedFrames={audio->MixedFramesTotal})");
     }
@@ -452,8 +513,12 @@ public static unsafe class AudioSystem
 
     public static AudioClipHandle LoadClipFromWavFile(AudioState* audio, string wavPath, StringId name = default)
     {
-        if (audio == null || audio->Active == 0 || !File.Exists(wavPath))
+        if (audio == null || Volatile.Read(ref audio->Active) == 0) return AudioClipHandle.Invalid;
+        if (string.IsNullOrEmpty(wavPath) || !File.Exists(wavPath))
+        {
+            LogSystem.Warn(audio->Log, $"AudioSystem.LoadClipFromWavFile: file not found '{wavPath ?? ""}'");
             return AudioClipHandle.Invalid;
+        }
         byte[] bytes = File.ReadAllBytes(wavPath);
         if (name.Value == 0) name = StringId.Hash(Path.GetFileNameWithoutExtension(wavPath));
         return LoadClipFromWavMemory(audio, bytes, name);
@@ -461,13 +526,16 @@ public static unsafe class AudioSystem
 
     public static AudioClipHandle LoadClipFromWavMemory(AudioState* audio, ReadOnlySpan<byte> wavBytes, StringId name = default)
     {
-        if (audio == null || audio->Active == 0) return AudioClipHandle.Invalid;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0) return AudioClipHandle.Invalid;
         if (!WavDecoder.TryDecode(wavBytes, out DecodedPcmData decoded))
+        {
+            LogSystem.Warn(audio->Log, $"AudioSystem.LoadClipFromWavMemory: failed to decode WAV (clip={name}, bytes={wavBytes.Length})");
             return AudioClipHandle.Invalid;
+        }
 
-        AudioClipHandle h = RegisterOwnedPcm(audio, decoded.Samples, decoded.AllocBytes, decoded.FrameCount, decoded.Channels, decoded.SampleRate, name);
+        AudioClipHandle h = CreateClipFromDecoded(audio, ref decoded, name);
         if (!h.IsValid)
-            WavDecoder.Free(ref decoded);
+            LogSystem.Warn(audio->Log, $"AudioSystem.LoadClipFromWavMemory: clip table full or inactive (maxClips={audio->MaxClips}, clip={name})");
         return h;
     }
 
@@ -480,12 +548,20 @@ public static unsafe class AudioSystem
         StringId blobName,
         ref LinearArena scratchArena)
     {
-        if (audio == null || audio->Active == 0) return AudioClipHandle.Invalid;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0) return AudioClipHandle.Invalid;
+        if (string.IsNullOrEmpty(bpackPath) || !File.Exists(bpackPath))
+        {
+            LogSystem.Warn(audio->Log, $"AudioSystem.LoadClipFromBpack: pack not found '{bpackPath ?? ""}' (blob={blobName})");
+            return AudioClipHandle.Invalid;
+        }
         ArenaMarker mark = scratchArena.SaveMarker();
         try
         {
             if (!AssetPackLoader.TryReadRawBlob(bpackPath, blobName, ref scratchArena, out NativeSlice<byte> raw))
+            {
+                LogSystem.Warn(audio->Log, $"AudioSystem.LoadClipFromBpack: missing or invalid blob {blobName} in '{bpackPath}'");
                 return AudioClipHandle.Invalid;
+            }
             return LoadClipFromWavMemory(audio, new ReadOnlySpan<byte>(raw.Ptr, raw.Length), blobName);
         }
         finally
@@ -505,42 +581,54 @@ public static unsafe class AudioSystem
         int sampleRate,
         StringId name = default)
     {
-        if (audio == null || audio->Active == 0 || interleavedSamples == null || frameCount <= 0 || sampleRate <= 0)
+        if (audio == null || Volatile.Read(ref audio->Active) == 0 || interleavedSamples == null ||
+            frameCount <= 0 || sampleRate <= 0 || channels <= 0 || channels > 2)
             return AudioClipHandle.Invalid;
 
-        int ch = channels <= 1 ? 1 : 2;
-        nuint bytes = (nuint)((long)frameCount * ch * sizeof(float));
+        nuint bytes = (nuint)((long)frameCount * channels * sizeof(float));
         float* copy = (float*)NativeMemoryTracker.AlignedAlloc(bytes, 64);
         Buffer.MemoryCopy(interleavedSamples, copy, bytes, bytes);
 
-        AudioClipHandle h = RegisterOwnedPcm(audio, copy, bytes, frameCount, ch, sampleRate, name);
+        AudioClipHandle h = RegisterOwnedPcm(audio, copy, bytes, frameCount, channels, sampleRate, name);
         if (!h.IsValid)
             NativeMemoryTracker.AlignedFree(copy, bytes);
         return h;
     }
 
     /// <summary>
-    /// Transfers ownership of a DecodedPcmData native buffer directly into AudioSystem (zero copy).
-    /// On failure, frees decoded.Samples automatically.
+    /// Transfers ownership of a DecodedPcmData native buffer directly into AudioSystem (zero copy) and clears <paramref name="decoded"/>.
+    /// On failure, frees decoded.Samples automatically and clears <paramref name="decoded"/>.
     /// </summary>
-    public static AudioClipHandle CreateClipFromDecoded(AudioState* audio, DecodedPcmData decoded, StringId name = default)
+    public static AudioClipHandle CreateClipFromDecoded(AudioState* audio, ref DecodedPcmData decoded, StringId name = default)
     {
-        if (audio == null || audio->Active == 0 || decoded.Samples == null || decoded.FrameCount <= 0 || decoded.SampleRate <= 0)
+        if (audio == null || Volatile.Read(ref audio->Active) == 0 ||
+            decoded.Samples == null || decoded.FrameCount <= 0 || decoded.SampleRate <= 0 ||
+            decoded.Channels <= 0 || decoded.Channels > 2)
         {
             WavDecoder.Free(ref decoded);
+            decoded = default;
             return AudioClipHandle.Invalid;
         }
-        AudioClipHandle h = RegisterOwnedPcm(audio, decoded.Samples, decoded.AllocBytes, decoded.FrameCount, decoded.Channels <= 1 ? 1 : 2, decoded.SampleRate, name);
+        AudioClipHandle h = RegisterOwnedPcm(audio, decoded.Samples, decoded.AllocBytes, decoded.FrameCount, decoded.Channels, decoded.SampleRate, name);
         if (!h.IsValid)
             WavDecoder.Free(ref decoded);
+        decoded = default;
         return h;
     }
+
+    /// <summary>
+    /// By-value convenience overload; prefer <see cref="CreateClipFromDecoded(AudioState*, ref DecodedPcmData, StringId)"/> so caller's struct is cleared on ownership transfer.
+    /// </summary>
+    public static AudioClipHandle CreateClipFromDecoded(AudioState* audio, DecodedPcmData decoded, StringId name = default)
+        => CreateClipFromDecoded(audio, ref decoded, name);
 
     private static AudioClipHandle RegisterOwnedPcm(AudioState* audio, float* ownedSamples, nuint allocBytes, int frameCount, int channels, int sampleRate, StringId name)
     {
         AcquireLock(audio);
         try
         {
+            if (Volatile.Read(ref audio->Active) == 0) return AudioClipHandle.Invalid;
+
             int slot = -1;
             for (int i = 0; i < audio->MaxClips; i++)
             {
@@ -558,7 +646,7 @@ public static unsafe class AudioSystem
                 Name = name,
                 Alive = 1,
             };
-            audio->LoadedClipCount++;
+            Volatile.Write(ref audio->LoadedClipCount, Volatile.Read(ref audio->LoadedClipCount) + 1);
             return AudioClipHandle.Create((uint)slot, audio->ClipGens[slot]);
         }
         finally
@@ -572,7 +660,7 @@ public static unsafe class AudioSystem
     /// </summary>
     public static bool UnloadClip(AudioState* audio, AudioClipHandle clip)
     {
-        if (audio == null || audio->Active == 0 || !clip.IsValid) return false;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0 || !clip.IsValid) return false;
         uint idx = clip.Index;
         if (idx >= (uint)audio->MaxClips) return false;
 
@@ -581,10 +669,12 @@ public static unsafe class AudioSystem
         AcquireLock(audio);
         try
         {
+            if (Volatile.Read(ref audio->Active) == 0) return false;
             if (audio->Clips[idx].Alive == 0 || audio->ClipGens[idx] != clip.Generation)
                 return false;
 
             // Stop all voices referencing this clip before freeing its sample buffer
+            int activeVoices = Volatile.Read(ref audio->ActiveVoiceCount);
             for (int v = 0; v < audio->MaxVoices; v++)
             {
                 ref AudioVoiceSlot vs = ref audio->Voices[v];
@@ -592,15 +682,17 @@ public static unsafe class AudioSystem
                 {
                     vs.State = AudioVoiceState.Inactive;
                     BumpGen(ref audio->VoiceGens[v]);
-                    if (audio->ActiveVoiceCount > 0) audio->ActiveVoiceCount--;
+                    if (activeVoices > 0) activeVoices--;
                 }
             }
+            Volatile.Write(ref audio->ActiveVoiceCount, activeVoices);
 
             toFree = audio->Clips[idx].Samples;
             toFreeBytes = audio->Clips[idx].AllocBytes;
             audio->Clips[idx] = default;
             BumpGen(ref audio->ClipGens[idx]);
-            if (audio->LoadedClipCount > 0) audio->LoadedClipCount--;
+            int loadedClips = Volatile.Read(ref audio->LoadedClipCount);
+            if (loadedClips > 0) Volatile.Write(ref audio->LoadedClipCount, loadedClips - 1);
         }
         finally
         {
@@ -615,13 +707,14 @@ public static unsafe class AudioSystem
 
     public static AudioVoiceHandle Play(AudioState* audio, AudioClipHandle clip, in AudioPlayParams p)
     {
-        if (audio == null || audio->Active == 0 || !clip.IsValid) return AudioVoiceHandle.Invalid;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0 || !clip.IsValid) return AudioVoiceHandle.Invalid;
         uint clipIdx = clip.Index;
         if (clipIdx >= (uint)audio->MaxClips) return AudioVoiceHandle.Invalid;
 
         AcquireLock(audio);
         try
         {
+            if (Volatile.Read(ref audio->Active) == 0) return AudioVoiceHandle.Invalid;
             if (audio->Clips[clipIdx].Alive == 0 || audio->ClipGens[clipIdx] != clip.Generation)
                 return AudioVoiceHandle.Invalid;
 
@@ -661,21 +754,25 @@ public static unsafe class AudioSystem
             }
 
             AudioBus bus = (byte)p.Bus < (byte)AudioBus.Count ? p.Bus : AudioBus.Sfx;
+            float vol = float.IsFinite(p.Volume) ? DetMath.Clamp(p.Volume, 0f, 4f) : 0f;
+            float pitch = float.IsFinite(p.Pitch) ? DetMath.Clamp(p.Pitch <= 0f ? 1f : p.Pitch, 0.125f, 4f) : 1f;
+            float pan = float.IsFinite(p.Pan) ? DetMath.Clamp(p.Pan, -1f, 1f) : 0f;
+
             audio->Voices[slot] = new AudioVoiceSlot
             {
                 ClipIndex = (int)clipIdx,
                 ClipGeneration = clip.Generation,
                 PlayheadFrame = 0.0,
-                Volume = DetMath.Clamp(p.Volume, 0f, 4f),
-                Pitch = DetMath.Clamp(p.Pitch <= 0f ? 1f : p.Pitch, 0.125f, 4f),
-                Pan = DetMath.Clamp(p.Pan, -1f, 1f),
+                Volume = vol,
+                Pitch = pitch,
+                Pan = pan,
                 StartOrder = audio->NextStartOrder++,
                 Bus = bus,
                 Loop = p.Loop,
                 State = p.StartPaused != 0 ? AudioVoiceState.Paused : AudioVoiceState.Playing,
             };
 
-            if (!stolen) audio->ActiveVoiceCount++;
+            if (!stolen) Volatile.Write(ref audio->ActiveVoiceCount, Volatile.Read(ref audio->ActiveVoiceCount) + 1);
             return AudioVoiceHandle.Create((uint)slot, audio->VoiceGens[slot]);
         }
         finally
@@ -711,18 +808,20 @@ public static unsafe class AudioSystem
 
     public static void StopVoice(AudioState* audio, AudioVoiceHandle voice)
     {
-        if (audio == null || audio->Active == 0 || !voice.IsValid) return;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0 || !voice.IsValid) return;
         uint idx = voice.Index;
         if (idx >= (uint)audio->MaxVoices) return;
 
         AcquireLock(audio);
         try
         {
+            if (Volatile.Read(ref audio->Active) == 0) return;
             if (audio->VoiceGens[idx] == voice.Generation && audio->Voices[idx].State != AudioVoiceState.Inactive)
             {
                 audio->Voices[idx].State = AudioVoiceState.Inactive;
                 BumpGen(ref audio->VoiceGens[idx]);
-                if (audio->ActiveVoiceCount > 0) audio->ActiveVoiceCount--;
+                int active = Volatile.Read(ref audio->ActiveVoiceCount);
+                if (active > 0) Volatile.Write(ref audio->ActiveVoiceCount, active - 1);
             }
         }
         finally
@@ -733,10 +832,12 @@ public static unsafe class AudioSystem
 
     public static void StopBus(AudioState* audio, AudioBus bus)
     {
-        if (audio == null || audio->Active == 0) return;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0) return;
         AcquireLock(audio);
         try
         {
+            if (Volatile.Read(ref audio->Active) == 0) return;
+            int active = Volatile.Read(ref audio->ActiveVoiceCount);
             for (int i = 0; i < audio->MaxVoices; i++)
             {
                 if (audio->Voices[i].State != AudioVoiceState.Inactive &&
@@ -744,9 +845,10 @@ public static unsafe class AudioSystem
                 {
                     audio->Voices[i].State = AudioVoiceState.Inactive;
                     BumpGen(ref audio->VoiceGens[i]);
-                    if (audio->ActiveVoiceCount > 0) audio->ActiveVoiceCount--;
+                    if (active > 0) active--;
                 }
             }
+            Volatile.Write(ref audio->ActiveVoiceCount, active);
         }
         finally
         {
@@ -759,13 +861,14 @@ public static unsafe class AudioSystem
 
     public static void SetVoicePaused(AudioState* audio, AudioVoiceHandle voice, bool paused)
     {
-        if (audio == null || audio->Active == 0 || !voice.IsValid) return;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0 || !voice.IsValid) return;
         uint idx = voice.Index;
         if (idx >= (uint)audio->MaxVoices) return;
 
         AcquireLock(audio);
         try
         {
+            if (Volatile.Read(ref audio->Active) == 0) return;
             if (audio->VoiceGens[idx] == voice.Generation && audio->Voices[idx].State != AudioVoiceState.Inactive)
                 audio->Voices[idx].State = paused ? AudioVoiceState.Paused : AudioVoiceState.Playing;
         }
@@ -777,15 +880,17 @@ public static unsafe class AudioSystem
 
     public static void SetVoiceVolume(AudioState* audio, AudioVoiceHandle voice, float volume)
     {
-        if (audio == null || audio->Active == 0 || !voice.IsValid) return;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0 || !voice.IsValid) return;
         uint idx = voice.Index;
         if (idx >= (uint)audio->MaxVoices) return;
 
+        float v = float.IsFinite(volume) ? DetMath.Clamp(volume, 0f, 4f) : 0f;
         AcquireLock(audio);
         try
         {
+            if (Volatile.Read(ref audio->Active) == 0) return;
             if (audio->VoiceGens[idx] == voice.Generation && audio->Voices[idx].State != AudioVoiceState.Inactive)
-                audio->Voices[idx].Volume = DetMath.Clamp(volume, 0f, 4f);
+                audio->Voices[idx].Volume = v;
         }
         finally
         {
@@ -795,15 +900,17 @@ public static unsafe class AudioSystem
 
     public static void SetVoicePitch(AudioState* audio, AudioVoiceHandle voice, float pitch)
     {
-        if (audio == null || audio->Active == 0 || !voice.IsValid) return;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0 || !voice.IsValid) return;
         uint idx = voice.Index;
         if (idx >= (uint)audio->MaxVoices) return;
 
+        float p = float.IsFinite(pitch) ? DetMath.Clamp(pitch, 0.125f, 4f) : 1f;
         AcquireLock(audio);
         try
         {
+            if (Volatile.Read(ref audio->Active) == 0) return;
             if (audio->VoiceGens[idx] == voice.Generation && audio->Voices[idx].State != AudioVoiceState.Inactive)
-                audio->Voices[idx].Pitch = DetMath.Clamp(pitch, 0.125f, 4f);
+                audio->Voices[idx].Pitch = p;
         }
         finally
         {
@@ -813,15 +920,17 @@ public static unsafe class AudioSystem
 
     public static void SetVoicePan(AudioState* audio, AudioVoiceHandle voice, float pan)
     {
-        if (audio == null || audio->Active == 0 || !voice.IsValid) return;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0 || !voice.IsValid) return;
         uint idx = voice.Index;
         if (idx >= (uint)audio->MaxVoices) return;
 
+        float p = float.IsFinite(pan) ? DetMath.Clamp(pan, -1f, 1f) : 0f;
         AcquireLock(audio);
         try
         {
+            if (Volatile.Read(ref audio->Active) == 0) return;
             if (audio->VoiceGens[idx] == voice.Generation && audio->Voices[idx].State != AudioVoiceState.Inactive)
-                audio->Voices[idx].Pan = DetMath.Clamp(pan, -1f, 1f);
+                audio->Voices[idx].Pan = p;
         }
         finally
         {
@@ -831,13 +940,14 @@ public static unsafe class AudioSystem
 
     public static AudioVoiceState GetVoiceState(AudioState* audio, AudioVoiceHandle voice)
     {
-        if (audio == null || audio->Active == 0 || !voice.IsValid) return AudioVoiceState.Inactive;
+        if (audio == null || Volatile.Read(ref audio->Active) == 0 || !voice.IsValid) return AudioVoiceState.Inactive;
         uint idx = voice.Index;
         if (idx >= (uint)audio->MaxVoices) return AudioVoiceState.Inactive;
 
         AcquireLock(audio);
         try
         {
+            if (Volatile.Read(ref audio->Active) == 0) return AudioVoiceState.Inactive;
             if (audio->VoiceGens[idx] != voice.Generation) return AudioVoiceState.Inactive;
             return audio->Voices[idx].State;
         }
@@ -856,25 +966,26 @@ public static unsafe class AudioSystem
     public static void SetBusVolume(AudioState* audio, AudioBus bus, float volume)
     {
         if (audio == null || (byte)bus >= (byte)AudioBus.Count) return;
-        audio->BusVolumes[(int)bus] = DetMath.Clamp(volume, 0f, 2f);
+        float v = float.IsFinite(volume) ? DetMath.Clamp(volume, 0f, 2f) : 0f;
+        Volatile.Write(ref audio->BusVolumes[(int)bus], v);
     }
 
     public static float GetBusVolume(AudioState* audio, AudioBus bus)
     {
         if (audio == null || (byte)bus >= (byte)AudioBus.Count) return 0f;
-        return audio->BusVolumes[(int)bus];
+        return Volatile.Read(ref audio->BusVolumes[(int)bus]);
     }
 
     public static void SetBusMuted(AudioState* audio, AudioBus bus, bool muted)
     {
         if (audio == null || (byte)bus >= (byte)AudioBus.Count) return;
-        audio->BusMuted[(int)bus] = (byte)(muted ? 1 : 0);
+        Volatile.Write(ref audio->BusMuted[(int)bus], (byte)(muted ? 1 : 0));
     }
 
     public static bool IsBusMuted(AudioState* audio, AudioBus bus)
     {
         if (audio == null || (byte)bus >= (byte)AudioBus.Count) return true;
-        return audio->BusMuted[(int)bus] != 0;
+        return Volatile.Read(ref audio->BusMuted[(int)bus]) != 0;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -888,18 +999,27 @@ public static unsafe class AudioSystem
     /// </summary>
     public static void SetPaused(AudioState* audio, bool paused)
     {
-        if (audio == null || audio->Active == 0) return;
-        audio->GlobalPaused = (byte)(paused ? 1 : 0);
-        if (audio->DeviceId != 0)
+        if (audio == null || Volatile.Read(ref audio->Active) == 0) return;
+        AcquireLock(audio);
+        try
         {
-            if (paused) SDL.PauseAudioDevice(audio->DeviceId);
-            else SDL.ResumeAudioDevice(audio->DeviceId);
+            if (Volatile.Read(ref audio->Active) == 0) return;
+            Volatile.Write(ref audio->GlobalPaused, (byte)(paused ? 1 : 0));
+            if (audio->DeviceId != 0)
+            {
+                if (paused) SDL.PauseAudioDevice(audio->DeviceId);
+                else SDL.ResumeAudioDevice(audio->DeviceId);
+            }
+        }
+        finally
+        {
+            ReleaseLock(audio);
         }
     }
 
-    public static bool IsPaused(AudioState* audio) => audio == null || audio->GlobalPaused != 0;
-    public static int GetActiveVoiceCount(AudioState* audio) => audio == null ? 0 : audio->ActiveVoiceCount;
-    public static int GetLoadedClipCount(AudioState* audio) => audio == null ? 0 : audio->LoadedClipCount;
+    public static bool IsPaused(AudioState* audio) => audio == null || Volatile.Read(ref audio->GlobalPaused) != 0;
+    public static int GetActiveVoiceCount(AudioState* audio) => audio == null ? 0 : Volatile.Read(ref audio->ActiveVoiceCount);
+    public static int GetLoadedClipCount(AudioState* audio) => audio == null ? 0 : Volatile.Read(ref audio->LoadedClipCount);
 
     // ==================== Deterministic Software Mixer ====================
 
@@ -916,13 +1036,17 @@ public static unsafe class AudioSystem
         int totalOutSamples = frameCount * outCh;
         new Span<float>(outInterleaved, totalOutSamples).Clear();
 
-        if (audio->Active == 0 || audio->GlobalPaused != 0)
+        if (Volatile.Read(ref audio->Active) == 0 || Volatile.Read(ref audio->GlobalPaused) != 0)
             return;
 
         AcquireLock(audio);
         try
         {
-            float masterVol = audio->BusMuted[(int)AudioBus.Master] != 0 ? 0f : audio->BusVolumes[(int)AudioBus.Master];
+            if (Volatile.Read(ref audio->Active) == 0 || Volatile.Read(ref audio->GlobalPaused) != 0)
+                return;
+
+            float masterVolRaw = Volatile.Read(ref audio->BusMuted[(int)AudioBus.Master]) != 0 ? 0f : Volatile.Read(ref audio->BusVolumes[(int)AudioBus.Master]);
+            float masterVol = float.IsFinite(masterVolRaw) ? masterVolRaw : 0f;
             int outRate = audio->SampleRate;
 
             for (int v = 0; v < audio->MaxVoices; v++)
@@ -937,7 +1061,8 @@ public static unsafe class AudioSystem
                 {
                     voice.State = AudioVoiceState.Inactive;
                     BumpGen(ref audio->VoiceGens[v]);
-                    if (audio->ActiveVoiceCount > 0) audio->ActiveVoiceCount--;
+                    int active = Volatile.Read(ref audio->ActiveVoiceCount);
+                    if (active > 0) Volatile.Write(ref audio->ActiveVoiceCount, active - 1);
                     continue;
                 }
 
@@ -946,21 +1071,26 @@ public static unsafe class AudioSystem
                 {
                     voice.State = AudioVoiceState.Inactive;
                     BumpGen(ref audio->VoiceGens[v]);
-                    if (audio->ActiveVoiceCount > 0) audio->ActiveVoiceCount--;
+                    int active = Volatile.Read(ref audio->ActiveVoiceCount);
+                    if (active > 0) Volatile.Write(ref audio->ActiveVoiceCount, active - 1);
                     continue;
                 }
 
                 int busIdx = (int)voice.Bus;
-                float busVol = ((uint)busIdx < (uint)AudioBus.Count && audio->BusMuted[busIdx] == 0)
-                    ? audio->BusVolumes[busIdx]
+                float busVolRaw = ((uint)busIdx < (uint)AudioBus.Count && Volatile.Read(ref audio->BusMuted[busIdx]) == 0)
+                    ? Volatile.Read(ref audio->BusVolumes[busIdx])
                     : 0f;
-                float gain = masterVol * (busIdx == (int)AudioBus.Master ? 1f : busVol) * voice.Volume;
+                float busVol = float.IsFinite(busVolRaw) ? busVolRaw : 0f;
+                float voiceVol = float.IsFinite(voice.Volume) ? voice.Volume : 0f;
+                float gain = masterVol * (busIdx == (int)AudioBus.Master ? 1f : busVol) * voiceVol;
+                if (!float.IsFinite(gain)) gain = 0f;
 
                 double step = ((double)clip.SampleRate / outRate) * voice.Pitch;
-                if (step <= 0.0) step = 1.0;
+                if (!double.IsFinite(step) || step <= 0.0) step = 1.0;
 
-                // Equal-power stereo panning (pan = 0 -> ~0.7071 each for mono, 1.0 unity for stereo center!)
-                float pan01 = (voice.Pan + 1f) * 0.5f; // [0, 1]
+                // Equal-power stereo panning (pan = 0 -> 1.0 unity each for mono; pan = +/-1 -> 1.4142 / 0.0)
+                float voicePan = float.IsFinite(voice.Pan) ? DetMath.Clamp(voice.Pan, -1f, 1f) : 0f;
+                float pan01 = (voicePan + 1f) * 0.5f; // [0, 1]
                 float panL, panR;
                 if (clip.Channels == 1)
                 {
@@ -968,18 +1098,18 @@ public static unsafe class AudioSystem
                     float angle = pan01 * DetMath.HalfPi;
                     panL = DetMath.Cos(angle) * 1.41421356f;
                     panR = DetMath.Sin(angle) * 1.41421356f;
-                    if (panL > 1f && voice.Pan <= 0f) panL = DetMath.Min(panL, 1.41421356f);
                 }
                 else
                 {
                     // Balance control for stereo clips: pan=0 -> (1, 1), pan=-1 -> (1, 0), pan=+1 -> (0, 1)
-                    panL = voice.Pan > 0f ? (1f - voice.Pan) : 1f;
-                    panR = voice.Pan < 0f ? (1f + voice.Pan) : 1f;
+                    panL = voicePan > 0f ? (1f - voicePan) : 1f;
+                    panR = voicePan < 0f ? (1f + voicePan) : 1f;
                 }
 
                 float gainL = gain * panL;
                 float gainR = gain * panR;
                 double playhead = voice.PlayheadFrame;
+                if (!double.IsFinite(playhead) || playhead < 0.0) playhead = 0.0;
                 int clipFrames = clip.FrameCount;
                 int clipCh = clip.Channels;
                 float* src = clip.Samples;
@@ -1052,7 +1182,8 @@ public static unsafe class AudioSystem
                 {
                     voice.State = AudioVoiceState.Inactive;
                     BumpGen(ref audio->VoiceGens[v]);
-                    if (audio->ActiveVoiceCount > 0) audio->ActiveVoiceCount--;
+                    int active = Volatile.Read(ref audio->ActiveVoiceCount);
+                    if (active > 0) Volatile.Write(ref audio->ActiveVoiceCount, active - 1);
                 }
                 else
                 {
@@ -1060,11 +1191,12 @@ public static unsafe class AudioSystem
                 }
             }
 
-            // Clamp final mix to [-1, 1]
+            // Clamp final mix to [-1, 1] and sanitize non-finite samples
             for (int i = 0; i < totalOutSamples; i++)
             {
                 float x = outInterleaved[i];
-                if (x > 1f) outInterleaved[i] = 1f;
+                if (!float.IsFinite(x)) outInterleaved[i] = 0f;
+                else if (x > 1f) outInterleaved[i] = 1f;
                 else if (x < -1f) outInterleaved[i] = -1f;
             }
 

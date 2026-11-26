@@ -12,7 +12,8 @@ struct GlyphGpuInstance
     float4 FillColor;      // rgba
     float4 OutlineColor;   // rgba
     float4 GlowColor;      // rgba
-    float4 StyleParams;    // x = onEdge (0.706), y = outlineWidth, z = softness, w = glowIntensity
+    float4 StyleParams;    // x = onEdge (0.502), y = outlineWidth, z = softness, w = glowIntensity
+    float4 CustomParams;   // tweenable user parameters forwarded from TextData.CustomParams
 };
 
 StructuredBuffer<GlyphGpuInstance> Glyphs : register(t0, space0);
@@ -38,6 +39,7 @@ struct PSInput
     float4 GlowColor    : TEXCOORD3;
     float4 StyleParams  : TEXCOORD4;
     float2 Effects      : TEXCOORD5; // x = shinePhase, y = localQuadY
+    float4 CustomParams : TEXCOORD6;
 };
 
 static const float2 QuadCorner[4] = {
@@ -70,6 +72,7 @@ PSInput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     o.GlowColor = g.GlowColor;
     o.StyleParams = g.StyleParams;
     o.Effects = float2(g.RightVec.w, c.y);
+    o.CustomParams = g.CustomParams;
     return o;
 }
 
@@ -101,8 +104,11 @@ float4 PSMain(PSInput input) : SV_Target0
         fillRgb += float3(0.75, 0.75, 0.75) * shine;
     }
 
-    float3 baseRgb = lerp(input.OutlineColor.rgb, fillRgb, fillAlpha);
-    float baseAlpha = max(fillAlpha * input.FillColor.a, outlineAlpha * input.OutlineColor.a);
+    // Porter-Duff premultiplied fill-over-outline compositing (prevents OutlineColor.rgb bleed when OutlineColor.a == 0)
+    float fillA = fillAlpha * input.FillColor.a;
+    float outA = outlineAlpha * input.OutlineColor.a;
+    float3 basePremul = fillRgb * fillA + input.OutlineColor.rgb * outA * (1.0 - fillA);
+    float baseAlpha = fillA + outA * (1.0 - fillA);
 
     // Outer SDF glow halo
     float glowAlpha = 0.0;
@@ -112,10 +118,10 @@ float4 PSMain(PSInput input) : SV_Target0
         glowAlpha = glowBand * (1.0 - outlineAlpha) * glowIntensity * input.GlowColor.a;
     }
 
-    float finalAlpha = saturate(baseAlpha + glowAlpha);
+    float finalAlpha = saturate(baseAlpha + glowAlpha * (1.0 - baseAlpha));
     if (finalAlpha <= 0.005)
         discard;
 
-    float3 finalRgb = (baseRgb * baseAlpha + input.GlowColor.rgb * glowAlpha) / max(finalAlpha, 0.001);
+    float3 finalRgb = (basePremul + input.GlowColor.rgb * glowAlpha * (1.0 - baseAlpha)) / max(finalAlpha, 0.001);
     return float4(finalRgb, finalAlpha);
 }

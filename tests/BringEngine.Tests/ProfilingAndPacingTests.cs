@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using BringEngine.Assets.Fonts;
 using BringEngine.Assets.Textures;
@@ -35,6 +36,8 @@ public static unsafe class ProfilingAndPacingTests
         Console.WriteLine("=== Update: VSync, FPS Cap, Separate-Bar Profiler, 2-Thread Pipeline & GPU Validation ===");
         Assert.Run("FramePacer_DefaultsToVSyncOnAnd60FpsCap", &TestFramePacerDefaultsAndCap);
         Assert.Run("FrameProfilerAndOverlay_SeparateBarsAndZeroGc", &TestProfilerAndOverlayZeroGc);
+        Assert.Run("ProfilerOverlay_AnchorsResizeVisibilityAndScopesReset", &TestOverlayAnchorsResizeAndScopesReset);
+        Assert.Run("EnginePipeline_HeadlessFaultRecoveryAndFlushZeroLeak", &TestEnginePipelineHeadlessFaultAndFlush);
         if (!headlessOnly)
         {
             Assert.Run("GpuVSyncToggle_SetPassCallsAndGpuDebugValidation", &TestGpuVSyncAndDebugValidation);
@@ -206,6 +209,19 @@ public static unsafe class ProfilingAndPacingTests
             Assert.True(profiler->GpuFrameMs > 0.0 && profiler->GpuFrameMs < maxGpuMs,
                 $"Swapchain VSync-ON GPU time must exclude VSync wait (< {maxGpuMs:F0}ms), got {profiler->GpuFrameMs:F3}ms");
 
+            // Cross-Module 2.2: Single-threaded RenderFrame with MeasureGpuWithFence = 0 still records Present GpuWaitTicks
+            // so VSync Present blocking does not pollute LogicCpuMs!
+            profiler->MeasureGpuWithFence = 0;
+            ProfilerSystem.BeginFrame(ref *profiler);
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 1f / 60f, 640, 360);
+            BatchRenderer.RenderFrame(ref *gpu, ref world, ref alloc, SceneLighting.Default, captureToOffscreen: false, profiler: profiler);
+            ProfilerSystem.EndCpuWork(ref *profiler);
+            ProfilerSystem.EndFrame(ref *profiler);
+            Assert.True(profiler->GpuWaitTicks >= 0L && profiler->LogicCpuMs < maxGpuMs,
+                $"Single-threaded LogicCpuMs excludes Present wait ({profiler->LogicCpuMs:F3}ms)");
+            profiler->MeasureGpuWithFence = 1;
+
             ProfilerOverlaySystem.Destroy(ref overlay, ref world);
         }
         finally
@@ -312,5 +328,115 @@ public static unsafe class ProfilingAndPacingTests
         }
 
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after 2-thread pipeline shutdown");
+    }
+
+    private static void TestOverlayAnchorsResizeAndScopesReset()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 512 * 1024, 1 * 1024 * 1024, 128 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 512, 64);
+        var bundleArena = LinearArena.Create(2 * 1024 * 1024);
+        var bundleId = BundleId.Create(1, 1);
+
+        FontHandle font = SdfFontLoader.BakeSdfFromSystemOrFile(null, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("ov_font"));
+        TextureHandle white = TextureLoader.CreateSolidColor(Color32.White, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("ov_white"));
+        var profiler = FrameProfiler.Create(ref alloc.Persistent, enabled: true, measureGpuWithFence: false);
+        var pacer = FramePacer.CreateDefault();
+
+        // F13 & T7: Verify all 4 anchors, dynamic resize, SetVisible(false), and ScopesText reset to "SCOPES: --"
+        var anchors = new[] { ProfilerAnchor.TopLeft, ProfilerAnchor.TopRight, ProfilerAnchor.BottomLeft, ProfilerAnchor.BottomRight };
+        foreach (ProfilerAnchor anchor in anchors)
+        {
+            var ov = ProfilerOverlaySystem.Create(ref world, font, white, 1280f, 720f, anchor, startVisible: true);
+            int tdIdx = BringEngine.Simulation.World.TransformSystem.GetDenseIndex(in world.Transforms, ov.BgEntity);
+            Vec3 pos720 = world.Transforms.LocalPosition[tdIdx];
+
+            // Resize to ultrawide 2560x1080 -> right-anchored panels must shift right
+            ProfilerOverlaySystem.Update(ref ov, ref world, in profiler, default, in pacer, 2560f, 1080f);
+            Vec3 posWide = world.Transforms.LocalPosition[tdIdx];
+            if (anchor == ProfilerAnchor.TopRight || anchor == ProfilerAnchor.BottomRight)
+                Assert.True(posWide.X > pos720.X, $"Right-anchored {anchor} shifts X on wider aspect ({pos720.X} -> {posWide.X})");
+            else
+                Assert.Near(pos720.X, posWide.X, 1e-3f, $"Left-anchored {anchor} keeps left margin");
+
+            ProfilerOverlaySystem.SetVisible(ref ov, ref world, false);
+            var bgSp = BringEngine.Simulation.RenderData.RenderComponentSystem.TryGetSprite(in world.RenderComponents, ov.BgSprite);
+            Assert.True(bgSp != null && bgSp->Visible == 0, $"{anchor} SetVisible(false) hides BgSprite");
+
+            ProfilerOverlaySystem.Destroy(ref ov, ref world);
+        }
+
+        // ScopesText reset when 0 scopes arrive after a frame with scopes
+        var ovScope = ProfilerOverlaySystem.Create(ref world, font, white, 1280f, 720f, ProfilerAnchor.TopRight, startVisible: true);
+        ProfilerSystem.BeginFrame(ref profiler);
+        int s = ProfilerSystem.BeginScope(ref profiler, "Sim");
+        ProfilerSystem.EndScope(ref profiler, s);
+        ProfilerSystem.EndFrame(ref profiler);
+        ProfilerSystem.BeginFrame(ref profiler); // copies "Sim" into LastFrameScopes
+        ProfilerOverlaySystem.Update(ref ovScope, ref world, in profiler, default, in pacer, 1280f, 720f);
+        var txt = BringEngine.Simulation.RenderData.RenderComponentSystem.TryGetText(in world.RenderComponents, ovScope.ScopesText);
+        Assert.True(txt != null && txt->Content.ToString().Contains("Sim:"), "ScopesText displays active scope");
+
+        ProfilerSystem.EndFrame(ref profiler); // 0 scopes in this frame
+        ProfilerSystem.BeginFrame(ref profiler); // LastFrameScopeCount becomes 0
+        ProfilerOverlaySystem.Update(ref ovScope, ref world, in profiler, default, in pacer, 1280f, 720f);
+        Assert.Equal("SCOPES: --", txt->Content.ToString(), "ScopesText resets to 'SCOPES: --' when 0 scopes arrive");
+
+        ProfilerOverlaySystem.Destroy(ref ovScope, ref world);
+        bundleArena.Dispose();
+        alloc.Dispose();
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks");
+    }
+
+    private static void FaultingLogicCallback(void* userCtx, ref PipelineFrameInput fin, ref RenderPacket outPacket)
+    {
+        int* shouldThrow = (int*)userCtx;
+        if (*shouldThrow != 0)
+            throw new InvalidDataException("Simulated logic worker fault");
+        outPacket = new RenderPacket { Valid = 1 };
+    }
+
+    private static void TestEnginePipelineHeadlessFaultAndFlush()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 1 * 1024 * 1024, 512 * 1024, 128 * 1024);
+        EnginePipelineState* pipe = alloc.Persistent.Alloc<EnginePipelineState>(1, 64);
+        int* flag = alloc.Persistent.Alloc<int>(1, 16);
+        *flag = 0;
+
+        GpuContext dummyGpu = default;
+        var shaders = default(RenderShaderDefaults);
+        EnginePipelineSystem.Start(pipe, flag, &FaultingLogicCallback, in shaders);
+        try
+        {
+            var fin = new PipelineFrameInput { DeltaTime = 1f / 60f, ViewportWidth = 1280f, ViewportHeight = 720f };
+            EnginePipelineSystem.StepPipelinedFrame(pipe, ref dummyGpu, ref alloc, in fin);
+            Assert.Equal((byte)1, pipe->HasRenderablePacket, "First headless step produced packet");
+
+            EnginePipelineSystem.FlushBeforeSceneTransition(pipe, ref dummyGpu);
+            Assert.Equal((byte)0, pipe->HasRenderablePacket, "FlushBeforeSceneTransition invalidated pending packet");
+
+            *flag = 1;
+            bool threw = false;
+            try
+            {
+                EnginePipelineSystem.StepPipelinedFrame(pipe, ref dummyGpu, ref alloc, in fin);
+            }
+            catch (InvalidOperationException ex)
+            {
+                threw = ex.InnerException is InvalidDataException;
+            }
+            Assert.True(threw, "Worker fault propagated via StepPipelinedFrame with inner exception");
+
+            *flag = 0;
+            EnginePipelineSystem.StepPipelinedFrame(pipe, ref dummyGpu, ref alloc, in fin);
+            Assert.Equal((byte)1, pipe->HasRenderablePacket, "Pipeline recovered cleanly after worker fault");
+        }
+        finally
+        {
+            EnginePipelineSystem.Stop(pipe);
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after pipeline fault test");
     }
 }

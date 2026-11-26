@@ -26,6 +26,9 @@ public static unsafe class TextureLoader
         TextureCompressionPolicy compression = TextureCompressionPolicy.None,
         JobScheduler* jobs = null)
     {
+        if (encodedBytes.IsEmpty)
+            throw new InvalidDataException("Encoded texture buffer is empty.");
+
         // Fast path: already GPU block-compressed BRTX blob (zero decode, direct BC1/BC3 VRAM upload!)
         if (encodedBytes.Length >= sizeof(BrtxHeader) &&
             MemoryMarshal.Read<uint>(encodedBytes) == BrtxHeader.MagicValue)
@@ -61,9 +64,19 @@ public static unsafe class TextureLoader
         BrtxHeader hdr = MemoryMarshal.Read<BrtxHeader>(brtxBytes);
         if (hdr.Magic != BrtxHeader.MagicValue)
             throw new InvalidDataException("Invalid BRTX header magic.");
+        if (hdr.Version != BrtxHeader.CurrentVersion)
+            throw new InvalidDataException($"Unsupported BRTX version {hdr.Version}.");
+        if (hdr.Width <= 0 || hdr.Height <= 0 || hdr.DataBytes <= 0)
+            throw new InvalidDataException($"Invalid BRTX dimensions/size ({hdr.Width}x{hdr.Height}, {hdr.DataBytes}B).");
+        if (hdr.Format is not (TexturePixelFormat.Rgba8 or TexturePixelFormat.R8 or TexturePixelFormat.Bc1Rgba or TexturePixelFormat.Bc3Rgba))
+            throw new InvalidDataException($"Unsupported BRTX pixel format {hdr.Format}.");
+
+        int expectedBytes = TextureCompressionSystem.CalcByteSize(hdr.Format, hdr.Width, hdr.Height);
+        if (hdr.DataBytes != expectedBytes)
+            throw new InvalidDataException($"BRTX DataBytes ({hdr.DataBytes}) does not match expected size ({expectedBytes}).");
 
         int payloadOffset = sizeof(BrtxHeader);
-        if (payloadOffset + hdr.DataBytes > brtxBytes.Length)
+        if ((long)payloadOffset + hdr.DataBytes > brtxBytes.Length)
             throw new InvalidDataException("BRTX payload truncated.");
 
         byte* dst = bundleArena.AllocUninitialized<byte>(hdr.DataBytes, 64);
@@ -87,6 +100,10 @@ public static unsafe class TextureLoader
         bool clampEdge = true,
         bool nearest = false)
     {
+        if (dataPtr == null) throw new ArgumentNullException(nameof(dataPtr));
+        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+        if (dataBytes <= 0) throw new ArgumentOutOfRangeException(nameof(dataBytes), "Texture dataBytes must be > 0.");
+
         return AssetSystem.RegisterTexture(ref assets, new TextureAssetData
         {
             OwnerBundle = bundle,
@@ -130,7 +147,15 @@ public static unsafe class TextureLoader
         bool clampEdge = false,
         bool nearest = false)
     {
-        int byteCount = width * height * 4;
+        if (width <= 0 || height <= 0)
+            throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+        long byteCountL = (long)width * height * 4L;
+        if (byteCountL > int.MaxValue)
+            throw new OverflowException("Texture RGBA byte size exceeds 2GB.");
+        int byteCount = (int)byteCountL;
+        if (rgba.Length < byteCount)
+            throw new ArgumentException($"RGBA span ({rgba.Length}B) smaller than {width}x{height}x4 ({byteCount}B).", nameof(rgba));
+
         byte* pixels = bundleArena.AllocUninitialized<byte>(byteCount, 64);
         rgba.Slice(0, byteCount).CopyTo(new Span<byte>(pixels, byteCount));
 
@@ -185,7 +210,8 @@ public static unsafe class TextureLoader
         BundleId bundle,
         StringId name)
     {
-        byte* px = bundleArena.AllocUninitialized<byte>(size * size * 4, 64);
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), size, "Radial glow texture size must be > 0.");
+        byte* px = bundleArena.AllocUninitialized<byte>(checked(size * size * 4), 64);
         float invHalf = 2f / size;
         for (int y = 0; y < size; y++)
         {
@@ -227,10 +253,11 @@ public static unsafe class TextureLoader
         BundleId bundle,
         StringId name)
     {
+        if (cellSize <= 0) throw new ArgumentOutOfRangeException(nameof(cellSize), cellSize, "Sprite sheet cellSize must be > 0.");
         const int cols = 4, rows = 2;
-        int w = cellSize * cols;
-        int h = cellSize * rows;
-        byte* px = bundleArena.Alloc<byte>(w * h * 4, 64);
+        int w = checked(cellSize * cols);
+        int h = checked(cellSize * rows);
+        byte* px = bundleArena.Alloc<byte>(checked(w * h * 4), 64);
 
         for (int frame = 0; frame < cols * rows; frame++)
         {
@@ -308,7 +335,9 @@ public static unsafe class TextureLoader
         BundleId bundle,
         StringId name)
     {
-        byte* px = bundleArena.AllocUninitialized<byte>(size * size * 4, 64);
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), size, "Checker texture size must be > 0.");
+        if (tiles <= 0) throw new ArgumentOutOfRangeException(nameof(tiles), tiles, "Checker tile count must be > 0.");
+        byte* px = bundleArena.AllocUninitialized<byte>(checked(size * size * 4), 64);
         int cell = size / tiles;
         if (cell < 2) cell = 2;
 

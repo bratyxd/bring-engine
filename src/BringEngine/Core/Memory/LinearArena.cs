@@ -37,6 +37,8 @@ public unsafe struct LinearArena
 
     public static LinearArena Create(nuint capacityBytes, ulong nameHash = 0)
     {
+        if (capacityBytes > nuint.MaxValue - 63)
+            throw new OutOfMemoryException("LinearArena capacity overflow.");
         nuint alignedCap = AlignUp(capacityBytes == 0 ? 64u : capacityBytes, 64);
         byte* ptr = (byte*)NativeMemoryTracker.AlignedAllocZeroed(alignedCap, 64);
         return new LinearArena
@@ -65,12 +67,18 @@ public unsafe struct LinearArena
             throw new InvalidOperationException("Attempted to allocate from an uninitialized or disposed LinearArena.");
 
         if (alignment < 1) alignment = 1;
-        nuint alignedOffset = AlignUp(Offset, alignment);
-        nuint newOffset = alignedOffset + byteCount;
+        if ((alignment & (alignment - 1)) != 0)
+            throw new ArgumentException("Alignment must be a power of 2.", nameof(alignment));
 
-        if (newOffset > Capacity)
+        nuint mask = alignment - 1;
+        if (Offset > nuint.MaxValue - mask)
             throw new OutOfMemoryException($"LinearArena overflow: requested {byteCount} bytes (align {alignment}), used {Offset}/{Capacity}.");
 
+        nuint alignedOffset = (Offset + mask) & ~mask;
+        if (alignedOffset > Capacity || byteCount > Capacity - alignedOffset)
+            throw new OutOfMemoryException($"LinearArena overflow: requested {byteCount} bytes (align {alignment}), used {Offset}/{Capacity}.");
+
+        nuint newOffset = alignedOffset + byteCount;
         byte* result = BasePtr + alignedOffset;
         Offset = newOffset;
         if (newOffset > PeakOffset) PeakOffset = newOffset;
@@ -86,21 +94,30 @@ public unsafe struct LinearArena
     public T* Alloc<T>(int count = 1, nuint alignment = 16) where T : unmanaged
     {
         if (count <= 0) return null;
-        return (T*)AllocBytes((nuint)sizeof(T) * (nuint)count, alignment, zeroed: true);
+        ulong bytes = (ulong)sizeof(T) * (ulong)count;
+        if (bytes > nuint.MaxValue)
+            throw new OutOfMemoryException("LinearArena element allocation size overflow.");
+        return (T*)AllocBytes((nuint)bytes, alignment, zeroed: true);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T* AllocUninitialized<T>(int count = 1, nuint alignment = 16) where T : unmanaged
     {
         if (count <= 0) return null;
-        return (T*)AllocBytes((nuint)sizeof(T) * (nuint)count, alignment, zeroed: false);
+        ulong bytes = (ulong)sizeof(T) * (ulong)count;
+        if (bytes > nuint.MaxValue)
+            throw new OutOfMemoryException("LinearArena element allocation size overflow.");
+        return (T*)AllocBytes((nuint)bytes, alignment, zeroed: false);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public NativeSlice<T> AllocSlice<T>(int count, nuint alignment = 16, bool zeroed = true) where T : unmanaged
     {
         if (count <= 0) return default;
-        T* ptr = (T*)AllocBytes((nuint)sizeof(T) * (nuint)count, alignment, zeroed);
+        ulong bytes = (ulong)sizeof(T) * (ulong)count;
+        if (bytes > nuint.MaxValue)
+            throw new OutOfMemoryException("LinearArena slice allocation size overflow.");
+        T* ptr = (T*)AllocBytes((nuint)bytes, alignment, zeroed);
         return new NativeSlice<T>(ptr, count);
     }
 

@@ -110,6 +110,8 @@ public unsafe struct ParticleTable
 
     public static ParticleTable Create(ref LinearArena arena, int maxParticles = 16384, int maxEmitters = 256)
     {
+        if (maxEmitters <= 0 || maxEmitters > 65535)
+            throw new ArgumentOutOfRangeException(nameof(maxEmitters), maxEmitters, "maxEmitters must be in [1, 65535].");
         uint* gens = arena.AllocUninitialized<uint>(maxEmitters, 16);
         for (int i = 0; i < maxEmitters; i++) gens[i] = 1;
 
@@ -406,13 +408,38 @@ public static unsafe class ParticleSystem
             if (t.EmitterAlive[s] == 0) continue;
             ref ParticleEmitterData em = ref t.Emitters[s];
 
+            Vec3 prevPos = em.Position;
             if (em.FollowEntity.IsValid)
-                em.Position = TransformSystem.GetWorldPosition(in transforms, em.FollowEntity);
+            {
+                int td = TransformSystem.GetDenseIndex(in transforms, em.FollowEntity);
+                if (td >= 0)
+                    em.Position = transforms.WorldPosition[td];
+            }
+
+            // Local-space emitters (WorldSpace == 0) carry their active particles along with emitter movement
+            if (em.WorldSpace == 0)
+            {
+                Vec3 delta = em.Position - prevPos;
+                if (delta.LengthSq() > 0f)
+                {
+                    for (int pIdx = 0; pIdx < t.ParticleCount; pIdx++)
+                    {
+                        if (t.EmitterSlot[pIdx] == (ushort)s)
+                        {
+                            t.PosX[pIdx] += delta.X;
+                            t.PosY[pIdx] += delta.Y;
+                            t.PosZ[pIdx] += delta.Z;
+                        }
+                    }
+                }
+            }
 
             if (em.PendingBurst > 0)
             {
                 int burst = em.PendingBurst;
                 em.PendingBurst = 0;
+                int avail = t.ParticleCapacity - t.ParticleCount;
+                if (burst > avail) burst = avail;
                 for (int b = 0; b < burst; b++)
                     SpawnParticle(ref t, (ushort)s, ref em);
             }
@@ -420,10 +447,12 @@ public static unsafe class ParticleSystem
             if (em.Enabled != 0 && em.EmitRate > 0f)
             {
                 em.EmitAccumulator += em.EmitRate * dt;
-                int spawnCount = (int)em.EmitAccumulator;
-                if (spawnCount > 0)
+                if (em.EmitAccumulator >= 1f)
                 {
-                    em.EmitAccumulator -= spawnCount;
+                    int avail = t.ParticleCapacity - t.ParticleCount;
+                    float whole = MathF.Floor(em.EmitAccumulator);
+                    int spawnCount = whole > avail ? avail : (int)whole;
+                    em.EmitAccumulator = whole > avail ? (em.EmitAccumulator - whole) : (em.EmitAccumulator - spawnCount);
                     for (int k = 0; k < spawnCount; k++)
                         SpawnParticle(ref t, (ushort)s, ref em);
                 }

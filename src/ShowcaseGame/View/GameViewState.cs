@@ -40,7 +40,7 @@ public unsafe struct GameViewState
     public EntityId TitleCoreEntity;
     public EntityId TitleRuneEntity;
     public SpriteHandle TitleRuneSprite;
-    public int TitleRuneAnimIdx;
+    public SpriteAnimPlayerHandle TitleRuneAnim;
     public float TitleOrbitAngle;
 
     // Arena scene handles
@@ -51,7 +51,8 @@ public unsafe struct GameViewState
     public EntityId CoreEntity;
     public EntityId FloorRuneEntity;
     public SpriteHandle FloorRuneSprite;
-    public int FloorRuneAnimIdx;
+    public SpriteAnimPlayerHandle FloorRuneAnim;
+    public int PickupStarClipIndex;
     public MaterialHandle CoreMaterial;
 
     public EmitterHandle PlayerTrailEmitter;
@@ -67,7 +68,7 @@ public unsafe struct GameViewState
     public SpriteHandle* ProjSprites;
     public EntityId* PickupEntities;
     public SpriteHandle* PickupSprites;
-    public int* PickupSpriteAnims;
+    public SpriteAnimPlayerHandle* PickupSpriteAnims;
 
     // Floating 3D animated SDF combat numbers
     public FloatingTextSlot* FloatingTexts;
@@ -94,7 +95,7 @@ public unsafe struct GameViewState
             ProjSprites = gamePersistent.Alloc<SpriteHandle>(GameSimState.MaxProjectiles, 64),
             PickupEntities = gamePersistent.Alloc<EntityId>(GameSimState.MaxPickups, 64),
             PickupSprites = gamePersistent.Alloc<SpriteHandle>(GameSimState.MaxPickups, 64),
-            PickupSpriteAnims = gamePersistent.Alloc<int>(GameSimState.MaxPickups, 64),
+            PickupSpriteAnims = gamePersistent.Alloc<SpriteAnimPlayerHandle>(GameSimState.MaxPickups, 64),
             FloatingTexts = gamePersistent.Alloc<FloatingTextSlot>(MaxFloatingTexts, 64),
         };
     }

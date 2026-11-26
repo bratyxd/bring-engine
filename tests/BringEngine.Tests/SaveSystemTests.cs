@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -23,6 +24,9 @@ public static unsafe class SaveSystemTests
         Assert.Run("SaveSystem_VersionedBinaryChunksBigSoAAndForwardCompat", &TestChunkedBigSoA);
         Assert.Run("SaveSystem_CorruptionCrc32AndAutomaticBackupRecovery", &TestCorruptionAndBackupRecovery);
         Assert.Run("SaveSystem_Zone1AsyncFifoOrderZeroGcAndZeroLeaks", &TestAsyncFifoZeroGcAndLeaks);
+        Assert.Run("SaveSystem_RawAsyncLongSlotNamesPathSanitizationAndLogging", &TestRawAsyncAndPathSanitization);
+        Assert.Run("SaveSystem_AdversarialBsavLz4BrotliAndChunkBounds", &TestAdversarialBsavLz4BrotliAndChunkBounds);
+        Assert.Run("SaveSystem_MaxPendingOpsAndMaxSaveBytesLimits", &TestMaxPendingOpsAndMaxSaveBytesLimits);
     }
 
     private static string CreateTempSaveDir(string suffix)
@@ -35,6 +39,16 @@ public static unsafe class SaveSystemTests
     private static void TryDeleteDir(string dir)
     {
         try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch { }
+    }
+
+    private static string[] ReadAllLinesShared(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var sr = new StreamReader(fs);
+        var list = new System.Collections.Generic.List<string>();
+        while (sr.ReadLine() is string line)
+            list.Add(line);
+        return list.ToArray();
     }
 
     private static void TestUnifiedPlatformPaths()
@@ -424,5 +438,267 @@ public static unsafe class SaveSystemTests
             Thread.Sleep(1);
         }
         throw new TimeoutException($"Timed out waiting for SaveOp {expectedHandle}");
+    }
+
+    private static void TestRawAsyncAndPathSanitization()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tempDir = CreateTempSaveDir("rawasync");
+        string logDir = CreateTempSaveDir("rawasynclog");
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        LogState* log = alloc.Persistent.Alloc<LogState>(1, 64);
+        SaveSystemState* saves = alloc.Persistent.Alloc<SaveSystemState>(1, 64);
+
+        try
+        {
+            LogSystem.Start(log, ref alloc.Persistent, appName: "RawAsyncLog", minLevel: LogLevel.Info, directoryOverride: logDir, hookExceptions: false);
+            SaveSystem.Start(saves, ref alloc.Persistent, appName: "RawAsyncTest", directoryOverride: tempDir, log: log);
+
+            // 1. SaveRawAsync -> SaveRawAsync (creates .bak) -> delete primary -> LoadRawAsync recovers from .bak
+            SaveOpHandle s1 = SaveSystem.SaveRawAsync(saves, "prefs.json", "{\"v\":1}"u8);
+            SaveResult r1 = WaitSaveResult(saves, s1);
+            SaveSystem.ReleaseResult(ref r1);
+            Assert.True(r1.IsSuccess, "SaveRawAsync v1 ok");
+
+            SaveOpHandle s2 = SaveSystem.SaveRawAsync(saves, "prefs.json", "{\"v\":2}"u8);
+            SaveResult r2 = WaitSaveResult(saves, s2);
+            SaveSystem.ReleaseResult(ref r2);
+            Assert.True(r2.IsSuccess, "SaveRawAsync v2 ok");
+
+            string rawPath = SaveSystem.GetSlotPath(saves, "prefs.json");
+            File.Delete(rawPath);
+
+            SaveOpHandle l1 = SaveSystem.LoadRawAsync(saves, "prefs.json");
+            SaveResult rl1 = WaitSaveResult(saves, l1);
+            try
+            {
+                Assert.True(rl1.IsSuccess && rl1.LoadedFromBackup == 1, "LoadRawAsync recovered from .bak");
+                Assert.Equal("{\"v\":1}", rl1.DataAsUtf8String(), "LoadRawAsync recovered v1 content");
+            }
+            finally { SaveSystem.ReleaseResult(ref rl1); }
+
+            // DeleteAsync removes primary & backup
+            SaveOpHandle d1 = SaveSystem.DeleteAsync(saves, "prefs.json", deleteBackup: true);
+            SaveResult rd1 = WaitSaveResult(saves, d1);
+            SaveSystem.ReleaseResult(ref rd1);
+            Assert.True(rd1.IsSuccess && !SaveSystem.Exists(saves, "prefs.json"), "DeleteAsync removed primary and backup");
+
+            // 2. Long slot name (> 60 bytes) async vs sync parity & zero-GC check
+            string longName = new string('a', 75) + "_profile.bsav";
+            ReadOnlySpan<byte> payload = "{\"ok\":true}"u8;
+
+            // Warmup once
+            SaveOpHandle warm = SaveSystem.SaveAsync(saves, longName, payload);
+            SaveResult rw = WaitSaveResult(saves, warm);
+            SaveSystem.ReleaseResult(ref rw);
+
+            long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+            SaveOpHandle sl = SaveSystem.SaveAsync(saves, longName, payload);
+            long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+            Assert.Equal(0L, gcAfter - gcBefore, "SaveAsync with >60-char slot name allocates 0 GC bytes");
+
+            SaveResult rsl = WaitSaveResult(saves, sl);
+            SaveSystem.ReleaseResult(ref rsl);
+            Assert.True(rsl.IsSuccess, "Long slot SaveAsync succeeded");
+            Assert.True(SaveSystem.Exists(saves, longName), "Sync Exists sees long async slot");
+
+            SaveResult syncLoad = SaveSystem.LoadSync(saves, longName);
+            try
+            {
+                Assert.True(syncLoad.IsSuccess, "Sync LoadSync sees long async slot");
+                Assert.Equal("{\"ok\":true}", syncLoad.DataAsUtf8String(), "Long slot payload matches");
+            }
+            finally { SaveSystem.ReleaseResult(ref syncLoad); }
+
+            // 3. Path traversal containment
+            string evilPath = SaveSystem.GetSlotPath(saves, "../../evil_slot.bsav");
+            Assert.Equal(tempDir, Path.GetDirectoryName(evilPath) ?? string.Empty, "Traversal stripped to savesDir");
+            Assert.Equal("evil_slot.bsav", Path.GetFileName(evilPath), "Sanitized filename exact");
+
+            string dotPath = SaveSystem.GetSlotPath(saves, "..");
+            Assert.Equal("save.bsav", Path.GetFileName(dotPath), "Dots-only falls back to save.bsav");
+            Assert.Equal(0, saves->PendingCount.Value, "PendingCount == 0 after drain");
+
+            LogSystem.Flush(log);
+            string[] logLines = ReadAllLinesShared(LogSystem.GetFilePath(log));
+            bool sawBackupLog = false;
+            for (int i = 0; i < logLines.Length; i++)
+            {
+                if (logLines[i].Contains("recovered", StringComparison.OrdinalIgnoreCase) &&
+                    logLines[i].Contains(".bak", StringComparison.OrdinalIgnoreCase))
+                    sawBackupLog = true;
+            }
+            Assert.True(sawBackupLog, "Optional LogState logged .bak recovery warning");
+        }
+        finally
+        {
+            SaveSystem.Stop(saves);
+            LogSystem.Stop(log);
+            alloc.Dispose();
+            TryDeleteDir(tempDir);
+            TryDeleteDir(logDir);
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after raw/path test");
+    }
+
+    private static void WriteCustomBsavFile(string path, ushort fmtVer, byte payloadKind, byte compMode, int uncompBytes, byte[] payloadBytes, uint crc = 0)
+    {
+        var hdr = new BsavHeader
+        {
+            Magic = BsavHeader.MagicValue,
+            FormatVersion = fmtVer,
+            PayloadKind = payloadKind,
+            Compression = compMode,
+            GameSchemaVersion = 1,
+            UncompressedBytes = uncompBytes,
+            CompressedBytes = payloadBytes.Length,
+            PayloadCrc32 = crc,
+            SavedUtcTicks = 1,
+        };
+        byte[] all = new byte[sizeof(BsavHeader) + payloadBytes.Length];
+        fixed (byte* p = all) *(BsavHeader*)p = hdr;
+        Buffer.BlockCopy(payloadBytes, 0, all, sizeof(BsavHeader), payloadBytes.Length);
+        File.WriteAllBytes(path, all);
+    }
+
+    private static void TestAdversarialBsavLz4BrotliAndChunkBounds()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tempDir = CreateTempSaveDir("adv");
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        SaveSystemState* saves = alloc.Persistent.Alloc<SaveSystemState>(1, 64);
+
+        try
+        {
+            SaveSystem.Start(saves, ref alloc.Persistent, appName: "AdvSaveTest", maxSaveBytes: 4096, directoryOverride: tempDir);
+
+            // 1. Missing primary + corrupt .bak -> MUST return Corrupted (not NotFound)
+            string missingPrimaryPath = SaveSystem.GetSlotPath(saves, "only_bak.bsav");
+            File.WriteAllBytes(missingPrimaryPath + ".bak", new byte[] { 1, 2, 3 });
+            SaveResult rOnlyBak = SaveSystem.LoadSync(saves, "only_bak.bsav");
+            Assert.Equal((byte)SaveStatus.Corrupted, (byte)rOnlyBak.Status, "Missing primary + corrupt .bak returns Corrupted");
+            Assert.True(rOnlyBak.DataPtr == null, "No leaked buffer on corrupt .bak");
+
+            // 2. UncompressedBytes == 0 with CompressedBytes != 0 -> Corrupted
+            string pZeroUncomp = SaveSystem.GetSlotPath(saves, "zero_uncomp.bsav");
+            WriteCustomBsavFile(pZeroUncomp, BsavHeader.CurrentFormatVersion, (byte)SavePayloadKind.Binary, (byte)PackCompressionMode.None, 0, new byte[16]);
+            SaveResult rZeroUncomp = SaveSystem.LoadSync(saves, "zero_uncomp.bsav");
+            Assert.Equal((byte)SaveStatus.Corrupted, (byte)rZeroUncomp.Status, "UncompressedBytes==0 && CompressedBytes>0 rejected");
+
+            // 3. Invalid PayloadKind (e.g. Raw=0 or 99 inside BSAV) -> Corrupted
+            string pBadKind = SaveSystem.GetSlotPath(saves, "bad_kind.bsav");
+            WriteCustomBsavFile(pBadKind, BsavHeader.CurrentFormatVersion, (byte)99, (byte)PackCompressionMode.None, 4, new byte[4], NetHash.Crc32(new byte[4]));
+            SaveResult rBadKind = SaveSystem.LoadSync(saves, "bad_kind.bsav");
+            Assert.Equal((byte)SaveStatus.Corrupted, (byte)rBadKind.Status, "Invalid BSAV PayloadKind rejected");
+
+            // 4. UncompressedBytes > MaxSaveBytes -> Corrupted
+            string pTooBig = SaveSystem.GetSlotPath(saves, "too_big.bsav");
+            WriteCustomBsavFile(pTooBig, BsavHeader.CurrentFormatVersion, (byte)SavePayloadKind.Binary, (byte)PackCompressionMode.Lz4, 8192, new byte[8]);
+            SaveResult rTooBig = SaveSystem.LoadSync(saves, "too_big.bsav");
+            Assert.Equal((byte)SaveStatus.Corrupted, (byte)rTooBig.Status, "UncompressedBytes > MaxSaveBytes rejected");
+
+            // 5. Unknown Compression mode -> Corrupted
+            string pBadComp = SaveSystem.GetSlotPath(saves, "bad_comp.bsav");
+            WriteCustomBsavFile(pBadComp, BsavHeader.CurrentFormatVersion, (byte)SavePayloadKind.Binary, (byte)250, 4, new byte[4]);
+            SaveResult rBadComp = SaveSystem.LoadSync(saves, "bad_comp.bsav");
+            Assert.Equal((byte)SaveStatus.Corrupted, (byte)rBadComp.Status, "Unknown Compression mode rejected");
+
+            // 6. Corrupt Brotli stream -> Corrupted
+            string pBadBrotli = SaveSystem.GetSlotPath(saves, "bad_brotli.bsav");
+            WriteCustomBsavFile(pBadBrotli, BsavHeader.CurrentFormatVersion, (byte)SavePayloadKind.Binary, (byte)PackCompressionMode.Brotli, 32, new byte[] { 0xFF, 0xFF, 0xFF, 0xFF });
+            SaveResult rBadBrotli = SaveSystem.LoadSync(saves, "bad_brotli.bsav");
+            Assert.Equal((byte)SaveStatus.Corrupted, (byte)rBadBrotli.Status, "Corrupt Brotli returns Corrupted");
+
+            // 7. Corrupt LZ4 stream (STO-02): trailing 0xF0 token at EOF & 0xFF run integer overflow -> Corrupted
+            string pLz4Eof = SaveSystem.GetSlotPath(saves, "bad_lz4_eof.bsav");
+            WriteCustomBsavFile(pLz4Eof, BsavHeader.CurrentFormatVersion, (byte)SavePayloadKind.Binary, (byte)PackCompressionMode.Lz4, 32, new byte[] { 0xF0 });
+            SaveResult rLz4Eof = SaveSystem.LoadSync(saves, "bad_lz4_eof.bsav");
+            Assert.Equal((byte)SaveStatus.Corrupted, (byte)rLz4Eof.Status, "Corrupt LZ4 0xF0 EOF returns Corrupted");
+
+            byte[] ffRun = new byte[64];
+            ffRun[0] = 0xF0;
+            for (int i = 1; i < ffRun.Length; i++) ffRun[i] = 0xFF;
+            string pLz4Ff = SaveSystem.GetSlotPath(saves, "bad_lz4_ff.bsav");
+            WriteCustomBsavFile(pLz4Ff, BsavHeader.CurrentFormatVersion, (byte)SavePayloadKind.Binary, (byte)PackCompressionMode.Lz4, 64, ffRun);
+            SaveResult rLz4Ff = SaveSystem.LoadSync(saves, "bad_lz4_ff.bsav");
+            Assert.Equal((byte)SaveStatus.Corrupted, (byte)rLz4Ff.Status, "Corrupt LZ4 0xFF run returns Corrupted");
+
+            // 8. SaveChunkReader adversarial bounds (payloadLen = int.MaxValue, truncated < 16 bytes)
+            byte* badChunkBuf = stackalloc byte[32];
+            BinaryPrimitives.WriteUInt64LittleEndian(new Span<byte>(badChunkBuf + 0, 8), StringId.Hash("evil").Value);
+            BinaryPrimitives.WriteUInt16LittleEndian(new Span<byte>(badChunkBuf + 8, 2), 1);
+            BinaryPrimitives.WriteUInt16LittleEndian(new Span<byte>(badChunkBuf + 10, 2), 0);
+            BinaryPrimitives.WriteInt32LittleEndian(new Span<byte>(badChunkBuf + 12, 4), int.MaxValue);
+            var readerMaxLen = SaveChunkReader.Create(badChunkBuf, 32);
+            Assert.True(!readerMaxLen.Next(out _), "SaveChunkReader rejects payloadLen=int.MaxValue");
+            Assert.True(readerMaxLen.IsMalformed, "SaveChunkReader flags IsMalformed on overflow length");
+
+            var readerShort = SaveChunkReader.Create(badChunkBuf, 8);
+            Assert.True(!readerShort.Next(out _) && readerShort.IsMalformed, "SaveChunkReader flags IsMalformed on < 16 bytes");
+
+            // 9. SaveChunkWriter.CreateInArena overflow
+            var arenaWriter = SaveChunkWriter.CreateInArena(ref alloc.Scratch, 32);
+            Assert.True(!arenaWriter.WriteChunk(StringId.Hash("big"), 1, new byte[64]), "Arena SaveChunkWriter rejects oversized chunk");
+            Assert.True(arenaWriter.HasOverflow, "Arena SaveChunkWriter sets HasOverflow");
+        }
+        finally
+        {
+            SaveSystem.Stop(saves);
+            alloc.Dispose();
+            TryDeleteDir(tempDir);
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after adversarial BSAV/LZ4/Chunk test");
+    }
+
+    private static void TestMaxPendingOpsAndMaxSaveBytesLimits()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tempDir = CreateTempSaveDir("limits");
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        SaveSystemState* saves = alloc.Persistent.Alloc<SaveSystemState>(1, 64);
+
+        try
+        {
+            SaveSystem.Start(saves, ref alloc.Persistent, appName: "LimitsTest", maxPendingOps: 4, maxSaveBytes: 4096, directoryOverride: tempDir);
+
+            // 1. Payload > MaxSaveBytes returns Invalid immediately
+            byte[] oversized = new byte[4097];
+            SaveOpHandle bigOp = SaveSystem.SaveAsync(saves, "oversize.bsav", oversized);
+            Assert.True(!bigOp.IsValid, "Oversized payload > MaxSaveBytes rejected with Invalid handle");
+
+            // 2. MaxPendingOps=4 slot saturation -> 5th op returns Invalid until polled
+            byte[] small = "{\"ok\":1}"u8.ToArray();
+            var handles = new SaveOpHandle[4];
+            for (int i = 0; i < 4; i++)
+            {
+                handles[i] = SaveSystem.SaveAsync(saves, $"slot_{i}.bsav", small);
+                Assert.True(handles[i].IsValid, $"Slot {i} accepted");
+            }
+            SaveOpHandle fifth = SaveSystem.SaveAsync(saves, "slot_4.bsav", small);
+            Assert.True(!fifth.IsValid, "5th concurrent op rejected when MaxPendingOps=4");
+
+            for (int i = 0; i < 4; i++)
+            {
+                SaveResult r = WaitSaveResult(saves, handles[i]);
+                SaveSystem.ReleaseResult(ref r);
+                Assert.True(r.IsSuccess, $"Slot {i} completed");
+            }
+
+            SaveOpHandle afterPoll = SaveSystem.SaveAsync(saves, "slot_4.bsav", small);
+            Assert.True(afterPoll.IsValid, "Slot reusable after PollCompleted");
+            SaveResult rp = WaitSaveResult(saves, afterPoll);
+            SaveSystem.ReleaseResult(ref rp);
+        }
+        finally
+        {
+            SaveSystem.Stop(saves);
+            alloc.Dispose();
+            TryDeleteDir(tempDir);
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after limits test");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after limits test");
     }
 }

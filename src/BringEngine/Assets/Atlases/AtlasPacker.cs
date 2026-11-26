@@ -16,7 +16,8 @@ public unsafe struct AtlasSourceImage
     public int Width;
     public int Height;
     public Vec4 SliceBorders; // 9-slice insets in source pixels: (Left, Bottom, Right, Top)
-    public Vec2 Pivot;        // (0.5, 0.5) if zero
+    public Vec2 Pivot;        // (0.5, 0.5) if HasPivot == 0 and Pivot == Vec2.Zero
+    public byte HasPivot;     // Set to 1 to preserve explicit Pivot == (0, 0)
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -100,6 +101,14 @@ public static unsafe class AtlasPacker
         int maxPage = options.MaxPageSize > 0 ? AlignUp4(options.MaxPageSize) : 2048;
         int pad = options.Padding >= 0 ? options.Padding : 2;
 
+        for (int i = 0; i < sources.Length; i++)
+        {
+            if (sources[i].RgbaPixels == null)
+                throw new ArgumentNullException(nameof(sources), $"Atlas source {i} has null RgbaPixels.");
+            if (sources[i].Width <= 0 || sources[i].Height <= 0)
+                throw new ArgumentOutOfRangeException(nameof(sources), $"Atlas source {i} dimensions must be > 0 (got {sources[i].Width}x{sources[i].Height}).");
+        }
+
         // Deterministic sort by height desc, then width desc, then name hash asc
         int[] order = new int[sources.Length];
         for (int i = 0; i < sources.Length; i++) order[i] = i;
@@ -115,7 +124,7 @@ public static unsafe class AtlasPacker
             order[j + 1] = key;
         }
 
-        // Shelf pack across 1..N pages
+        // Shelf pack across 1..N pages (4px-aligned cells prevent BC1/BC3 4x4 block crosstalk between neighbors)
         var placements = new Placement[sources.Length];
         int pageCap = 16;
         var pageSizes = new PageSize[pageCap];
@@ -149,8 +158,8 @@ public static unsafe class AtlasPacker
             int si = order[oi];
             int sw = sources[si].Width;
             int sh = sources[si].Height;
-            int pw = sw + pad * 2;
-            int ph = sh + pad * 2;
+            int pw = AlignUp4(sw + pad * 2);
+            int ph = AlignUp4(sh + pad * 2);
 
             if (pw > maxPage || ph > maxPage)
                 throw new InvalidOperationException($"Sprite ({sw}x{sh} + padding {pad}) exceeds MaxPageSize ({maxPage}).");
@@ -197,7 +206,10 @@ public static unsafe class AtlasPacker
         {
             int w = pageSizes[p].Width;
             int h = pageSizes[p].Height;
-            byte[] rgba = new byte[w * h * 4];
+            long rgbaBytes = (long)w * h * 4L;
+            if (rgbaBytes > int.MaxValue)
+                throw new OverflowException("Atlas page pixel buffer exceeds 2GB.");
+            byte[] rgba = new byte[(int)rgbaBytes];
 
             fixed (byte* dstPtr = rgba)
             {
@@ -209,7 +221,9 @@ public static unsafe class AtlasPacker
 
                     BlitWithEdgeBleed(src.RgbaPixels, src.Width, src.Height, dstPtr, w, h, pl.X, pl.Y, pad);
 
-                    Vec2 piv = (src.Pivot.X == 0f && src.Pivot.Y == 0f) ? new Vec2(0.5f, 0.5f) : src.Pivot;
+                    Vec2 piv = src.HasPivot != 0
+                        ? src.Pivot
+                        : ((src.Pivot.X == 0f && src.Pivot.Y == 0f) ? new Vec2(0.5f, 0.5f) : src.Pivot);
                     regions[pl.SourceIndex] = new PackedAtlasRegion
                     {
                         Name = src.Name,
@@ -310,6 +324,9 @@ public static unsafe class AtlasPacker
         byte* dst, int dw, int dh,
         int ox, int oy, int pad)
     {
+        if (src == null || dst == null || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0)
+            return;
+
         int xMin = Math.Max(0, ox - pad);
         int xMax = Math.Min(dw - 1, ox + sw - 1 + pad);
         int yMin = Math.Max(0, oy - pad);

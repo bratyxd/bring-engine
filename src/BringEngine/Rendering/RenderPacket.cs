@@ -102,6 +102,7 @@ public struct Batch3DCmd
     public int TextureGpuSlot;
     public ShaderHandle Shader;
     public MaterialAlphaMode AlphaMode;
+    public byte DoubleSided;
     public uint BaseInstance;
     public uint InstanceCount;
 }

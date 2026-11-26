@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using BringEngine.Core.Handles;
+using BringEngine.Core.Logging;
 using BringEngine.Core.Memory;
 using BringEngine.Core.Threading;
 
@@ -73,6 +74,8 @@ internal unsafe struct WsConnectionMeta
     public int InUse;
     public int ConnState; // (int)WebSocketStateKind
     public int CloseRequested;
+    public ushort RequestedCloseStatus;
+    public FixedString256 RequestedCloseReason;
 
     public WsOutboundFrame* OutQueue;
     public int OutMask;
@@ -104,6 +107,7 @@ public unsafe struct WebSocketClientState
     public int MaxConnections;
     public int MaxMessageBytes;
     public int PoolSlot;
+    public LogState* Log;
     public byte Active;
 
     public CachePaddedInt ActiveConnectionCount;
@@ -124,7 +128,7 @@ public static unsafe class WebSocketSystem
 {
     private const int MaxInstances = 8;
 
-    private struct ManagedConnection
+    internal struct ManagedConnection
     {
         public ClientWebSocket? Socket;
         public CancellationTokenSource? Cts;
@@ -132,9 +136,16 @@ public static unsafe class WebSocketSystem
         public Task? IoTask;
     }
 
+    internal sealed class ManagedWsGuard
+    {
+        public volatile bool Stopped;
+        public int ActiveWorkers;
+        public ManagedConnection[]? Connections;
+    }
+
     private struct ManagedWsPool
     {
-        public ManagedConnection[]? Connections;
+        public ManagedWsGuard? Guard;
         public bool InUse;
     }
 
@@ -147,17 +158,29 @@ public static unsafe class WebSocketSystem
         int maxConnections = WebSocketClientState.DefaultMaxConnections,
         int eventQueueCapacity = WebSocketClientState.DefaultEventQueueCapacity,
         int outboundQueueCapacity = WebSocketClientState.DefaultOutboundQueueCapacity,
-        int maxMessageBytes = WebSocketClientState.DefaultMaxMessageBytes)
+        int maxMessageBytes = WebSocketClientState.DefaultMaxMessageBytes,
+        LogState* log = null)
     {
         if (state == null) throw new ArgumentNullException(nameof(state));
         if (maxConnections < 1) maxConnections = 1;
+        int maxHandleSlots = (int)HandlePacking.IndexMask + 1;
+        if (maxConnections > maxHandleSlots) maxConnections = maxHandleSlots;
         if (maxMessageBytes < 1024) maxMessageBytes = 1024;
+        if (eventQueueCapacity < 16) eventQueueCapacity = 16;
+        if (eventQueueCapacity > 0x2000_0000) eventQueueCapacity = 0x2000_0000;
+        if (outboundQueueCapacity < 16) outboundQueueCapacity = 16;
+        if (outboundQueueCapacity > 0x2000_0000) outboundQueueCapacity = 0x2000_0000;
 
         int evCap = 16;
         while (evCap < eventQueueCapacity) evCap <<= 1;
 
         int outCap = 16;
         while (outCap < outboundQueueCapacity) outCap <<= 1;
+
+        var guard = new ManagedWsGuard
+        {
+            Connections = new ManagedConnection[maxConnections],
+        };
 
         int poolSlot = -1;
         lock (s_poolLock)
@@ -167,7 +190,7 @@ public static unsafe class WebSocketSystem
                 if (!s_pools[i].InUse)
                 {
                     s_pools[i].InUse = true;
-                    s_pools[i].Connections = new ManagedConnection[maxConnections];
+                    s_pools[i].Guard = guard;
                     poolSlot = i;
                     break;
                 }
@@ -176,34 +199,58 @@ public static unsafe class WebSocketSystem
         if (poolSlot < 0)
             throw new InvalidOperationException("Maximum concurrent WebSocketClientState instances exceeded.");
 
-        *state = default;
-        state->Connections = persistentArena.Alloc<WsConnectionMeta>(maxConnections, 64);
-        for (int i = 0; i < maxConnections; i++)
+        try
         {
-            state->Connections[i].Generation = 1;
-            state->Connections[i].InUse = 0;
-            state->Connections[i].ConnState = (int)WebSocketStateKind.Disconnected;
-            state->Connections[i].OutQueue = persistentArena.Alloc<WsOutboundFrame>(outCap, 64);
-            state->Connections[i].OutMask = outCap - 1;
+            *state = default;
+            state->Connections = persistentArena.Alloc<WsConnectionMeta>(maxConnections, 64);
+            for (int i = 0; i < maxConnections; i++)
+            {
+                state->Connections[i].Generation = 1;
+                state->Connections[i].InUse = 0;
+                state->Connections[i].ConnState = (int)WebSocketStateKind.Disconnected;
+                state->Connections[i].OutQueue = persistentArena.Alloc<WsOutboundFrame>(outCap, 64);
+                state->Connections[i].OutMask = outCap - 1;
+            }
+
+            state->EventQueue = persistentArena.Alloc<WebSocketEvent>(evCap, 64);
+            state->EventMask = evCap - 1;
+            state->MaxConnections = maxConnections;
+            state->MaxMessageBytes = maxMessageBytes;
+            state->PoolSlot = poolSlot;
+            state->Log = log;
+            Volatile.Write(ref state->Active, 1);
+        }
+        catch
+        {
+            lock (s_poolLock)
+            {
+                s_pools[poolSlot] = default;
+            }
+            throw;
         }
 
-        state->EventQueue = persistentArena.Alloc<WebSocketEvent>(evCap, 64);
-        state->EventMask = evCap - 1;
-        state->MaxConnections = maxConnections;
-        state->MaxMessageBytes = maxMessageBytes;
-        state->PoolSlot = poolSlot;
-        state->Active = 1;
+        LogSystem.Info(log, $"WebSocketSystem started (maxConnections={maxConnections}, maxMessageBytes={maxMessageBytes})");
     }
 
     public static void Stop(WebSocketClientState* state)
     {
-        if (state == null || state->Active == 0) return;
-        int poolSlot = state->PoolSlot;
+        if (state == null || Volatile.Read(ref state->Active) == 0) return;
 
-        state->Active = 0;
-        Thread.MemoryBarrier();
-
-        ManagedConnection[]? conns = s_pools[poolSlot].Connections;
+        int poolSlot;
+        ManagedWsGuard? guard;
+        ManagedConnection[]? conns;
+        AcquireSpinLock(ref state->SlotLock.Value);
+        if (Volatile.Read(ref state->Active) == 0)
+        {
+            ReleaseSpinLock(ref state->SlotLock.Value);
+            return;
+        }
+        Volatile.Write(ref state->Active, 0);
+        poolSlot = state->PoolSlot;
+        guard = (uint)poolSlot < MaxInstances ? s_pools[poolSlot].Guard : null;
+        conns = guard?.Connections;
+        if (guard != null)
+            guard.Stopped = true;
         if (conns != null)
         {
             for (int i = 0; i < conns.Length; i++)
@@ -211,6 +258,11 @@ public static unsafe class WebSocketSystem
                 try { conns[i].Cts?.Cancel(); } catch { }
                 try { conns[i].SendWake?.Set(); } catch { }
             }
+        }
+        ReleaseSpinLock(ref state->SlotLock.Value);
+
+        if (conns != null)
+        {
             for (int i = 0; i < conns.Length; i++)
             {
                 Task? t = conns[i].IoTask;
@@ -218,9 +270,12 @@ public static unsafe class WebSocketSystem
                 {
                     try { t.Wait(TimeSpan.FromSeconds(5)); } catch { }
                 }
-                conns[i].Socket?.Dispose();
-                conns[i].Cts?.Dispose();
-                conns[i].SendWake?.Dispose();
+                if (t == null || t.IsCompleted)
+                {
+                    try { conns[i].Socket?.Dispose(); } catch { }
+                    try { conns[i].Cts?.Dispose(); } catch { }
+                    try { conns[i].SendWake?.Dispose(); } catch { }
+                }
                 conns[i] = default;
 
                 DrainOutboundQueue(state->Connections + i);
@@ -230,10 +285,16 @@ public static unsafe class WebSocketSystem
         while (PollEvent(state, out WebSocketEvent ev))
             ReleaseEvent(ref ev);
 
-        lock (s_poolLock)
+        if ((uint)poolSlot < MaxInstances)
         {
-            s_pools[poolSlot] = default;
+            lock (s_poolLock)
+            {
+                s_pools[poolSlot] = default;
+            }
         }
+
+        LogSystem.Info(state->Log,
+            $"WebSocketSystem stopped (sent={Interlocked.Read(ref state->TotalMessagesSent.Value)}, recv={Interlocked.Read(ref state->TotalMessagesReceived.Value)}, dropped={Interlocked.Read(ref state->DroppedEvents.Value)})");
     }
 
     /// <summary>
@@ -248,12 +309,18 @@ public static unsafe class WebSocketSystem
         int keepAliveMs = 20000,
         int connectTimeoutMs = 10000)
     {
-        if (state == null || state->Active == 0 || url.IsEmpty)
+        if (state == null || Volatile.Read(ref state->Active) == 0 || url.IsEmpty)
             return WebSocketHandle.Invalid;
 
         int slotIdx = -1;
         uint gen = 0;
         AcquireSpinLock(ref state->SlotLock.Value);
+        ManagedWsGuard? guard = (uint)state->PoolSlot < MaxInstances ? s_pools[state->PoolSlot].Guard : null;
+        if (Volatile.Read(ref state->Active) == 0 || guard == null || guard.Stopped || guard.Connections == null)
+        {
+            ReleaseSpinLock(ref state->SlotLock.Value);
+            return WebSocketHandle.Invalid;
+        }
         for (int i = 0; i < state->MaxConnections; i++)
         {
             if (Volatile.Read(ref state->Connections[i].InUse) == 0)
@@ -265,6 +332,8 @@ public static unsafe class WebSocketSystem
                 c->InUse = 1;
                 c->ConnState = (int)WebSocketStateKind.Connecting;
                 c->CloseRequested = 0;
+                c->RequestedCloseStatus = 0;
+                c->RequestedCloseReason = default;
                 c->OutHead = 0;
                 c->OutTail = 0;
                 c->OutLock = 0;
@@ -276,13 +345,35 @@ public static unsafe class WebSocketSystem
         ReleaseSpinLock(ref state->SlotLock.Value);
 
         if (slotIdx < 0)
+        {
+            LogSystem.Warn(state->Log, $"WebSocketSystem connection pool full (maxConnections={state->MaxConnections})");
             return WebSocketHandle.Invalid;
+        }
 
         WebSocketHandle handle = WebSocketHandle.Create((uint)slotIdx, gen);
         Uri uri;
+        ClientWebSocket ws;
         try
         {
             uri = new Uri(new string(url), UriKind.Absolute);
+            ws = new ClientWebSocket();
+            try
+            {
+                if (keepAliveMs > 0)
+                    ws.Options.KeepAliveInterval = TimeSpan.FromMilliseconds(keepAliveMs);
+                if (!subProtocol.IsEmpty)
+                    ws.Options.AddSubProtocol(new string(subProtocol));
+                for (int i = 0; i < headers.Length; i++)
+                {
+                    if (headers[i].Name.Length > 0)
+                        ws.Options.SetRequestHeader(headers[i].Name.ToString(), headers[i].Value.ToString());
+                }
+            }
+            catch
+            {
+                ws.Dispose();
+                throw;
+            }
         }
         catch (Exception ex)
         {
@@ -292,36 +383,40 @@ public static unsafe class WebSocketSystem
                 Kind = WebSocketEventKind.Error,
                 Info = FixedString256.From(ex.Message),
             });
+            LogSystem.Warn(state->Log, $"WebSocket {handle} Connect setup failed: {ex.Message}");
+            AcquireSpinLock(ref state->SlotLock.Value);
             Volatile.Write(ref state->Connections[slotIdx].ConnState, (int)WebSocketStateKind.Faulted);
             Volatile.Write(ref state->Connections[slotIdx].InUse, 0);
+            ReleaseSpinLock(ref state->SlotLock.Value);
             return handle;
-        }
-
-        var ws = new ClientWebSocket();
-        if (keepAliveMs > 0)
-            ws.Options.KeepAliveInterval = TimeSpan.FromMilliseconds(keepAliveMs);
-        if (!subProtocol.IsEmpty)
-            ws.Options.AddSubProtocol(new string(subProtocol));
-        for (int i = 0; i < headers.Length; i++)
-        {
-            if (headers[i].Name.Length > 0)
-                ws.Options.SetRequestHeader(headers[i].Name.ToString(), headers[i].Value.ToString());
         }
 
         var cts = new CancellationTokenSource();
         var wake = new AutoResetEvent(false);
 
-        int poolSlot = state->PoolSlot;
-        ManagedConnection[] conns = s_pools[poolSlot].Connections!;
+        ManagedConnection[] conns = guard.Connections;
         // Wait for any previous finished task on this slot before disposing old handles
         Task? prevTask = conns[slotIdx].IoTask;
         if (prevTask != null && !prevTask.IsCompleted)
         {
             try { prevTask.Wait(TimeSpan.FromSeconds(2)); } catch { }
         }
-        conns[slotIdx].Socket?.Dispose();
-        conns[slotIdx].Cts?.Dispose();
-        conns[slotIdx].SendWake?.Dispose();
+
+        AcquireSpinLock(ref state->SlotLock.Value);
+        if (Volatile.Read(ref state->Active) == 0 || guard.Stopped)
+        {
+            Volatile.Write(ref state->Connections[slotIdx].ConnState, (int)WebSocketStateKind.Closed);
+            Volatile.Write(ref state->Connections[slotIdx].InUse, 0);
+            ReleaseSpinLock(ref state->SlotLock.Value);
+            ws.Dispose();
+            cts.Dispose();
+            wake.Dispose();
+            return WebSocketHandle.Invalid;
+        }
+
+        try { conns[slotIdx].Socket?.Dispose(); } catch { }
+        try { conns[slotIdx].Cts?.Dispose(); } catch { }
+        try { conns[slotIdx].SendWake?.Dispose(); } catch { }
         conns[slotIdx] = new ManagedConnection
         {
             Socket = ws,
@@ -330,8 +425,10 @@ public static unsafe class WebSocketSystem
         };
 
         Interlocked.Increment(ref state->ActiveConnectionCount.Value);
+        Interlocked.Increment(ref guard.ActiveWorkers);
         nint statePtr = (nint)state;
-        conns[slotIdx].IoTask = Task.Run(() => WsAsyncWorker.RunConnectionAsync(statePtr, slotIdx, handle, uri, ws, cts, wake, connectTimeoutMs));
+        conns[slotIdx].IoTask = Task.Run(() => WsAsyncWorker.RunConnectionAsync(statePtr, guard, slotIdx, handle, uri, ws, cts, wake, connectTimeoutMs));
+        ReleaseSpinLock(ref state->SlotLock.Value);
         return handle;
     }
 
@@ -395,42 +492,54 @@ public static unsafe class WebSocketSystem
         ushort closeStatus = 1000,
         ReadOnlySpan<char> reason = default)
     {
-        if (state == null || state->Active == 0 || !handle.IsValid) return;
+        if (state == null || Volatile.Read(ref state->Active) == 0 || !handle.IsValid) return;
         uint idx = handle.Index;
         if (idx >= (uint)state->MaxConnections) return;
         WsConnectionMeta* c = state->Connections + idx;
         if (Volatile.Read(ref c->Generation) != handle.Generation || Volatile.Read(ref c->InUse) == 0)
             return;
 
-        Volatile.Write(ref c->CloseRequested, 1);
-
+        FixedString256 fixedReason = reason.IsEmpty ? default : FixedString256.From(reason);
         var frame = new WsOutboundFrame
         {
             IsText = 2,
             CloseStatus = closeStatus,
-            CloseReason = reason.IsEmpty ? default : FixedString256.From(reason),
+            CloseReason = fixedReason,
         };
 
+        bool cancelConnect = false;
         AcquireSpinLock(ref c->OutLock);
-        int count = c->OutTail - c->OutHead;
-        if (count <= c->OutMask)
+        if (Volatile.Read(ref c->Generation) == handle.Generation && Volatile.Read(ref c->InUse) != 0)
         {
-            c->OutQueue[c->OutTail & c->OutMask] = frame;
-            c->OutTail++;
+            Volatile.Write(ref c->CloseRequested, 1);
+            c->RequestedCloseStatus = closeStatus;
+            c->RequestedCloseReason = fixedReason;
+
+            int count = c->OutTail - c->OutHead;
+            if (count <= c->OutMask)
+            {
+                c->OutQueue[c->OutTail & c->OutMask] = frame;
+                c->OutTail++;
+            }
+
+            int st = Volatile.Read(ref c->ConnState);
+            if (st == (int)WebSocketStateKind.Connecting)
+                cancelConnect = true;
+            else if (st == (int)WebSocketStateKind.Open)
+                Volatile.Write(ref c->ConnState, (int)WebSocketStateKind.Closing);
         }
         ReleaseSpinLock(ref c->OutLock);
 
-        int st = Volatile.Read(ref c->ConnState);
-        if (st == (int)WebSocketStateKind.Connecting)
+        ManagedWsGuard? guard = (uint)state->PoolSlot < MaxInstances ? s_pools[state->PoolSlot].Guard : null;
+        ManagedConnection[]? conns = guard?.Connections;
+        if (conns != null && idx < (uint)conns.Length)
         {
-            try { s_pools[state->PoolSlot].Connections?[idx].Cts?.Cancel(); } catch { }
+            if (cancelConnect)
+            {
+                try { conns[idx].Cts?.Cancel(); } catch { }
+            }
+            try { conns[idx].SendWake?.Set(); } catch { }
         }
-        else if (st == (int)WebSocketStateKind.Open)
-        {
-            Volatile.Write(ref c->ConnState, (int)WebSocketStateKind.Closing);
-        }
-
-        try { s_pools[state->PoolSlot].Connections?[idx].SendWake?.Set(); } catch { }
     }
 
     /// <summary>
@@ -519,11 +628,12 @@ public static unsafe class WebSocketSystem
         }
 
         // AutoResetEvent.Set() allocates 0 managed bytes and never inlines continuations onto the Logic Thread
-        try { s_pools[state->PoolSlot].Connections?[idx].SendWake?.Set(); } catch { }
+        ManagedWsGuard? guard = (uint)state->PoolSlot < MaxInstances ? s_pools[state->PoolSlot].Guard : null;
+        try { guard?.Connections?[idx].SendWake?.Set(); } catch { }
         return true;
     }
 
-    internal static bool IsActive(nint statePtr) => ((WebSocketClientState*)statePtr)->Active != 0;
+    internal static bool IsActive(nint statePtr) => Volatile.Read(ref ((WebSocketClientState*)statePtr)->Active) != 0;
     internal static int GetMaxMessageBytes(nint statePtr) => ((WebSocketClientState*)statePtr)->MaxMessageBytes;
 
     internal static void SetConnState(nint statePtr, int slotIdx, WebSocketStateKind kind)
@@ -538,6 +648,15 @@ public static unsafe class WebSocketSystem
         Volatile.Write(ref c->CloseRequested, 1);
     }
 
+    internal static void GetRequestedClose(nint statePtr, int slotIdx, out ushort status, out FixedString256 reason)
+    {
+        WsConnectionMeta* c = ((WebSocketClientState*)statePtr)->Connections + slotIdx;
+        AcquireSpinLock(ref c->OutLock);
+        status = c->RequestedCloseStatus;
+        reason = c->RequestedCloseReason;
+        ReleaseSpinLock(ref c->OutLock);
+    }
+
     internal static void PushEventFromWorker(
         nint statePtr,
         WebSocketHandle handle,
@@ -549,12 +668,6 @@ public static unsafe class WebSocketSystem
         in FixedString256 info = default)
     {
         WebSocketClientState* state = (WebSocketClientState*)statePtr;
-        if (kind == WebSocketEventKind.TextMessage || kind == WebSocketEventKind.BinaryMessage)
-        {
-            Interlocked.Increment(ref state->TotalMessagesReceived.Value);
-            Interlocked.Add(ref state->TotalBytesReceived.Value, dataLen);
-        }
-
         var ev = new WebSocketEvent
         {
             Handle = handle,
@@ -565,7 +678,18 @@ public static unsafe class WebSocketSystem
             DataAllocSize = dataCap,
             Info = info,
         };
-        PushEvent(state, in ev);
+        if (PushEvent(state, in ev) && (kind == WebSocketEventKind.TextMessage || kind == WebSocketEventKind.BinaryMessage))
+        {
+            Interlocked.Increment(ref state->TotalMessagesReceived.Value);
+            Interlocked.Add(ref state->TotalBytesReceived.Value, dataLen);
+        }
+
+        if (kind == WebSocketEventKind.Connected)
+            LogSystem.Info(state->Log, $"WebSocket {handle} connected");
+        else if (kind == WebSocketEventKind.Closed)
+            LogSystem.Info(state->Log, $"WebSocket {handle} closed (code={closeStatus}): {info}");
+        else if (kind == WebSocketEventKind.Error)
+            LogSystem.Warn(state->Log, $"WebSocket {handle} error: {info}");
     }
 
     internal static void FinishConnectionFromWorker(nint statePtr, int slotIdx)
@@ -576,12 +700,13 @@ public static unsafe class WebSocketSystem
         int curState = Volatile.Read(ref c->ConnState);
         if (curState != (int)WebSocketStateKind.Faulted)
             Volatile.Write(ref c->ConnState, (int)WebSocketStateKind.Closed);
-        Volatile.Write(ref c->InUse, 0);
         Interlocked.Decrement(ref state->ActiveConnectionCount.Value);
+        Volatile.Write(ref c->InUse, 0);
     }
 
     internal static void SendLoopBlocking(
         nint statePtr,
+        ManagedWsGuard guard,
         int slotIdx,
         ClientWebSocket ws,
         CancellationToken ct,
@@ -593,7 +718,7 @@ public static unsafe class WebSocketSystem
 
         try
         {
-            while (!ct.IsCancellationRequested && state->Active != 0)
+            while (!ct.IsCancellationRequested && !guard.Stopped && IsActive(statePtr))
             {
                 if (!TryDequeueOutbound(c, out WsOutboundFrame frame))
                 {
@@ -601,8 +726,10 @@ public static unsafe class WebSocketSystem
                     {
                         if (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseReceived)
                         {
-                            ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, string.Empty, ct)
-                              .GetAwaiter().GetResult();
+                            GetRequestedClose(statePtr, slotIdx, out ushort closeCode, out FixedString256 closeReason);
+                            WebSocketCloseStatus code = closeCode != 0 ? (WebSocketCloseStatus)closeCode : WebSocketCloseStatus.NormalClosure;
+                            string rsn = closeReason.Length > 0 ? closeReason.ToString() : string.Empty;
+                            ws.CloseOutputAsync(code, rsn, ct).GetAwaiter().GetResult();
                         }
                         break;
                     }
@@ -624,7 +751,16 @@ public static unsafe class WebSocketSystem
                     }
 
                     if (ws.State != WebSocketState.Open)
+                    {
+                        if (ws.State == WebSocketState.CloseReceived && Volatile.Read(ref c->CloseRequested) != 0)
+                        {
+                            GetRequestedClose(statePtr, slotIdx, out ushort closeCode, out FixedString256 closeReason);
+                            WebSocketCloseStatus code = closeCode != 0 ? (WebSocketCloseStatus)closeCode : WebSocketCloseStatus.NormalClosure;
+                            string rsn = closeReason.Length > 0 ? closeReason.ToString() : string.Empty;
+                            ws.CloseOutputAsync(code, rsn, ct).GetAwaiter().GetResult();
+                        }
                         break;
+                    }
 
                     var msgType = frame.IsText != 0 ? WebSocketMessageType.Text : WebSocketMessageType.Binary;
                     int remaining = frame.DataLength;
@@ -669,7 +805,7 @@ public static unsafe class WebSocketSystem
         }
     }
 
-    private static void PushEvent(WebSocketClientState* state, in WebSocketEvent ev)
+    private static bool PushEvent(WebSocketClientState* state, in WebSocketEvent ev)
     {
         bool pushed = false;
         AcquireSpinLock(ref state->EventLock.Value);
@@ -684,9 +820,11 @@ public static unsafe class WebSocketSystem
         if (!pushed)
         {
             Interlocked.Increment(ref state->DroppedEvents.Value);
+            LogSystem.Warn(state->Log, $"WebSocketSystem event queue full, dropped {ev.Kind} for {ev.Handle}");
             if (ev.DataPtr != null && ev.DataAllocSize > 0)
                 NativeMemoryTracker.AlignedFree(ev.DataPtr, ev.DataAllocSize);
         }
+        return pushed;
     }
 
     private static bool TryDequeueOutbound(WsConnectionMeta* c, out WsOutboundFrame frame)
@@ -734,6 +872,7 @@ file static class WsAsyncWorker
 {
     public static async Task RunConnectionAsync(
         nint statePtr,
+        WebSocketSystem.ManagedWsGuard guard,
         int slotIdx,
         WebSocketHandle handle,
         Uri uri,
@@ -742,32 +881,103 @@ file static class WsAsyncWorker
         AutoResetEvent sendWake,
         int connectTimeoutMs)
     {
+        Task? sendTask = null;
+        CancellationTokenSource? loopCts = null;
+        bool connectTimedOut = false;
+
         try
         {
             using (var connectTimeout = new CancellationTokenSource(connectTimeoutMs > 0 ? connectTimeoutMs : 10000))
             using (var linked = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, connectTimeout.Token))
             {
-                await ws.ConnectAsync(uri, linked.Token).ConfigureAwait(false);
+                try
+                {
+                    await ws.ConnectAsync(uri, linked.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (connectTimeout.IsCancellationRequested && (guard.Stopped || !cts.IsCancellationRequested))
+                {
+                    connectTimedOut = true;
+                    throw;
+                }
             }
+
+            if (guard.Stopped || !WebSocketSystem.IsActive(statePtr))
+                return;
 
             WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Open);
             WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Connected);
 
-            Task sendTask = Task.Factory.StartNew(
-                () => WebSocketSystem.SendLoopBlocking(statePtr, slotIdx, ws, cts.Token, sendWake),
+            loopCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+            CancellationToken loopCt = loopCts.Token;
+
+            sendTask = Task.Factory.StartNew(
+                () => WebSocketSystem.SendLoopBlocking(statePtr, guard, slotIdx, ws, loopCt, sendWake),
                 CancellationToken.None,
                 TaskCreationOptions.LongRunning,
                 TaskScheduler.Default);
 
-            await ReceiveLoopAsync(statePtr, slotIdx, handle, ws, cts.Token).ConfigureAwait(false);
+            (bool sawClose, ushort closeCode, string closeDesc) =
+                await ReceiveLoopAsync(statePtr, guard, slotIdx, handle, ws, loopCt).ConfigureAwait(false);
 
-            WebSocketSystem.MarkCloseRequested(statePtr, slotIdx);
+            if (!guard.Stopped)
+                WebSocketSystem.MarkCloseRequested(statePtr, slotIdx);
             try { sendWake.Set(); } catch { }
             await sendTask.ConfigureAwait(false);
+            sendTask = null;
+
+            if (!guard.Stopped && WebSocketSystem.IsActive(statePtr))
+            {
+                if (ws.State == WebSocketState.Aborted && !sawClose)
+                {
+                    WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Faulted);
+                    FixedString256 errInfo = FixedString256.From("WebSocket connection aborted.");
+                    WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Error, info: in errInfo);
+                }
+                else
+                {
+                    if (!sawClose)
+                    {
+                        if (ws.CloseStatus.HasValue)
+                        {
+                            closeCode = (ushort)ws.CloseStatus.Value;
+                            closeDesc = ws.CloseStatusDescription ?? string.Empty;
+                        }
+                        else
+                        {
+                            WebSocketSystem.GetRequestedClose(statePtr, slotIdx, out ushort reqCode, out FixedString256 reqReason);
+                            closeCode = reqCode != 0 ? reqCode : (ushort)1000;
+                            closeDesc = reqReason.Length > 0 ? reqReason.ToString() : "Connection closed.";
+                        }
+                    }
+                    WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Closed);
+                    FixedString256 info = FixedString256.From(closeDesc);
+                    WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Closed, closeStatus: closeCode, info: in info);
+                }
+            }
         }
         catch (OperationCanceledException)
         {
-            if (WebSocketSystem.IsActive(statePtr))
+            if (!guard.Stopped && WebSocketSystem.IsActive(statePtr))
+            {
+                if (connectTimedOut)
+                {
+                    WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Faulted);
+                    FixedString256 info = FixedString256.From("Connection timed out.");
+                    WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Error, info: in info);
+                }
+                else
+                {
+                    WebSocketSystem.GetRequestedClose(statePtr, slotIdx, out ushort reqCode, out FixedString256 reqReason);
+                    ushort closeCode = reqCode != 0 ? reqCode : (ushort)1000;
+                    FixedString256 info = reqReason.Length > 0 ? reqReason : FixedString256.From("Connection closed.");
+                    WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Closed);
+                    WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Closed, closeStatus: closeCode, info: in info);
+                }
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            if (!guard.Stopped && WebSocketSystem.IsActive(statePtr))
             {
                 WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Closed);
                 FixedString256 info = FixedString256.From("Connection closed.");
@@ -776,26 +986,48 @@ file static class WsAsyncWorker
         }
         catch (Exception ex)
         {
-            WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Faulted);
-            if (WebSocketSystem.IsActive(statePtr))
+            if (!guard.Stopped)
             {
-                FixedString256 info = FixedString256.From(ex.Message);
-                WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Error, info: in info);
+                WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Faulted);
+                if (WebSocketSystem.IsActive(statePtr))
+                {
+                    FixedString256 info = FixedString256.From(ex.Message);
+                    WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Error, info: in info);
+                }
             }
         }
         finally
         {
-            WebSocketSystem.FinishConnectionFromWorker(statePtr, slotIdx);
+            if (sendTask != null)
+            {
+                try { loopCts?.Cancel(); } catch { }
+                try { sendWake.Set(); } catch { }
+                try { await sendTask.ConfigureAwait(false); } catch { }
+            }
+            loopCts?.Dispose();
+
+            if (!guard.Stopped)
+                WebSocketSystem.FinishConnectionFromWorker(statePtr, slotIdx);
+
+            Interlocked.Decrement(ref guard.ActiveWorkers);
+            if (guard.Stopped)
+            {
+                try { ws.Dispose(); } catch { }
+                try { cts.Dispose(); } catch { }
+                try { sendWake.Dispose(); } catch { }
+            }
         }
     }
 
-    private static async Task ReceiveLoopAsync(
+    private static async Task<(bool SawClose, ushort CloseCode, string CloseDesc)> ReceiveLoopAsync(
         nint statePtr,
+        WebSocketSystem.ManagedWsGuard guard,
         int slotIdx,
         WebSocketHandle handle,
         ClientWebSocket ws,
         CancellationToken ct)
     {
+        _ = slotIdx;
         int maxMsgBytes = WebSocketSystem.GetMaxMessageBytes(statePtr);
         byte[] recvBuf = ArrayPool<byte>.Shared.Rent(16384);
 
@@ -805,7 +1037,7 @@ file static class WsAsyncWorker
 
         try
         {
-            while (!ct.IsCancellationRequested && WebSocketSystem.IsActive(statePtr) &&
+            while (!ct.IsCancellationRequested && !guard.Stopped && WebSocketSystem.IsActive(statePtr) &&
                    (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent))
             {
                 ValueWebSocketReceiveResult res = await ws.ReceiveAsync(recvBuf.AsMemory(), ct).ConfigureAwait(false);
@@ -817,35 +1049,23 @@ file static class WsAsyncWorker
 
                     ushort closeCode = (ushort)(ws.CloseStatus ?? WebSocketCloseStatus.NormalClosure);
                     string desc = ws.CloseStatusDescription ?? string.Empty;
-
-                    if (ws.State == WebSocketState.CloseReceived)
-                    {
-                        try
-                        {
-                            await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, string.Empty, ct).ConfigureAwait(false);
-                        }
-                        catch { }
-                    }
-
-                    WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Closed);
-                    FixedString256 info = FixedString256.From(desc);
-                    WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Closed, closeStatus: closeCode, info: in info);
-                    return;
+                    return (true, closeCode, desc);
                 }
 
                 if (res.Count > 0)
                 {
-                    if (msgLen + res.Count > maxMsgBytes)
+                    long needed = (long)msgLen + res.Count;
+                    if (needed > maxMsgBytes)
                     {
                         FreeNative(ref msgPtr, ref msgCap);
                         msgLen = 0;
                         throw new InvalidOperationException("WebSocket message exceeded MaxMessageBytes limit.");
                     }
 
-                    if ((nuint)(msgLen + res.Count) > msgCap)
+                    if ((nuint)needed > msgCap)
                     {
                         nuint newCap = msgCap == 0 ? (nuint)res.Count : msgCap * 2u;
-                        while (newCap < (nuint)(msgLen + res.Count)) newCap *= 2u;
+                        while (newCap < (nuint)needed) newCap *= 2u;
                         if (newCap > (nuint)maxMsgBytes) newCap = (nuint)maxMsgBytes;
                         msgPtr = GrowNative(msgPtr, msgLen, msgCap, newCap);
                         msgCap = newCap;
@@ -868,9 +1088,16 @@ file static class WsAsyncWorker
                     msgLen = 0;
                     msgCap = 0;
 
+                    if (guard.Stopped)
+                    {
+                        FreeNative(ref outPtr, ref outCap);
+                        return (false, 0, string.Empty);
+                    }
+
                     WebSocketSystem.PushEventFromWorker(statePtr, handle, evKind, dataPtr: outPtr, dataLen: outLen, dataCap: outCap);
                 }
             }
+            return (false, 0, string.Empty);
         }
         finally
         {

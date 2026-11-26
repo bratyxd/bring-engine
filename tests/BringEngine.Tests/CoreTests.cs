@@ -1,7 +1,9 @@
 using System;
+using System.Text;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
+using BringEngine.Core.Profiling;
 
 namespace BringEngine.Tests;
 
@@ -17,6 +19,11 @@ public static unsafe class CoreTests
         Assert.Run("FixedMath_DeterministicTrigSqrtVectors", &TestFixedMath);
         Assert.Run("RenderMath_Mat4InverseFrustumAndDetRng", &TestRenderMath);
         Assert.Run("ZeroGcAllocation_HotLoop", &TestZeroGcHotLoop);
+        Assert.Run("Handles_AllTypesPackingAndWraparound", &TestHandlesAllTypesAndWraparound);
+        Assert.Run("Memory_OverflowBoundsDoubleFreeAndTracker", &TestMemoryEdgeCases);
+        Assert.Run("Containers_TombstonesOverflowBoundsAndUtf8Strings", &TestContainersAndStringsEdgeCases);
+        Assert.Run("Math_Fix64LargeVectorsDetMathAcosPowExpBounds3", &TestMathComprehensiveEdgeCases);
+        Assert.Run("FrameProfiler_MaxScopesDisabledZeroTicksAndReset", &TestFrameProfilerEdgeCases);
     }
 
     private static void TestLinearArena()
@@ -211,5 +218,355 @@ public static unsafe class CoreTests
 
         alloc.Dispose();
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leak");
+    }
+
+    private static void TestHandlesAllTypesAndWraparound()
+    {
+        Assert.True(!default(EntityId).IsValid, "default EntityId invalid");
+        Assert.True(!new EntityId(1).IsValid, "Generation == 0 handle must be invalid");
+
+        uint p0 = HandlePacking.Pack(0, 0);
+        Assert.True(p0 != 0 && HandlePacking.UnpackGeneration(p0) == 1, "Pack(0,0) promotes gen 0 -> 1");
+        Assert.Equal(4095u, HandlePacking.UnpackGeneration(HandlePacking.Pack(5, 4095)), "Pack gen 4095");
+        Assert.Equal(1u, HandlePacking.UnpackGeneration(HandlePacking.Pack(5, 4096)), "Pack gen 4096 wraps -> 1");
+        Assert.Equal(1u, HandlePacking.NextGeneration(4095), "NextGeneration(4095) wraps -> 1");
+        Assert.Equal(2u, HandlePacking.NextGeneration(1), "NextGeneration(1) == 2");
+
+        bool threwIdx = false;
+        try { _ = HandlePacking.Pack(HandlePacking.IndexMask + 1u, 1); }
+        catch (ArgumentOutOfRangeException) { threwIdx = true; }
+        Assert.True(threwIdx, "Pack rejects index > IndexMask");
+
+        // Verify all 25 handle structs (including AnimPlayerHandle & SpriteAnimPlayerHandle)
+        Assert.True(EntityId.Create(3, 2).IsValid && EntityId.Create(3, 2).Index == 3 && EntityId.Create(3, 2).Generation == 2, "EntityId");
+        Assert.True(SceneId.Create(3, 2).IsValid && !SceneId.Invalid.IsValid, "SceneId");
+        Assert.True(BundleId.Create(3, 2).IsValid && !BundleId.Invalid.IsValid, "BundleId");
+        Assert.True(MeshHandle.Create(3, 2).IsValid && !MeshHandle.Invalid.IsValid, "MeshHandle");
+        Assert.True(TextureHandle.Create(3, 2).IsValid && !TextureHandle.Invalid.IsValid, "TextureHandle");
+        Assert.True(MaterialHandle.Create(3, 2).IsValid && !MaterialHandle.Invalid.IsValid, "MaterialHandle");
+        Assert.True(ShaderHandle.Create(3, 2).IsValid && !ShaderHandle.Invalid.IsValid, "ShaderHandle");
+        Assert.True(FontHandle.Create(3, 2).IsValid && !FontHandle.Invalid.IsValid, "FontHandle");
+        Assert.True(GltfHandle.Create(3, 2).IsValid && !GltfHandle.Invalid.IsValid, "GltfHandle");
+        Assert.True(AnimClipHandle.Create(3, 2).IsValid && !AnimClipHandle.Invalid.IsValid, "AnimClipHandle");
+        Assert.True(SkeletonHandle.Create(3, 2).IsValid && !SkeletonHandle.Invalid.IsValid, "SkeletonHandle");
+        Assert.True(AnimPlayerHandle.Create(7, 9).IsValid && AnimPlayerHandle.Create(7, 9).Index == 7 && AnimPlayerHandle.Create(7, 9).Generation == 9 && !AnimPlayerHandle.Invalid.IsValid, "AnimPlayerHandle");
+        Assert.True(SpriteAnimPlayerHandle.Create(11, 4).IsValid && SpriteAnimPlayerHandle.Create(11, 4).Index == 11 && SpriteAnimPlayerHandle.Create(11, 4).Generation == 4 && !SpriteAnimPlayerHandle.Invalid.IsValid, "SpriteAnimPlayerHandle");
+        Assert.True(TweenHandle.Create(3, 2).IsValid && !TweenHandle.Invalid.IsValid, "TweenHandle");
+        Assert.True(EmitterHandle.Create(3, 2).IsValid && !EmitterHandle.Invalid.IsValid, "EmitterHandle");
+        Assert.True(CameraHandle.Create(3, 2).IsValid && !CameraHandle.Invalid.IsValid, "CameraHandle");
+        Assert.True(SpriteHandle.Create(3, 2).IsValid && !SpriteHandle.Invalid.IsValid, "SpriteHandle");
+        Assert.True(TextHandle.Create(3, 2).IsValid && !TextHandle.Invalid.IsValid, "TextHandle");
+        Assert.True(JobHandle.Create(3, 2).IsValid && !JobHandle.Invalid.IsValid, "JobHandle");
+        Assert.True(HttpRequestHandle.Create(3, 2).IsValid && !HttpRequestHandle.Invalid.IsValid, "HttpRequestHandle");
+        Assert.True(WebSocketHandle.Create(3, 2).IsValid && !WebSocketHandle.Invalid.IsValid, "WebSocketHandle");
+        Assert.True(LogFileHandle.Create(3, 2).IsValid && !LogFileHandle.Invalid.IsValid, "LogFileHandle");
+        Assert.True(SaveOpHandle.Create(3, 2).IsValid && !SaveOpHandle.Invalid.IsValid, "SaveOpHandle");
+        Assert.True(AudioClipHandle.Create(3, 2).IsValid && !AudioClipHandle.Invalid.IsValid, "AudioClipHandle");
+        Assert.True(AudioVoiceHandle.Create(3, 2).IsValid && !AudioVoiceHandle.Invalid.IsValid, "AudioVoiceHandle");
+    }
+
+    private static void TestMemoryEdgeCases()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+
+        // NativeMemoryTracker zero-size & non-power-of-2 alignment
+        void* zPtr = NativeMemoryTracker.AlignedAlloc(0, 64);
+        Assert.True(zPtr != null, "AlignedAlloc(0, 64) returns valid pointer");
+        NativeMemoryTracker.AlignedFree(zPtr, 0);
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "AlignedAlloc(0)+Free(0) leaves LiveBytes == 0");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "AlignedAlloc(0)+Free(0) leaves LiveBlocks == 0");
+
+        bool threwAlign = false;
+        try { NativeMemoryTracker.AlignedAlloc(16, 3); }
+        catch (ArgumentOutOfRangeException) { threwAlign = true; }
+        Assert.True(threwAlign, "AlignedAlloc rejects non-power-of-2 alignment");
+
+        // LinearArena overflow wraparound, Create(0), forward rollback, alignment check
+        var zeroArena = LinearArena.Create(0);
+        Assert.True(zeroArena.IsValid && zeroArena.Capacity >= 64, "Create(0) creates valid 64B arena");
+        zeroArena.Dispose();
+
+        var arena = LinearArena.Create(4096);
+        _ = arena.Alloc<int>(8, 16);
+        nuint savedOffset = arena.Offset;
+        bool threwWrap = false;
+        try { arena.AllocBytes(nuint.MaxValue - 8, 16); }
+        catch (OutOfMemoryException) { threwWrap = true; }
+        Assert.True(threwWrap && arena.Offset == savedOffset, "LinearArena overflow wraparound throws OOM without corrupting Offset");
+
+        bool threwBadAlign = false;
+        try { arena.AllocBytes(16, 3); }
+        catch (ArgumentException) { threwBadAlign = true; }
+        Assert.True(threwBadAlign, "LinearArena rejects non-power-of-2 alignment");
+
+        ArenaMarker mark = arena.SaveMarker();
+        _ = arena.Alloc<int>(4);
+        ArenaMarker forwardMark = arena.SaveMarker();
+        arena.Rollback(mark);
+        bool threwForward = false;
+        try { arena.Rollback(forwardMark); }
+        catch (InvalidOperationException) { threwForward = true; }
+        Assert.True(threwForward, "LinearArena rejects forward Rollback");
+        arena.Dispose();
+
+        // PoolAllocator standalone, exhaustion, double-free, CreateStandalone(0)
+        bool threwPoolZero = false;
+        try { _ = PoolAllocator<int>.CreateStandalone(0); }
+        catch (ArgumentOutOfRangeException) { threwPoolZero = true; }
+        Assert.True(threwPoolZero, "PoolAllocator.CreateStandalone(0) throws");
+
+        var pool = PoolAllocator<int>.CreateStandalone(4);
+        Assert.True(pool.TryRentIndex(out int p0), "Rent 0");
+        Assert.True(pool.TryRentIndex(out int p1), "Rent 1");
+        Assert.True(pool.TryRentIndex(out int p2), "Rent 2");
+        Assert.True(pool.TryRentIndex(out int p3), "Rent 3");
+        Assert.True(!pool.TryRentIndex(out _), "Exhausted TryRentIndex returns false");
+
+        pool.ReturnIndex(p0);
+        bool threwDoubleFree = false;
+        try { pool.ReturnIndex(p0); }
+        catch (InvalidOperationException) { threwDoubleFree = true; }
+        Assert.True(threwDoubleFree, "PoolAllocator rejects double-free");
+
+        pool.Reset();
+        Assert.Equal(4, pool.FreeCount, "Pool Reset restores FreeCount");
+        Assert.Equal(0, pool.ActiveCount, "Pool Reset restores ActiveCount");
+        pool.Dispose();
+
+        // FreeListAllocator overflow wraparound, double-free, foreign pointer, null free
+        var fl = FreeListAllocator.Create(4096);
+        fl.Free(null); // no-op
+        void* blk = fl.Alloc(64);
+        fl.Free(blk);
+
+        bool threwFlDouble = false;
+        try { fl.Free(blk); }
+        catch (InvalidOperationException) { threwFlDouble = true; }
+        Assert.True(threwFlDouble, "FreeList rejects double-free");
+
+        bool threwFlForeign = false;
+        try { fl.Free(fl.BasePtr); }
+        catch (ArgumentException) { threwFlForeign = true; }
+        Assert.True(threwFlForeign, "FreeList rejects BasePtr/invalid pointer");
+
+        bool threwFlWrap = false;
+        try { fl.Alloc(nuint.MaxValue - 8); }
+        catch (OutOfMemoryException) { threwFlWrap = true; }
+        Assert.True(threwFlWrap, "FreeList rejects nuint wraparound");
+
+        fl.Dispose();
+
+        // EngineAllocators SwapFrameArenas & GetTelemetry
+        var eng = EngineAllocators.Create(16384, 8192, 8192, 8192);
+        _ = eng.Frame.Alloc<int>(16);
+        eng.SwapFrameArenas();
+        Assert.Equal((nuint)0, eng.Frame.Offset, "SwapFrameArenas gives fresh Frame arena");
+        var tel = eng.GetTelemetry();
+        Assert.True(tel.PersistentCapacity >= 16384 && tel.DynamicCapacity >= 8192, "Telemetry populated");
+        eng.Dispose();
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after memory edge cases");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after memory edge cases");
+    }
+
+    private static void TestContainersAndStringsEdgeCases()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var arena = LinearArena.Create(512 * 1024);
+
+        // NativeList: growth, RemoveAtSwapBack bounds, EnsureCapacity overflow
+        var list = NativeList<int>.CreateGrowable(4);
+        for (int i = 0; i < 20; i++) list.Add(i * 10);
+        Assert.Equal(20, list.Count, "NativeList grew to 20");
+        list.RemoveAtSwapBack(3);
+        Assert.Equal(190, list[3], "RemoveAtSwapBack swapped last element");
+
+        bool threwListOob = false;
+        try { list.RemoveAtSwapBack(99); }
+        catch (ArgumentOutOfRangeException) { threwListOob = true; }
+        Assert.True(threwListOob, "NativeList RemoveAtSwapBack OOB throws");
+
+        list.Clear();
+        bool threwListEmpty = false;
+        try { list.RemoveAtSwapBack(0); }
+        catch (ArgumentOutOfRangeException) { threwListEmpty = true; }
+        Assert.True(threwListEmpty, "NativeList RemoveAtSwapBack on empty throws");
+
+        bool threwEnsureOom = false;
+        try { list.EnsureCapacity(int.MaxValue); }
+        catch (OutOfMemoryException) { threwEnsureOom = true; }
+        Assert.True(threwEnsureOom, "NativeList EnsureCapacity(int.MaxValue) throws OOM instead of hanging");
+        list.Dispose();
+
+        // NativeSparseSet bounds
+        bool threwSparseZero = false;
+        try { _ = NativeSparseSet<int>.Create(ref arena, 0, 8); }
+        catch (ArgumentOutOfRangeException) { threwSparseZero = true; }
+        Assert.True(threwSparseZero, "NativeSparseSet.Create(0, 8) throws");
+
+        var sset = NativeSparseSet<int>.Create(ref arena, 16, 8);
+        bool threwAddOob = false;
+        try { sset.AddOrReplace(16, 123); }
+        catch (ArgumentOutOfRangeException) { threwAddOob = true; }
+        Assert.True(threwAddOob, "NativeSparseSet.AddOrReplace OOB throws");
+
+        bool threwGetMissing = false;
+        try { _ = sset.GetRef(5); }
+        catch (InvalidOperationException) { threwGetMissing = true; }
+        Assert.True(threwGetMissing, "NativeSparseSet.GetRef missing component throws");
+
+        // NativeHashMap tombstone saturation + key 0 + update + TryGetPtr + Clear
+        var map = NativeHashMap<int>.Create(ref arena, 8); // Capacity = 16
+        for (int i = 1; i <= map.Capacity; i++)
+            map.Set((ulong)i, i * 100);
+        for (int i = 1; i <= map.Capacity; i++)
+            Assert.True(map.Remove((ulong)i), $"Removed key {i}");
+        Assert.Equal(0, map.Count, "HashMap empty after removing all");
+
+        for (int i = 100; i < 100 + map.Capacity; i++)
+            map.Set((ulong)i, i);
+        Assert.Equal(map.Capacity, map.Count, "HashMap re-filled to capacity after tombstone saturation");
+        for (int i = 100; i < 100 + map.Capacity; i++)
+            Assert.True(map.TryGet((ulong)i, out int val) && val == i, $"Recovered key {i} after saturation");
+
+        map.Clear();
+        map.Set(0UL, 77);
+        map.Set(0UL, 88);
+        int* ptr0 = map.TryGetPtr(0UL);
+        Assert.True(ptr0 != null && *ptr0 == 88, "HashMap key 0 update and TryGetPtr");
+
+        // StringId UTF-8 parity & zero-GC check + FixedString non-ASCII truncation
+        string uni = "hero_café_世界_🚀";
+        byte[] uniUtf8 = Encoding.UTF8.GetBytes(uni);
+        Assert.Equal(StringId.HashUtf8(uniUtf8).Value, StringId.Hash(uni.AsSpan()).Value, "StringId.Hash == HashUtf8 on Unicode");
+
+        FixedString64 fs64 = FixedString64.From(uni.AsSpan());
+        Assert.Equal(uni, fs64.ToString(), "FixedString64 Unicode roundtrip");
+        Assert.Equal(fs64.ToStringId().Value, StringId.Hash(uni.AsSpan()).Value, "FixedString64.ToStringId == StringId.Hash");
+
+        // Huge string O(1) truncation + rune-boundary preservation
+        string huge = new string('世', 5000);
+        FixedString256 fs256 = FixedString256.From(huge.AsSpan());
+        Assert.True(fs256.Length <= FixedString256.MaxBytes && (fs256.Length % 3) == 0, "FixedString256 truncated cleanly on UTF-8 rune boundary");
+
+        long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+        ulong hashAcc = 0;
+        for (int i = 0; i < 100; i++)
+            hashAcc ^= StringId.Hash(uni.AsSpan()).Value;
+        long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+        Assert.True(hashAcc != 0 || hashAcc == 0, "Keep hashAcc live");
+        Assert.Equal(0L, gcAfter - gcBefore, "StringId.Hash Unicode allocates 0 GC bytes");
+
+        arena.Dispose();
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after containers/strings test");
+    }
+
+    private static void TestMathComprehensiveEdgeCases()
+    {
+        // Fix32 boundary cases
+        Assert.Equal(32768, Fix32.MaxValue.ToIntRound(), "Fix32.MaxValue.ToIntRound() == 32768");
+        Assert.Near(Fix32.Cos(Fix32.MaxValue - Fix32.TwoPi).ToFloat(), Fix32.Cos(Fix32.MaxValue).ToFloat(), 0.001f, "Fix32.Cos(MaxValue) no overflow");
+        Assert.Equal(Fix32.MaxValue.Raw, Fix32.Abs(Fix32.MinValue).Raw, "Fix32.Abs(MinValue) saturates");
+        Assert.Equal(0, Fix32.FromFloat(float.NaN).Raw, "Fix32.FromFloat(NaN) == 0");
+        Assert.Equal(Fix32.MaxValue.Raw, Fix32.FromFloat(1e9f).Raw, "Fix32.FromFloat(+large) == MaxValue");
+        Assert.Equal(Fix32.MinValue.Raw, Fix32.FromFloat(-1e9f).Raw, "Fix32.FromFloat(-large) == MinValue");
+
+        // FixVec3 / FixVec2 / FixQuat 64-bit length & normalization
+        FixVec3 big = FixVec3.FromFloat(300f, 400f, 0f);
+        Assert.Near(500f, big.Length().ToFloat(), 0.01f, "FixVec3(300,400,0).Length() == 500");
+        Assert.Near(500f, FixVec3.Distance(FixVec3.Zero, big).ToFloat(), 0.01f, "FixVec3.Distance == 500");
+        FixVec3 bigN = big.Normalized();
+        Assert.Near(0.6f, bigN.X.ToFloat(), 0.001f, "FixVec3 big normalized X");
+        Assert.Near(0.8f, bigN.Y.ToFloat(), 0.001f, "FixVec3 big normalized Y");
+
+        FixVec3 tiny = new FixVec3(new Fix32(10), Fix32.Zero, Fix32.Zero);
+        Assert.Equal(FixVec3.UnitX.X.Raw, tiny.Normalized().X.Raw, "FixVec3 tiny normalized == UnitX");
+        Assert.True(FixQuat.FromAxisAngle(FixVec3.Zero, Fix32.Pi).Equals(FixQuat.Identity), "FixQuat zero axis -> Identity");
+
+        FixVec2 big2 = FixVec2.FromFloat(300f, 400f);
+        Assert.Near(500f, big2.Length().ToFloat(), 0.01f, "FixVec2(300,400).Length() == 500");
+
+        // Fix64 ops
+        Fix64 f64 = Fix64.FromRatio(5, 2);
+        Assert.Near(2.5f, (float)f64.ToDouble(), 1e-5f, "Fix64.FromRatio");
+        Assert.True(Fix64.Abs(-f64) == f64 && Fix64.Clamp(f64, Fix64.Zero, Fix64.One) == Fix64.One, "Fix64 Abs/Clamp");
+
+        // DetMath deterministic Acos, Exp, Exp2, Log, Pow, Clamp01, SmoothStep
+        Assert.Near(0f, DetMath.Acos(1f), 1e-6f, "Acos(1)");
+        Assert.Near(DetMath.Pi, DetMath.Acos(-1f), 1e-6f, "Acos(-1)");
+        Assert.Near(DetMath.HalfPi, DetMath.Acos(0f), 1e-6f, "Acos(0)");
+        Assert.Near(DetMath.Pi / 3f, DetMath.Acos(0.5f), 1e-6f, "Acos(0.5)");
+        Assert.Near(2.7182818f, DetMath.Exp(1f), 1e-5f, "Exp(1)");
+        Assert.Near(8f, DetMath.Exp2(3f), 1e-5f, "Exp2(3)");
+        Assert.Near(1f, DetMath.Log(DetMath.Exp(1f)), 1e-5f, "Log(e)");
+        Assert.Near(8f, DetMath.Pow(2f, 3f), 1e-5f, "Pow(2,3)");
+        Assert.Near(-8f, DetMath.Pow(-2f, 3f), 1e-5f, "Pow(-2,3)");
+        Assert.True(float.IsNaN(DetMath.Pow(-2f, 0.5f)), "Pow(-2, 0.5) == NaN");
+        Assert.Equal(0f, DetMath.Clamp01(float.NaN), "Clamp01(NaN) == 0");
+        Assert.True(!float.IsNaN(DetMath.SmoothStep(1f, 1f, 1f)), "SmoothStep equal edges not NaN");
+
+        // Quat.Slerp antipodal & normal, LookRotation UnitX fallback
+        Quat qA = Quat.FromAxisAngle(Vec3.UnitY, 0.2f);
+        Quat qB = new Quat(-qA.X, -qA.Y, -qA.Z, -qA.W);
+        Quat qS = Quat.Slerp(qA, qB, 0.5f);
+        Assert.Near(1f, qS.X * qS.X + qS.Y * qS.Y + qS.Z * qS.Z + qS.W * qS.W, 1e-4f, "Quat.Slerp antipodal unit");
+
+        Quat qX = Quat.LookRotation(Vec3.UnitX, Vec3.UnitX);
+        Assert.Near(1f, qX.X * qX.X + qX.Y * qX.Y + qX.Z * qX.Z + qX.W * qX.W, 1e-4f, "LookRotation parallel UnitX valid");
+
+        // Bounds3.Empty & Frustum & NaN Mat4.TryInvert
+        Mat4 proj = Mat4.CreatePerspective(60f * DetMath.Deg2Rad, 16f / 9f, 0.1f, 100f);
+        Mat4 view = Mat4.CreateLookAt(new Vec3(0, 0, 10), Vec3.Zero, Vec3.Up);
+        Mat4 vp = proj * view;
+        Frustum frustum = Frustum.FromViewProjection(in vp);
+        Assert.True(!frustum.IntersectsBounds(Bounds3.Empty), "Frustum must NOT intersect Bounds3.Empty");
+        Assert.True(Bounds3.Empty.Transform(Mat4.Identity).IsEmpty, "Bounds3.Empty.Transform remains Empty without NaN");
+
+        Mat4 nanMat = Mat4.Identity;
+        nanMat.C0.X = float.NaN;
+        Assert.True(!Mat4.TryInvert(in nanMat, out _), "NaN Mat4.TryInvert returns false");
+
+        Mat4 singular = default;
+        Assert.True(!Mat4.TryInvert(in singular, out _), "Zero Mat4.TryInvert returns false");
+
+        // DetRng inverted range
+        var rng = DetRng.Create(123);
+        Assert.Equal(10, rng.NextInt(10, 5), "NextInt(10, 5) returns minInclusive");
+    }
+
+    private static void TestFrameProfilerEdgeCases()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var arena = LinearArena.Create(64 * 1024);
+        var prof = FrameProfiler.Create(ref arena, enabled: true);
+
+        ProfilerSystem.BeginFrame(ref prof);
+        for (int i = 0; i < FrameProfiler.MaxScopesPerFrame + 10; i++)
+        {
+            int idx = ProfilerSystem.BeginScope(ref prof, "S");
+            if (i < FrameProfiler.MaxScopesPerFrame)
+            {
+                Assert.True(idx == i, $"Scope {i} accepted");
+                ProfilerSystem.EndScope(ref prof, idx);
+            }
+            else
+            {
+                Assert.Equal(-1, idx, "Overflow scope returns -1 cleanly");
+            }
+        }
+        Assert.Equal(FrameProfiler.MaxScopesPerFrame, prof.ActiveScopeCount, "ActiveScopeCount capped at MaxScopesPerFrame");
+        Assert.Equal(0, prof.CurrentDepth, "CurrentDepth balanced");
+        ProfilerSystem.EndCpuWork(ref prof);
+        ProfilerSystem.EndFrame(ref prof);
+        Assert.True(double.IsFinite(prof.InstantFps), "InstantFps finite on immediate EndFrame");
+
+        // Disabled profiler no-ops
+        prof.Enabled = 0;
+        Assert.Equal(-1, ProfilerSystem.BeginScope(ref prof, "Disabled"), "Disabled BeginScope returns -1");
+        ProfilerSystem.ResetHistory(ref prof);
+        Assert.Equal(0, prof.HistoryCount, "ResetHistory resets HistoryCount");
+
+        arena.Dispose();
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after FrameProfiler test");
     }
 }

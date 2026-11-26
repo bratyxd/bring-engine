@@ -26,15 +26,17 @@ Need to generate real `.glb` files for tests or procedural assets? Use `GlbBuild
 ## Instanced 3D PBR Batching (Phase 6)
 All `MeshRendererData` components are automatically:
 1. Frustum-culled against the active camera's 6 planes using transformed `LocalBounds`.
-2. Sorted in `FrameArena` by `(AlphaMode, Shader, Material, Mesh, SkinnedFlag)`.
+2. Sorted in `Scratch` arena by `(AlphaMode, DoubleSided, Shader, Texture, Mesh, OriginalIndex)`.
 3. Merged into **instanced draw calls** sharing one storage buffer upload per frame (single `SDL_GPUCopyPass` before `SDL_GPURenderPass`).
-4. Skinned meshes automatically sample `AnimationTable.FrameJointPalette` uploaded to the GPU joint storage buffer!
+4. Skinned meshes automatically sample `AnimationTable.FrameJointPalette` uploaded to the GPU joint storage buffer (via `MeshRendererData.AnimPlayer` `AnimPlayerHandle`)!
+5. `MaterialAssetData.DoubleSided` (`!= 0`) automatically selects a `CullMode.None` pipeline variant in both the main 3D pass and the directional shadow pass.
 
-## Directional Sun Shadow Mapping (`SceneLighting` + `shadow_depth.hlsl`)
+## Directional Sun Shadow Mapping (`SceneLighting` + `shadow_depth.hlsl` / `shadow_depth_mask.hlsl`)
 Built-in 3D PBR rendering (`pbr_mesh.hlsl`) automatically renders a **texel-snapped directional sun shadow map** (`D32Float`, **3×3 PCF soft shadows**) before the main scene pass whenever `SceneLighting.ShadowsEnabled != 0` (enabled by default in `SceneLighting.Default`).
 
-- Both **static** and **skinned animated glTF** opaque/masked meshes automatically cast shadows in a single depth pass (`shadow_depth.hlsl`), batched strictly by `MeshGpuSlot` (ignoring material/texture so many meshes sharing geometry collapse into 1 shadow draw call, tracked in `RenderStats.ShadowDrawCalls`).
-- Transparent meshes (`MaterialAlphaMode.Blend`) do not cast opaque depth shadows.
+- Both **static** and **skinned animated glTF** opaque (`shadow_depth.hlsl`) and alpha-masked cutout (`MaterialAlphaMode.Mask`, `shadow_depth_mask.hlsl`) meshes automatically cast shadows whenever `MeshRendererData.CastShadow != 0`, tracked in `RenderStats.ShadowDrawCalls`.
+- Opaque casters batch strictly by `(DoubleSided, MeshGpuSlot)` (ignoring material/texture so many meshes sharing geometry collapse into 1 shadow draw call); `Mask` casters batch by `(DoubleSided, TextureGpuSlot, MeshGpuSlot)` and test `AlbedoTex` alpha against `AlphaCutoff`.
+- Set `mr.CastShadow = 0` to opt a mesh out of shadow casting; transparent meshes (`MaterialAlphaMode.Blend`) never cast opaque depth shadows.
 - **Large Worlds**: Update `lighting.ShadowCenter = playerPos` each frame — `BatchRenderer.ComputeDirectionalLightViewProj` automatically snaps the orthographic frustum to exact shadow texels so shadows stay rock-solid without swimming!
 
 ```csharp

@@ -12,6 +12,7 @@ using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
 using BringEngine.Core.Threading;
+using BringEngine.Networking;
 using BringEngine.Simulation.World;
 using StbImageSharp;
 
@@ -27,10 +28,34 @@ public enum PackEntryKind : byte
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
+internal struct BringPackHeaderV1
+{
+    public uint Magic;
+    public ushort Version;
+    public PackCompressionMode Compression;
+    public byte Reserved;
+    public int EntryCount;
+    public int TableOffset;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+internal struct PackEntryHeaderV1
+{
+    public ulong NameHash;
+    public PackEntryKind Kind;
+    public PackCompressionMode Compression;
+    public ushort Flags;
+    public int DataOffset;
+    public int CompressedBytes;
+    public int UncompressedBytes;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct BringPackHeader
 {
     public const uint MagicValue = 0x4B415042u; // "BPAK"
-    public const ushort CurrentVersion = 1;
+    public const ushort LegacyVersion1 = 1;
+    public const ushort CurrentVersion = 2;
 
     public uint Magic;
     public ushort Version;
@@ -38,6 +63,7 @@ public struct BringPackHeader
     public byte Reserved;
     public int EntryCount;
     public int TableOffset;
+    public uint TableCrc32;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
@@ -50,6 +76,7 @@ public struct PackEntryHeader
     public int DataOffset;
     public int CompressedBytes;
     public int UncompressedBytes;
+    public uint PayloadCrc32;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
@@ -111,6 +138,7 @@ public static unsafe class AssetPackBuilder
         public string Name;
         public Vec4 SliceBorders;
         public Vec2 Pivot;
+        public bool HasPivot;
         public bool OptOutAtlas;
         public bool Nearest;
         public bool ClampEdge;
@@ -162,6 +190,11 @@ public static unsafe class AssetPackBuilder
         string packJsonPath = Path.Combine(fullRoot, "pack.json");
         if (File.Exists(packJsonPath))
             ParsePackMetadata(packJsonPath, ref compression, ref atlasCompression, ref gltfTextureCompression, ref maxAtlasSize, ref atlasPadding, out metaOverrides, out fontOverrides);
+
+        if (maxAtlasSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxAtlasSize), maxAtlasSize, "maxAtlasSize must be > 0.");
+        if (atlasPadding < 0)
+            throw new ArgumentOutOfRangeException(nameof(atlasPadding), atlasPadding, "atlasPadding must be >= 0.");
 
         string[] allFiles = Directory.GetFiles(fullRoot, "*", SearchOption.AllDirectories);
         Array.Sort(allFiles, StringComparer.OrdinalIgnoreCase);
@@ -235,12 +268,13 @@ public static unsafe class AssetPackBuilder
                         Width = dec.Width,
                         Height = dec.Height,
                         SliceBorders = hasMeta ? sm.SliceBorders : Vec4.Zero,
-                        Pivot = (hasMeta && (sm.Pivot.X != 0f || sm.Pivot.Y != 0f)) ? sm.Pivot : new Vec2(0.5f, 0.5f),
+                        Pivot = hasMeta ? sm.Pivot : new Vec2(0.5f, 0.5f),
+                        HasPivot = (byte)(hasMeta ? 1 : 0),
                     };
                     atlasSourceCount++;
                 }
             }
-            else if (ext == ".glb" || ext == ".gltf")
+            else if (ext == ".glb" || ext == ".gltf" || ext == ".bglb")
             {
                 summary.RawInputBytes += new FileInfo(file).Length;
                 byte[] glb = PackCompressionSystem.BuildSelfContainedGlbFromFile(file, gltfTextureCompression, jobs);
@@ -358,13 +392,14 @@ public static unsafe class AssetPackBuilder
 
     /// <summary>
     /// Guardrail check ensuring NO loose PNG/JPG/BMP/TGA textures leaked into a game's final dist/ output directory.
+    /// Returns false if outputDir does not exist or contains loose image files.
     /// </summary>
     public static bool VerifyNoLooseTextures(string outputDir, out string[] offendingFiles)
     {
-        if (!Directory.Exists(outputDir))
+        if (string.IsNullOrWhiteSpace(outputDir) || !Directory.Exists(outputDir))
         {
             offendingFiles = Array.Empty<string>();
-            return true;
+            return false;
         }
 
         string[] files = Directory.GetFiles(outputDir, "*", SearchOption.AllDirectories);
@@ -408,7 +443,7 @@ public static unsafe class AssetPackBuilder
 
         int hdrSize = sizeof(PackedAtlasPayloadHeader);
         int recSize = sizeof(PackedSpriteRegionRecord);
-        int totalBytes = hdrSize + regionCount * recSize + page.CompressedData.Length;
+        int totalBytes = checked(hdrSize + regionCount * recSize + page.CompressedData.Length);
         byte[] buf = new byte[totalBytes];
 
         fixed (byte* ptr = buf)
@@ -450,7 +485,7 @@ public static unsafe class AssetPackBuilder
     private static byte[] BuildFontPayload(byte[] ttf, float pixelSize, int atlasSize, int sdfPadding)
     {
         int hdrSize = sizeof(PackedFontPayloadHeader);
-        byte[] buf = new byte[hdrSize + ttf.Length];
+        byte[] buf = new byte[checked(hdrSize + ttf.Length)];
         fixed (byte* ptr = buf)
         {
             *(PackedFontPayloadHeader*)ptr = new PackedFontPayloadHeader
@@ -478,7 +513,10 @@ public static unsafe class AssetPackBuilder
         for (int i = 0; i < entries.Length; i++)
         {
             ref readonly PreparedEntry e = ref entries[i];
-            int offset = (int)fs.Position;
+            long pos = fs.Position;
+            if (pos > int.MaxValue || pos + e.CompressedPayload.Length > int.MaxValue)
+                throw new InvalidOperationException(".bpack archive exceeds 2GB format limit.");
+            int offset = (int)pos;
             fs.Write(e.CompressedPayload, 0, e.CompressedPayload.Length);
             table[i] = new PackEntryHeader
             {
@@ -488,16 +526,23 @@ public static unsafe class AssetPackBuilder
                 DataOffset = offset,
                 CompressedBytes = e.CompressedPayload.Length,
                 UncompressedBytes = e.UncompressedBytes,
+                PayloadCrc32 = NetHash.Crc32(e.CompressedPayload),
             };
         }
 
-        int tableOffset = (int)fs.Position;
-        byte[] tableBytes = new byte[entries.Length * entryHdrSize];
+        long tablePos = fs.Position;
+        long tableByteLen = (long)entries.Length * entryHdrSize;
+        if (tablePos > int.MaxValue || tablePos + tableByteLen > int.MaxValue)
+            throw new InvalidOperationException(".bpack archive exceeds 2GB format limit.");
+
+        int tableOffset = (int)tablePos;
+        byte[] tableBytes = new byte[(int)tableByteLen];
         fixed (byte* tPtr = tableBytes)
         {
             PackEntryHeader* dst = (PackEntryHeader*)tPtr;
             for (int i = 0; i < entries.Length; i++) dst[i] = table[i];
         }
+        uint tableCrc = NetHash.Crc32(tableBytes);
         fs.Write(tableBytes, 0, tableBytes.Length);
 
         var fileHdr = new BringPackHeader
@@ -507,6 +552,7 @@ public static unsafe class AssetPackBuilder
             Compression = mode,
             EntryCount = entries.Length,
             TableOffset = tableOffset,
+            TableCrc32 = tableCrc,
         };
         byte[] hdrBytes = new byte[hdrSize];
         fixed (byte* hPtr = hdrBytes)
@@ -524,13 +570,15 @@ public static unsafe class AssetPackBuilder
             if (!allFiles[i].EndsWith(".gltf", StringComparison.OrdinalIgnoreCase)) continue;
             string dir = Path.GetDirectoryName(allFiles[i]) ?? ".";
             using var doc = JsonDocument.Parse(StripUtf8Bom(File.ReadAllBytes(allFiles[i])));
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) continue;
             if (!doc.RootElement.TryGetProperty("images", out var imgs) || imgs.ValueKind != JsonValueKind.Array) continue;
             foreach (JsonElement img in imgs.EnumerateArray())
             {
-                if (!img.TryGetProperty("uri", out var uriEl)) continue;
+                if (img.ValueKind != JsonValueKind.Object || !img.TryGetProperty("uri", out var uriEl) || uriEl.ValueKind != JsonValueKind.String) continue;
                 string uri = uriEl.GetString() ?? "";
                 if (uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(uri)) continue;
-                string full = Path.GetFullPath(Path.Combine(dir, uri));
+                if (!PackCompressionSystem.TryResolveSafeRelativePath(dir, uri, out string full))
+                    throw new InvalidDataException($"Unsafe external glTF image URI rejected: '{uri}'.");
                 if (count >= found.Length)
                 {
                     var next = new string[Math.Max(8, found.Length * 2)];
@@ -568,16 +616,18 @@ public static unsafe class AssetPackBuilder
 
         using var doc = JsonDocument.Parse(StripUtf8Bom(File.ReadAllBytes(packJsonPath)));
         JsonElement root = doc.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("pack.json root must be a JSON object.");
 
-        if (root.TryGetProperty("compression", out var cEl))
+        if (root.TryGetProperty("compression", out var cEl) && cEl.ValueKind == JsonValueKind.String)
             compression = ParsePackCompression(cEl.GetString(), compression);
-        if (root.TryGetProperty("atlas_compression", out var acEl))
+        if (root.TryGetProperty("atlas_compression", out var acEl) && acEl.ValueKind == JsonValueKind.String)
             atlasComp = ParseTexPolicy(acEl.GetString(), atlasComp);
-        if (root.TryGetProperty("gltf_texture_compression", out var gcEl))
+        if (root.TryGetProperty("gltf_texture_compression", out var gcEl) && gcEl.ValueKind == JsonValueKind.String)
             gltfTexComp = ParseTexPolicy(gcEl.GetString(), gltfTexComp);
-        if (root.TryGetProperty("max_atlas_size", out var msEl))
+        if (root.TryGetProperty("max_atlas_size", out var msEl) && msEl.ValueKind == JsonValueKind.Number)
             maxAtlasSize = msEl.GetInt32();
-        if (root.TryGetProperty("atlas_padding", out var apEl))
+        if (root.TryGetProperty("atlas_padding", out var apEl) && apEl.ValueKind == JsonValueKind.Number)
             atlasPadding = apEl.GetInt32();
 
         if (root.TryGetProperty("sprites", out var spEl) && spEl.ValueKind == JsonValueKind.Array)
@@ -586,15 +636,18 @@ public static unsafe class AssetPackBuilder
             int i = 0;
             foreach (JsonElement item in spEl.EnumerateArray())
             {
+                if (item.ValueKind != JsonValueKind.Object)
+                    throw new InvalidDataException("pack.json sprites element must be an object.");
                 var sm = new SpriteMeta
                 {
-                    RelativePath = item.TryGetProperty("path", out var pEl) ? NormalizeSlash(pEl.GetString() ?? "") : "",
-                    Name = item.TryGetProperty("name", out var nEl) ? (nEl.GetString() ?? "") : "",
-                    OptOutAtlas = item.TryGetProperty("atlas", out var aEl) && !aEl.GetBoolean(),
-                    Nearest = item.TryGetProperty("nearest", out var nrEl) && nrEl.GetBoolean(),
-                    ClampEdge = !item.TryGetProperty("wrap", out var wEl) || !wEl.GetBoolean(),
-                    Compression = item.TryGetProperty("compression", out var tcEl) ? ParseTexPolicy(tcEl.GetString(), TextureCompressionPolicy.Auto) : TextureCompressionPolicy.Auto,
+                    RelativePath = (item.TryGetProperty("path", out var pEl) && pEl.ValueKind == JsonValueKind.String) ? NormalizeSlash(pEl.GetString() ?? "") : "",
+                    Name = (item.TryGetProperty("name", out var nEl) && nEl.ValueKind == JsonValueKind.String) ? (nEl.GetString() ?? "") : "",
+                    OptOutAtlas = item.TryGetProperty("atlas", out var aEl) && (aEl.ValueKind == JsonValueKind.False || (aEl.ValueKind == JsonValueKind.True && !aEl.GetBoolean())),
+                    Nearest = item.TryGetProperty("nearest", out var nrEl) && nrEl.ValueKind == JsonValueKind.True,
+                    ClampEdge = !item.TryGetProperty("wrap", out var wEl) || wEl.ValueKind != JsonValueKind.True,
+                    Compression = (item.TryGetProperty("compression", out var tcEl) && tcEl.ValueKind == JsonValueKind.String) ? ParseTexPolicy(tcEl.GetString(), TextureCompressionPolicy.Auto) : TextureCompressionPolicy.Auto,
                     Pivot = new Vec2(0.5f, 0.5f),
+                    HasPivot = false,
                 };
                 if (item.TryGetProperty("slice", out var slEl) && slEl.ValueKind == JsonValueKind.Array && slEl.GetArrayLength() == 4)
                 {
@@ -603,6 +656,7 @@ public static unsafe class AssetPackBuilder
                 if (item.TryGetProperty("pivot", out var pvEl) && pvEl.ValueKind == JsonValueKind.Array && pvEl.GetArrayLength() == 2)
                 {
                     sm.Pivot = new Vec2(pvEl[0].GetSingle(), pvEl[1].GetSingle());
+                    sm.HasPivot = true;
                 }
                 sprites[i++] = sm;
             }
@@ -614,13 +668,15 @@ public static unsafe class AssetPackBuilder
             int i = 0;
             foreach (JsonElement item in fEl.EnumerateArray())
             {
+                if (item.ValueKind != JsonValueKind.Object)
+                    throw new InvalidDataException("pack.json fonts element must be an object.");
                 fonts[i++] = new FontMeta
                 {
-                    RelativePath = item.TryGetProperty("path", out var pEl) ? NormalizeSlash(pEl.GetString() ?? "") : "",
-                    Name = item.TryGetProperty("name", out var nEl) ? (nEl.GetString() ?? "") : "",
-                    PixelSize = item.TryGetProperty("pixel_size", out var psEl) ? psEl.GetSingle() : 64f,
-                    AtlasSize = item.TryGetProperty("atlas_size", out var asEl) ? asEl.GetInt32() : 1024,
-                    SdfPadding = item.TryGetProperty("sdf_padding", out var sp2El) ? sp2El.GetInt32() : 8,
+                    RelativePath = (item.TryGetProperty("path", out var pEl) && pEl.ValueKind == JsonValueKind.String) ? NormalizeSlash(pEl.GetString() ?? "") : "",
+                    Name = (item.TryGetProperty("name", out var nEl) && nEl.ValueKind == JsonValueKind.String) ? (nEl.GetString() ?? "") : "",
+                    PixelSize = (item.TryGetProperty("pixel_size", out var psEl) && psEl.ValueKind == JsonValueKind.Number) ? psEl.GetSingle() : 64f,
+                    AtlasSize = (item.TryGetProperty("atlas_size", out var asEl) && asEl.ValueKind == JsonValueKind.Number) ? asEl.GetInt32() : 1024,
+                    SdfPadding = (item.TryGetProperty("sdf_padding", out var sp2El) && sp2El.ValueKind == JsonValueKind.Number) ? sp2El.GetInt32() : 8,
                 };
             }
         }
@@ -710,6 +766,101 @@ public static unsafe class AssetPackLoader
         return LoadFromMemoryIntoBundle(packBytes, ref bundleArena, ref scratchArena, ref world, bundle);
     }
 
+    private static bool TryReadHeaderAndValidateTable(
+        ReadOnlySpan<byte> packBytes,
+        out ushort version,
+        out int hdrSize,
+        out int entrySize,
+        out int entryCount,
+        out int tableOffset)
+    {
+        version = 0;
+        hdrSize = 0;
+        entrySize = 0;
+        entryCount = 0;
+        tableOffset = 0;
+
+        if (packBytes.Length < sizeof(BringPackHeaderV1)) return false;
+        BringPackHeaderV1 v1 = MemoryMarshal.Read<BringPackHeaderV1>(packBytes);
+        if (v1.Magic != BringPackHeader.MagicValue) return false;
+
+        version = v1.Version;
+        if (version == BringPackHeader.LegacyVersion1)
+        {
+            hdrSize = sizeof(BringPackHeaderV1);
+            entrySize = sizeof(PackEntryHeaderV1);
+            entryCount = v1.EntryCount;
+            tableOffset = v1.TableOffset;
+        }
+        else if (version == BringPackHeader.CurrentVersion)
+        {
+            if (packBytes.Length < sizeof(BringPackHeader)) return false;
+            BringPackHeader v2 = MemoryMarshal.Read<BringPackHeader>(packBytes);
+            hdrSize = sizeof(BringPackHeader);
+            entrySize = sizeof(PackEntryHeader);
+            entryCount = v2.EntryCount;
+            tableOffset = v2.TableOffset;
+
+            if (entryCount < 0 || tableOffset < hdrSize ||
+                (long)tableOffset + (long)entryCount * entrySize > packBytes.Length)
+                return false;
+
+            uint tableCrc = NetHash.Crc32(packBytes.Slice(tableOffset, entryCount * entrySize));
+            if (tableCrc != v2.TableCrc32)
+                return false;
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+
+        if (entryCount < 0 || tableOffset < hdrSize ||
+            (long)tableOffset + (long)entryCount * entrySize > packBytes.Length)
+            return false;
+        return true;
+    }
+
+    private static PackEntryHeader ReadEntryHeader(ReadOnlySpan<byte> packBytes, ushort version, int tableOffset, int entrySize, int index, out bool hasCrc)
+    {
+        int offset = tableOffset + index * entrySize;
+        if (version == BringPackHeader.LegacyVersion1)
+        {
+            PackEntryHeaderV1 e1 = MemoryMarshal.Read<PackEntryHeaderV1>(packBytes.Slice(offset, entrySize));
+            hasCrc = false;
+            return new PackEntryHeader
+            {
+                NameHash = e1.NameHash,
+                Kind = e1.Kind,
+                Compression = e1.Compression,
+                Flags = e1.Flags,
+                DataOffset = e1.DataOffset,
+                CompressedBytes = e1.CompressedBytes,
+                UncompressedBytes = e1.UncompressedBytes,
+                PayloadCrc32 = 0,
+            };
+        }
+        hasCrc = true;
+        return MemoryMarshal.Read<PackEntryHeader>(packBytes.Slice(offset, entrySize));
+    }
+
+    private static bool IsEntryBoundsValid(ReadOnlySpan<byte> packBytes, int hdrSize, in PackEntryHeader e, bool hasCrc)
+    {
+        if (e.DataOffset < hdrSize || e.CompressedBytes < 0 || e.UncompressedBytes < 0)
+            return false;
+        if ((long)e.DataOffset + e.CompressedBytes > packBytes.Length)
+            return false;
+        if (e.UncompressedBytes == 0 && e.CompressedBytes != 0)
+            return false;
+        if (e.Kind is not (PackEntryKind.CompressedAtlas or PackEntryKind.GltfModel or PackEntryKind.SdfFont or PackEntryKind.StandaloneTexture or PackEntryKind.RawBlob))
+            return false;
+        if (e.Compression is not (PackCompressionMode.None or PackCompressionMode.Lz4 or PackCompressionMode.Brotli))
+            return false;
+        if (hasCrc && NetHash.Crc32(packBytes.Slice(e.DataOffset, e.CompressedBytes)) != e.PayloadCrc32)
+            return false;
+        return true;
+    }
+
     public static int LoadFromMemoryIntoBundle(
         ReadOnlySpan<byte> packBytes,
         ref LinearArena bundleArena,
@@ -717,22 +868,14 @@ public static unsafe class AssetPackLoader
         ref EngineWorld world,
         BundleId bundle)
     {
-        if (packBytes.Length < sizeof(BringPackHeader))
-            throw new InvalidDataException("Invalid .bpack file (truncated header).");
-
-        BringPackHeader hdr = MemoryMarshal.Read<BringPackHeader>(packBytes);
-        if (hdr.Magic != BringPackHeader.MagicValue || hdr.Version != BringPackHeader.CurrentVersion)
-            throw new InvalidDataException($"Unsupported .bpack header (magic=0x{hdr.Magic:X8}, version={hdr.Version}).");
-
-        int entrySize = sizeof(PackEntryHeader);
-        if (hdr.TableOffset < sizeof(BringPackHeader) || hdr.TableOffset + hdr.EntryCount * entrySize > packBytes.Length)
-            throw new InvalidDataException("Invalid .bpack entry table.");
+        if (!TryReadHeaderAndValidateTable(packBytes, out ushort version, out int hdrSize, out int entrySize, out int entryCount, out int tableOffset))
+            throw new InvalidDataException("Invalid or corrupt .bpack header/entry table.");
 
         int loaded = 0;
-        for (int i = 0; i < hdr.EntryCount; i++)
+        for (int i = 0; i < entryCount; i++)
         {
-            PackEntryHeader e = MemoryMarshal.Read<PackEntryHeader>(packBytes.Slice(hdr.TableOffset + i * entrySize, entrySize));
-            if (e.DataOffset + e.CompressedBytes > packBytes.Length || e.UncompressedBytes < 0)
+            PackEntryHeader e = ReadEntryHeader(packBytes, version, tableOffset, entrySize, i, out bool hasCrc);
+            if (!IsEntryBoundsValid(packBytes, hdrSize, in e, hasCrc))
                 throw new InvalidDataException($"Corrupt .bpack entry {i}.");
 
             ArenaMarker mark = scratchArena.SaveMarker();
@@ -741,7 +884,11 @@ public static unsafe class AssetPackLoader
                 byte* rawPtr = scratchArena.AllocUninitialized<byte>(Math.Max(1, e.UncompressedBytes), 64);
                 var rawSpan = new Span<byte>(rawPtr, e.UncompressedBytes);
                 if (e.UncompressedBytes > 0)
-                    PackCompressionSystem.Decompress(packBytes.Slice(e.DataOffset, e.CompressedBytes), e.Compression, rawSpan);
+                {
+                    int written = PackCompressionSystem.Decompress(packBytes.Slice(e.DataOffset, e.CompressedBytes), e.Compression, rawSpan);
+                    if (written != e.UncompressedBytes)
+                        throw new InvalidDataException($"Corrupt .bpack entry {i}: decompressed size {written} != {e.UncompressedBytes}.");
+                }
 
                 StringId nameId = new StringId(e.NameHash);
                 switch (e.Kind)
@@ -780,6 +927,11 @@ public static unsafe class AssetPackLoader
     /// </summary>
     public static bool TryReadRawBlob(string bpackPath, StringId name, ref LinearArena dstArena, out NativeSlice<byte> outBytes)
     {
+        if (string.IsNullOrEmpty(bpackPath) || !File.Exists(bpackPath))
+        {
+            outBytes = default;
+            return false;
+        }
         byte[] packBytes = File.ReadAllBytes(bpackPath);
         return TryReadRawBlobFromMemory(packBytes, name, ref dstArena, out outBytes);
     }
@@ -787,21 +939,39 @@ public static unsafe class AssetPackLoader
     public static bool TryReadRawBlobFromMemory(ReadOnlySpan<byte> packBytes, StringId name, ref LinearArena dstArena, out NativeSlice<byte> outBytes)
     {
         outBytes = default;
-        if (packBytes.Length < sizeof(BringPackHeader)) return false;
-        BringPackHeader hdr = MemoryMarshal.Read<BringPackHeader>(packBytes);
-        if (hdr.Magic != BringPackHeader.MagicValue) return false;
+        if (!TryReadHeaderAndValidateTable(packBytes, out ushort version, out int hdrSize, out int entrySize, out int entryCount, out int tableOffset))
+            return false;
 
-        int entrySize = sizeof(PackEntryHeader);
-        for (int i = 0; i < hdr.EntryCount; i++)
+        for (int i = 0; i < entryCount; i++)
         {
-            PackEntryHeader e = MemoryMarshal.Read<PackEntryHeader>(packBytes.Slice(hdr.TableOffset + i * entrySize, entrySize));
+            PackEntryHeader e = ReadEntryHeader(packBytes, version, tableOffset, entrySize, i, out bool hasCrc);
             if (e.Kind == PackEntryKind.RawBlob && e.NameHash == name.Value)
             {
-                byte* dst = dstArena.AllocUninitialized<byte>(Math.Max(1, e.UncompressedBytes), 16);
-                var span = new Span<byte>(dst, e.UncompressedBytes);
-                PackCompressionSystem.Decompress(packBytes.Slice(e.DataOffset, e.CompressedBytes), e.Compression, span);
-                outBytes = new NativeSlice<byte>(dst, e.UncompressedBytes);
-                return true;
+                if (!IsEntryBoundsValid(packBytes, hdrSize, in e, hasCrc))
+                    return false;
+
+                ArenaMarker mark = dstArena.SaveMarker();
+                try
+                {
+                    byte* dst = dstArena.AllocUninitialized<byte>(Math.Max(1, e.UncompressedBytes), 16);
+                    if (e.UncompressedBytes > 0)
+                    {
+                        var span = new Span<byte>(dst, e.UncompressedBytes);
+                        int written = PackCompressionSystem.Decompress(packBytes.Slice(e.DataOffset, e.CompressedBytes), e.Compression, span);
+                        if (written != e.UncompressedBytes)
+                        {
+                            dstArena.Rollback(mark);
+                            return false;
+                        }
+                    }
+                    outBytes = new NativeSlice<byte>(dst, e.UncompressedBytes);
+                    return true;
+                }
+                catch
+                {
+                    dstArena.Rollback(mark);
+                    return false;
+                }
             }
         }
         return false;
@@ -819,9 +989,19 @@ public static unsafe class AssetPackLoader
         if (payload.Length < hdrSize) throw new InvalidDataException("Truncated atlas payload.");
 
         PackedAtlasPayloadHeader ah = MemoryMarshal.Read<PackedAtlasPayloadHeader>(payload);
-        int texOff = hdrSize + ah.RegionCount * recSize;
-        if (texOff + ah.TextureDataBytes > payload.Length)
+        if (ah.Width <= 0 || ah.Height <= 0 || ah.TextureDataBytes <= 0 || ah.RegionCount < 0)
+            throw new InvalidDataException($"Invalid atlas payload dimensions/counts ({ah.Width}x{ah.Height}, {ah.TextureDataBytes}B, regions={ah.RegionCount}).");
+        if (ah.Format is not (TexturePixelFormat.Rgba8 or TexturePixelFormat.R8 or TexturePixelFormat.Bc1Rgba or TexturePixelFormat.Bc3Rgba))
+            throw new InvalidDataException($"Unsupported atlas texture format {ah.Format}.");
+
+        int expectedBytes = TextureCompressionSystem.CalcByteSize(ah.Format, ah.Width, ah.Height);
+        if (ah.TextureDataBytes != expectedBytes)
+            throw new InvalidDataException($"Atlas TextureDataBytes ({ah.TextureDataBytes}) != expected ({expectedBytes}).");
+
+        long texOffL = (long)hdrSize + (long)ah.RegionCount * recSize;
+        if (texOffL > payload.Length || texOffL + ah.TextureDataBytes > payload.Length)
             throw new InvalidDataException("Truncated atlas texture data.");
+        int texOff = (int)texOffL;
 
         byte* texDst = bundleArena.AllocUninitialized<byte>(ah.TextureDataBytes, 64);
         payload.Slice(texOff, ah.TextureDataBytes).CopyTo(new Span<byte>(texDst, ah.TextureDataBytes));
@@ -857,7 +1037,10 @@ public static unsafe class AssetPackLoader
         int hdrSize = sizeof(PackedFontPayloadHeader);
         if (payload.Length < hdrSize) throw new InvalidDataException("Truncated font payload.");
         PackedFontPayloadHeader fh = MemoryMarshal.Read<PackedFontPayloadHeader>(payload);
-        if (hdrSize + fh.TtfBytes > payload.Length) throw new InvalidDataException("Truncated font TTF bytes.");
+        if (fh.TtfBytes <= 0 || (long)hdrSize + fh.TtfBytes > payload.Length)
+            throw new InvalidDataException("Invalid or truncated font TTF bytes.");
+        if (!float.IsFinite(fh.PixelSize) || fh.PixelSize <= 0f || fh.AtlasSize < 16 || fh.SdfPadding <= 0)
+            throw new InvalidDataException($"Invalid font bake parameters (pixelSize={fh.PixelSize}, atlasSize={fh.AtlasSize}, sdfPadding={fh.SdfPadding}).");
 
         byte[] ttf = payload.Slice(hdrSize, fh.TtfBytes).ToArray();
         SdfFontLoader.BakeSdfFromMemory(ttf, ref bundleArena, ref assets, bundle, fontName, fh.PixelSize, fh.AtlasSize, fh.SdfPadding);

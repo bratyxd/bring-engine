@@ -1,7 +1,9 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using BringEngine.Assets.Bundles;
 using BringEngine.Core.Handles;
+using BringEngine.Core.Logging;
 using BringEngine.Core.Memory;
 using BringEngine.Simulation.World;
 
@@ -65,8 +67,13 @@ public unsafe struct SceneManager
     public uint* SceneGens;
     public int MaxActiveScenes;
     public int ActiveCount;
+    public LogState* Log;
 
-    public static SceneManager Create(ref LinearArena persistentArena, int maxDefinitions = 32, int maxActiveScenes = 8)
+    public static SceneManager Create(
+        ref LinearArena persistentArena,
+        int maxDefinitions = 32,
+        int maxActiveScenes = 8,
+        LogState* log = null)
     {
         uint* gens = persistentArena.AllocUninitialized<uint>(maxActiveScenes, 16);
         for (int i = 0; i < maxActiveScenes; i++) gens[i] = 1;
@@ -82,12 +89,15 @@ public unsafe struct SceneManager
             SceneGens = gens,
             MaxActiveScenes = maxActiveScenes,
             ActiveCount = 0,
+            Log = log,
         };
     }
 }
 
 public static unsafe class SceneSystem
 {
+    public static void SetLogger(ref SceneManager mgr, LogState* log) => mgr.Log = log;
+
     public static int RegisterScene(
         ref SceneManager mgr,
         ref LinearArena persistentArena,
@@ -100,6 +110,10 @@ public static unsafe class SceneSystem
         delegate*<ref SceneContext, void> onViewSync = null,
         void* userData = null)
     {
+        StringId id = StringId.Hash(name);
+        if (mgr.NameToDef.TryGet(id.Value, out int _))
+            throw new InvalidOperationException($"Scene '{name.ToString()}' (hash={id.Value}) is already registered.");
+
         if (mgr.DefinitionCount >= mgr.MaxDefinitions)
             throw new OutOfMemoryException("SceneManager definition capacity exceeded.");
 
@@ -111,7 +125,6 @@ public static unsafe class SceneSystem
             requiredBundles.CopyTo(new Span<BundleId>(bundleCopy, requiredBundles.Length));
         }
 
-        StringId id = StringId.Hash(name);
         mgr.Definitions[idx] = new SceneDefinition
         {
             Name = id,
@@ -129,60 +142,107 @@ public static unsafe class SceneSystem
         return idx;
     }
 
+    private static int FindFreeActiveSlot(in SceneManager mgr)
+    {
+        for (int i = 0; i < mgr.MaxActiveScenes; i++)
+            if (mgr.ActiveScenes[i].Active == 0) return i;
+        return -1;
+    }
+
     public static SceneId LoadScene(
         ref SceneManager mgr,
         ref EngineWorld world,
         ref EngineAllocators alloc,
         ref BundleManager bundles,
         StringId sceneName,
-        SceneLoadMode mode = SceneLoadMode.Single)
+        SceneLoadMode mode = SceneLoadMode.Single,
+        LogState* log = null)
     {
         if (!mgr.NameToDef.TryGet(sceneName.Value, out int defIdx))
             throw new InvalidOperationException($"Scene not registered (hash={sceneName.Value}).");
 
+        LogState* activeLog = log != null ? log : mgr.Log;
+        long startTicks = Stopwatch.GetTimestamp();
         ref SceneDefinition newDef = ref mgr.Definitions[defIdx];
 
+        int slot;
         if (mode == SceneLoadMode.Single)
         {
-            // Acquire shared bundles first if we want zero-reload transitions, OR unload old scenes first for minimal peak RAM!
-            // To guarantee MINIMUM peak memory usage, we acquire bundles already loaded (ref++)? Wait:
-            // Actually acquiring shared bundles that are ALREADY loaded keeps them alive with zero RAM spike,
-            // while unloading unshared old bundles BEFORE loading new unshared bundles keeps peak RAM strictly minimal!
+            if (mgr.MaxActiveScenes <= 0)
+                throw new OutOfMemoryException("Max active scenes exceeded.");
+
             ArenaMarker mark = alloc.Scratch.SaveMarker();
-            byte* alreadyHeld = newDef.RequiredBundleCount > 0 ? alloc.Scratch.Alloc<byte>(newDef.RequiredBundleCount) : null;
-            for (int b = 0; b < newDef.RequiredBundleCount; b++)
+            byte* acquired = newDef.RequiredBundleCount > 0 ? alloc.Scratch.Alloc<byte>(newDef.RequiredBundleCount) : null;
+            try
             {
-                if (BundleSystem.IsLoaded(in bundles, newDef.RequiredBundles[b]))
+                // Acquire shared already-loaded bundles first so Single transitions keep them resident without reload spikes
+                for (int b = 0; b < newDef.RequiredBundleCount; b++)
                 {
-                    BundleSystem.Acquire(ref bundles, newDef.RequiredBundles[b], ref world, ref alloc.Scratch);
-                    alreadyHeld[b] = 1;
+                    if (BundleSystem.IsLoaded(in bundles, newDef.RequiredBundles[b]))
+                    {
+                        BundleSystem.Acquire(ref bundles, newDef.RequiredBundles[b], ref world, ref alloc.Scratch);
+                        acquired[b] = 1;
+                    }
+                }
+
+                // Unload all currently active scenes (frees unshared bundles + scene arenas + entities immediately!)
+                UnloadAllScenes(ref mgr, ref world, ref alloc, ref bundles, activeLog);
+
+                // Acquire remaining new bundles
+                for (int b = 0; b < newDef.RequiredBundleCount; b++)
+                {
+                    if (acquired[b] == 0)
+                    {
+                        BundleSystem.Acquire(ref bundles, newDef.RequiredBundles[b], ref world, ref alloc.Scratch);
+                        acquired[b] = 1;
+                    }
                 }
             }
-
-            // Unload all currently active scenes (frees unshared bundles + scene arenas + entities immediately!)
-            UnloadAllScenes(ref mgr, ref world, ref alloc, ref bundles);
-
-            // Now acquire remaining new bundles
-            for (int b = 0; b < newDef.RequiredBundleCount; b++)
+            catch
             {
-                if (alreadyHeld[b] == 0)
-                    BundleSystem.Acquire(ref bundles, newDef.RequiredBundles[b], ref world, ref alloc.Scratch);
+                for (int b = 0; b < newDef.RequiredBundleCount; b++)
+                {
+                    if (acquired != null && acquired[b] != 0)
+                        BundleSystem.Release(ref bundles, newDef.RequiredBundles[b], ref world);
+                }
+                throw;
             }
-            alloc.Scratch.Rollback(mark);
+            finally
+            {
+                alloc.Scratch.Rollback(mark);
+            }
+
+            slot = FindFreeActiveSlot(in mgr);
+            if (slot < 0)
+            {
+                for (int b = 0; b < newDef.RequiredBundleCount; b++)
+                    BundleSystem.Release(ref bundles, newDef.RequiredBundles[b], ref world);
+                throw new OutOfMemoryException("Max active scenes exceeded.");
+            }
         }
         else
         {
-            for (int b = 0; b < newDef.RequiredBundleCount; b++)
-                BundleSystem.Acquire(ref bundles, newDef.RequiredBundles[b], ref world, ref alloc.Scratch);
-        }
+            // Check free active scene slot BEFORE acquiring any bundles to prevent bundle RefCount/arena leaks
+            slot = FindFreeActiveSlot(in mgr);
+            if (slot < 0)
+                throw new OutOfMemoryException("Max active scenes exceeded.");
 
-        // Find free active slot
-        int slot = -1;
-        for (int i = 0; i < mgr.MaxActiveScenes; i++)
-        {
-            if (mgr.ActiveScenes[i].Active == 0) { slot = i; break; }
+            int acquiredCount = 0;
+            try
+            {
+                for (int b = 0; b < newDef.RequiredBundleCount; b++)
+                {
+                    BundleSystem.Acquire(ref bundles, newDef.RequiredBundles[b], ref world, ref alloc.Scratch);
+                    acquiredCount++;
+                }
+            }
+            catch
+            {
+                for (int b = acquiredCount - 1; b >= 0; b--)
+                    BundleSystem.Release(ref bundles, newDef.RequiredBundles[b], ref world);
+                throw;
+            }
         }
-        if (slot < 0) throw new OutOfMemoryException("Max active scenes exceeded.");
 
         SceneId handle = SceneId.Create((uint)slot, mgr.SceneGens[slot]);
         ref ActiveSceneData inst = ref mgr.ActiveScenes[slot];
@@ -194,22 +254,44 @@ public static unsafe class SceneSystem
 
         if (newDef.OnLoad != null)
         {
-            fixed (LinearArena* sa = &inst.SceneArena)
-            fixed (EngineWorld* wp = &world)
-            fixed (EngineAllocators* ap = &alloc)
-            fixed (BundleManager* bp = &bundles)
+            try
             {
-                var ctx = new SceneContext
+                fixed (LinearArena* sa = &inst.SceneArena)
+                fixed (EngineWorld* wp = &world)
+                fixed (EngineAllocators* ap = &alloc)
+                fixed (BundleManager* bp = &bundles)
                 {
-                    Scene = handle,
-                    SceneArena = sa,
-                    World = wp,
-                    Allocators = ap,
-                    Bundles = bp,
-                    UserData = newDef.UserData,
-                };
-                newDef.OnLoad(ref ctx);
+                    var ctx = new SceneContext
+                    {
+                        Scene = handle,
+                        SceneArena = sa,
+                        World = wp,
+                        Allocators = ap,
+                        Bundles = bp,
+                        UserData = newDef.UserData,
+                    };
+                    newDef.OnLoad(ref ctx);
+                }
             }
+            catch
+            {
+                EngineWorldSystem.DestroySceneObjects(ref world, handle, ref alloc.Scratch);
+                inst.SceneArena.Dispose();
+                inst.Active = 0;
+                mgr.SceneGens[slot] = HandlePacking.NextGeneration(mgr.SceneGens[slot]);
+                mgr.ActiveCount--;
+                for (int b = 0; b < newDef.RequiredBundleCount; b++)
+                    BundleSystem.Release(ref bundles, newDef.RequiredBundles[b], ref world);
+                if (activeLog != null)
+                    LogSystem.Error(activeLog, $"Scene '{newDef.NameText}' OnLoad failed; rolled back (handle={handle})");
+                throw;
+            }
+        }
+
+        if (activeLog != null)
+        {
+            double elapsedMs = (Stopwatch.GetTimestamp() - startTicks) * 1000.0 / Stopwatch.Frequency;
+            LogSystem.Info(activeLog, $"Scene '{newDef.NameText}' loaded (mode={(mode == SceneLoadMode.Single ? "Single"u8 : "Additive"u8)}, handle={handle}, entities={world.Entities.AliveCount}, bundles={newDef.RequiredBundleCount}, {elapsedMs:F2}ms)");
         }
 
         return handle;
@@ -220,47 +302,63 @@ public static unsafe class SceneSystem
         ref EngineWorld world,
         ref EngineAllocators alloc,
         ref BundleManager bundles,
-        SceneId sceneId)
+        SceneId sceneId,
+        LogState* log = null)
     {
         if (!sceneId.IsValid || sceneId.Index >= (uint)mgr.MaxActiveScenes) return false;
         ref ActiveSceneData inst = ref mgr.ActiveScenes[sceneId.Index];
         if (inst.Active == 0 || inst.Handle != sceneId) return false;
 
+        LogState* activeLog = log != null ? log : mgr.Log;
+        long startTicks = Stopwatch.GetTimestamp();
+        int entitiesBefore = world.Entities.AliveCount;
+        nuint arenaBytes = inst.SceneArena.Capacity;
         ref SceneDefinition def = ref mgr.Definitions[inst.DefinitionIndex];
 
-        if (def.OnUnload != null)
+        try
         {
-            fixed (LinearArena* sa = &inst.SceneArena)
-            fixed (EngineWorld* wp = &world)
-            fixed (EngineAllocators* ap = &alloc)
-            fixed (BundleManager* bp = &bundles)
+            if (def.OnUnload != null)
             {
-                var ctx = new SceneContext
+                fixed (LinearArena* sa = &inst.SceneArena)
+                fixed (EngineWorld* wp = &world)
+                fixed (EngineAllocators* ap = &alloc)
+                fixed (BundleManager* bp = &bundles)
                 {
-                    Scene = sceneId,
-                    SceneArena = sa,
-                    World = wp,
-                    Allocators = ap,
-                    Bundles = bp,
-                    UserData = def.UserData,
-                };
-                def.OnUnload(ref ctx);
+                    var ctx = new SceneContext
+                    {
+                        Scene = sceneId,
+                        SceneArena = sa,
+                        World = wp,
+                        Allocators = ap,
+                        Bundles = bp,
+                        UserData = def.UserData,
+                    };
+                    def.OnUnload(ref ctx);
+                }
             }
         }
+        finally
+        {
+            // Clean up all world objects belonging to this scene
+            EngineWorldSystem.DestroySceneObjects(ref world, sceneId, ref alloc.Scratch);
 
-        // Clean up all world objects belonging to this scene
-        EngineWorldSystem.DestroySceneObjects(ref world, sceneId, ref alloc.Scratch);
+            // Dispose per-scene arena immediately
+            inst.SceneArena.Dispose();
+            inst.Active = 0;
+            mgr.SceneGens[sceneId.Index] = HandlePacking.NextGeneration(mgr.SceneGens[sceneId.Index]);
+            mgr.ActiveCount--;
 
-        // Dispose per-scene arena immediately
-        inst.SceneArena.Dispose();
-        inst.Active = 0;
-        uint g = (mgr.SceneGens[sceneId.Index] + 1) & HandlePacking.GenerationMask;
-        mgr.SceneGens[sceneId.Index] = g == 0 ? 1u : g;
-        mgr.ActiveCount--;
+            // Release bundles (unloads any bundle whose RefCount hits 0)
+            for (int b = 0; b < def.RequiredBundleCount; b++)
+                BundleSystem.Release(ref bundles, def.RequiredBundles[b], ref world);
+        }
 
-        // Release bundles (unloads any bundle whose RefCount hits 0)
-        for (int b = 0; b < def.RequiredBundleCount; b++)
-            BundleSystem.Release(ref bundles, def.RequiredBundles[b], ref world);
+        if (activeLog != null)
+        {
+            int entitiesRemoved = entitiesBefore - world.Entities.AliveCount;
+            double elapsedMs = (Stopwatch.GetTimestamp() - startTicks) * 1000.0 / Stopwatch.Frequency;
+            LogSystem.Info(activeLog, $"Scene '{def.NameText}' unloaded (handle={sceneId}, entitiesRemoved={entitiesRemoved}, arenaBytes={arenaBytes}, {elapsedMs:F2}ms)");
+        }
 
         return true;
     }
@@ -269,12 +367,13 @@ public static unsafe class SceneSystem
         ref SceneManager mgr,
         ref EngineWorld world,
         ref EngineAllocators alloc,
-        ref BundleManager bundles)
+        ref BundleManager bundles,
+        LogState* log = null)
     {
         for (int i = mgr.MaxActiveScenes - 1; i >= 0; i--)
         {
             if (mgr.ActiveScenes[i].Active != 0)
-                UnloadScene(ref mgr, ref world, ref alloc, ref bundles, mgr.ActiveScenes[i].Handle);
+                UnloadScene(ref mgr, ref world, ref alloc, ref bundles, mgr.ActiveScenes[i].Handle, log);
         }
     }
 

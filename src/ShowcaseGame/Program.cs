@@ -5,9 +5,11 @@ using BringEngine;
 using BringEngine.Assets;
 using BringEngine.Assets.Bundles;
 using BringEngine.Core.Handles;
+using BringEngine.Core.Logging;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
 using BringEngine.Core.Profiling;
+using BringEngine.Core.Storage;
 using BringEngine.Core.Threading;
 using BringEngine.Rendering;
 using BringEngine.Rendering.Gpu;
@@ -43,6 +45,17 @@ internal unsafe struct GameLogicContext
     public float FixedAccumulator;
     public byte FixedSingleStepMode; // 1 in deterministic verify-render mode (1 exact 1/60s sim tick per frame)
     public byte ProfileScopesActive;
+
+    // Input edge/delta latch across 0-tick and multi-tick fixed-step frames
+    public fixed ulong LatchedKeysPressed[8];
+    public fixed ulong LatchedKeysReleased[8];
+    public uint LatchedMousePressed;
+    public uint LatchedMouseReleased;
+    public fixed uint LatchedPadPressed[InputState.MaxGamepads];
+    public fixed uint LatchedPadReleased[InputState.MaxGamepads];
+    public float LatchedMouseDeltaX;
+    public float LatchedMouseDeltaY;
+    public float LatchedMouseWheelY;
 }
 
 /// <summary>
@@ -165,6 +178,7 @@ public static unsafe class Program
 
         gameAlloc.BeginFrame();
         world.Input = frameIn.Input;
+        LatchInputEdges(ctx, in frameIn.Input);
 
         const float fixedStep = 1f / 60f;
         Fix32 fixedDt = Fix32.FromRatio(1, 60);
@@ -172,16 +186,18 @@ public static unsafe class Program
         int simScope = prof != null ? ProfilerSystem.BeginScope(ref *prof, "Sim") : -1;
         if (ctx->FixedSingleStepMode != 0)
         {
+            InputState tickInput = ConsumeLatchedTickInput(ctx, in frameIn.Input);
             if (ctx->View->Mode == 1)
-                GameSimSystems.StepFixed(ref *ctx->Sim, in world.Input, fixedDt);
+                GameSimSystems.StepFixed(ref *ctx->Sim, in tickInput, fixedDt);
         }
         else
         {
             ctx->FixedAccumulator += frameIn.DeltaTime;
             while (ctx->FixedAccumulator >= fixedStep)
             {
+                InputState tickInput = ConsumeLatchedTickInput(ctx, in frameIn.Input);
                 if (ctx->View->Mode == 1)
-                    GameSimSystems.StepFixed(ref *ctx->Sim, in world.Input, fixedDt);
+                    GameSimSystems.StepFixed(ref *ctx->Sim, in tickInput, fixedDt);
                 ctx->FixedAccumulator -= fixedStep;
             }
         }
@@ -203,6 +219,75 @@ public static unsafe class Program
             ref engAlloc.Frame, ref engAlloc.Scratch, out outPacket, prof);
     }
 
+    private static void LatchInputEdges(GameLogicContext* ctx, in InputState src)
+    {
+        for (int w = 0; w < 8; w++)
+        {
+            ulong down = src.KeysDown[w];
+            ulong prev = src.KeysPrev[w];
+            ctx->LatchedKeysPressed[w] |= down & ~prev;
+            ctx->LatchedKeysReleased[w] |= ~down & prev;
+        }
+        ctx->LatchedMousePressed |= src.MouseButtonsDown & ~src.MouseButtonsPrev;
+        ctx->LatchedMouseReleased |= ~src.MouseButtonsDown & src.MouseButtonsPrev;
+        for (int g = 0; g < InputState.MaxGamepads; g++)
+        {
+            GamepadState gp = src.GetGamepad(g);
+            ctx->LatchedPadPressed[g] |= gp.ButtonsDown & ~gp.ButtonsPrev;
+            ctx->LatchedPadReleased[g] |= ~gp.ButtonsDown & gp.ButtonsPrev;
+        }
+        ctx->LatchedMouseDeltaX += src.MouseDeltaX;
+        ctx->LatchedMouseDeltaY += src.MouseDeltaY;
+        ctx->LatchedMouseWheelY += src.MouseWheelY;
+    }
+
+    private static InputState ConsumeLatchedTickInput(GameLogicContext* ctx, in InputState src)
+    {
+        InputState tick = src;
+        for (int w = 0; w < 8; w++)
+        {
+            ulong pressed = ctx->LatchedKeysPressed[w];
+            ulong released = ctx->LatchedKeysReleased[w] & ~pressed;
+            tick.KeysPrev[w] = tick.KeysDown[w];
+            tick.KeysDown[w] = (tick.KeysDown[w] | pressed) & ~released;
+            tick.KeysPrev[w] = (tick.KeysPrev[w] & ~pressed) | released;
+            ctx->LatchedKeysPressed[w] = 0;
+            ctx->LatchedKeysReleased[w] = 0;
+        }
+
+        uint mPressed = ctx->LatchedMousePressed;
+        uint mReleased = ctx->LatchedMouseReleased & ~mPressed;
+        tick.MouseButtonsPrev = tick.MouseButtonsDown;
+        tick.MouseButtonsDown = (tick.MouseButtonsDown | mPressed) & ~mReleased;
+        tick.MouseButtonsPrev = (tick.MouseButtonsPrev & ~mPressed) | mReleased;
+        ctx->LatchedMousePressed = 0;
+        ctx->LatchedMouseReleased = 0;
+
+        ConsumePadLatch(ref tick.Gamepad0, ref ctx->LatchedPadPressed[0], ref ctx->LatchedPadReleased[0]);
+        ConsumePadLatch(ref tick.Gamepad1, ref ctx->LatchedPadPressed[1], ref ctx->LatchedPadReleased[1]);
+        ConsumePadLatch(ref tick.Gamepad2, ref ctx->LatchedPadPressed[2], ref ctx->LatchedPadReleased[2]);
+        ConsumePadLatch(ref tick.Gamepad3, ref ctx->LatchedPadPressed[3], ref ctx->LatchedPadReleased[3]);
+
+        tick.MouseDeltaX = ctx->LatchedMouseDeltaX;
+        tick.MouseDeltaY = ctx->LatchedMouseDeltaY;
+        tick.MouseWheelY = ctx->LatchedMouseWheelY;
+        ctx->LatchedMouseDeltaX = 0f;
+        ctx->LatchedMouseDeltaY = 0f;
+        ctx->LatchedMouseWheelY = 0f;
+        return tick;
+    }
+
+    private static void ConsumePadLatch(ref GamepadState pad, ref uint pressedLatch, ref uint releasedLatch)
+    {
+        uint pressed = pressedLatch;
+        uint released = releasedLatch & ~pressed;
+        pad.ButtonsPrev = pad.ButtonsDown;
+        pad.ButtonsDown = (pad.ButtonsDown | pressed) & ~released;
+        pad.ButtonsPrev = (pad.ButtonsPrev & ~pressed) | released;
+        pressedLatch = 0;
+        releasedLatch = 0;
+    }
+
     private static int RunPipelinedGame(bool verifyRender, string outDir, int targetFps, bool vsync, WindowMode windowMode)
     {
         Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - Bring Arena ({(verifyRender ? "Verify Render Mode" : windowMode.ToString())}, 2-Thread Pipelined, VSync={(vsync ? "ON" : "OFF")}, FPS Cap={(targetFps > 0 ? targetFps.ToString() : "Uncapped")})");
@@ -217,14 +302,20 @@ public static unsafe class Program
         var gameAlloc = GameAllocators.Create();
 
         // Keep top-level structs in native Persistent memory so pointers passed to Logic Thread stay 100% pinned & stable!
+        LogState* log = engAlloc.Persistent.Alloc<LogState>(1, 64);
+        LogSystem.Start(log, ref engAlloc.Persistent, appName: "BringArena", defaultFileName: "engine.log", minLevel: LogLevel.Info, mirrorToConsole: false);
+
+        SaveSystemState* save = engAlloc.Persistent.Alloc<SaveSystemState>(1, 64);
+        SaveSystem.Start(save, ref engAlloc.Persistent, appName: "BringArena", log: log);
+
         EngineWorld* world = engAlloc.Persistent.Alloc<EngineWorld>(1, 64);
         *world = EngineWorld.Create(ref engAlloc.Persistent, maxEntities: 8192, maxParticles: 8192);
 
         BundleManager* bundles = engAlloc.Persistent.Alloc<BundleManager>(1, 64);
-        *bundles = BundleManager.Create(ref engAlloc.Persistent, maxBundles: 16);
+        *bundles = BundleManager.Create(ref engAlloc.Persistent, maxBundles: 16, log: log);
 
         SceneManager* scenes = engAlloc.Persistent.Alloc<SceneManager>(1, 64);
-        *scenes = SceneManager.Create(ref engAlloc.Persistent, maxDefinitions: 16, maxActiveScenes: 8);
+        *scenes = SceneManager.Create(ref engAlloc.Persistent, maxDefinitions: 16, maxActiveScenes: 8, log: log);
 
         FrameProfiler* profiler = engAlloc.Persistent.Alloc<FrameProfiler>(1, 64);
         *profiler = FrameProfiler.Create(ref engAlloc.Persistent, enabled: true, measureGpuWithFence: true);
@@ -246,15 +337,15 @@ public static unsafe class Program
 
         GameLogicContext* logicCtx = engAlloc.Persistent.Alloc<GameLogicContext>(1, 64);
 
-        var window = PlatformSystem.InitWindow("Bring Engine — Bring Arena", 1280, 720, hidden: verifyRender, mode: windowMode);
+        var window = PlatformSystem.InitWindow("Bring Engine — Bring Arena", 1280, 720, hidden: verifyRender, mode: windowMode, log: log);
         GpuContext* gpu = engAlloc.Persistent.Alloc<GpuContext>(1, 64);
-        *gpu = GpuSystem.Create(window.Window, ref engAlloc.Persistent, ref world->Assets, debugMode: false);
+        *gpu = GpuSystem.Create(window.Window, ref engAlloc.Persistent, ref world->Assets, debugMode: false, log: log);
         GpuSystem.BindAssetCleanupHooks(gpu, ref world->Assets);
         FramePacerSystem.ApplyVSync(ref *pacer, ref *gpu, vsync);
 
         try
         {
-            ShaderSystem.CompileBuiltinShaders(ref *gpu);
+            ShaderSystem.CompileBuiltinShaders(ref *gpu, log: log);
             string holoPath = Path.Combine(GameAssets.ShadersDir, "hologram_energy.hlsl");
             view->HologramShader = ShaderSystem.CompileFromFile(ref *gpu, holoPath, "hologram_energy", ShaderVertexLayout.Mesh3D, SDL.GPUCullMode.None);
 
@@ -461,8 +552,10 @@ public static unsafe class Program
             ProfilerOverlaySystem.Destroy(ref *profOverlay, ref *world);
             SceneSystem.UnloadAllScenes(ref *scenes, ref *world, ref engAlloc, ref *bundles);
             BundleSystem.UnloadAll(ref *bundles, ref *world);
-            GpuSystem.Dispose(ref *gpu);
+            GpuSystem.Dispose(ref *gpu, ref world->Assets);
             PlatformSystem.Shutdown(ref window);
+            SaveSystem.Stop(save);
+            LogSystem.Stop(log);
             gameAlloc.Dispose();
             engAlloc.Dispose();
         }

@@ -54,7 +54,7 @@ public unsafe struct NetWriter
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool EnsureSpace(int bytes)
     {
-        if (Overflow != 0 || Data == null || bytes < 0 || Position + bytes > Capacity)
+        if (Overflow != 0 || Data == null || bytes < 0 || Position < 0 || Position > Capacity || bytes > Capacity - Position)
         {
             Overflow = 1;
             return false;
@@ -247,7 +247,7 @@ public unsafe struct NetReader
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool EnsureAvailable(int bytes)
     {
-        if (Overflow != 0 || Data == null || bytes < 0 || Position + bytes > Length)
+        if (Overflow != 0 || Data == null || bytes < 0 || Position < 0 || Position > Length || bytes > Length - Position)
         {
             Overflow = 1;
             return false;
@@ -333,6 +333,11 @@ public unsafe struct NetReader
         {
             byte b = ReadByte();
             if (Overflow != 0) return 0;
+            if (i == 4 && b > 0x0Fu)
+            {
+                Overflow = 1;
+                return 0;
+            }
             result |= (uint)(b & 0x7Fu) << shift;
             if ((b & 0x80u) == 0)
                 return result;
@@ -381,6 +386,11 @@ public unsafe struct NetReader
 
     public ReadOnlySpan<byte> ReadBytes(int maxAllowed = int.MaxValue)
     {
+        if (maxAllowed < 0)
+        {
+            Overflow = 1;
+            return ReadOnlySpan<byte>.Empty;
+        }
         uint len = ReadVarUInt32();
         if (Overflow != 0 || len > (uint)maxAllowed || len > (uint)Remaining)
         {

@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using BringEngine.Core.Logging;
 using BringEngine.Core.Math;
 using BringEngine.Simulation.Input;
 using SDL3;
@@ -54,15 +55,23 @@ public static unsafe class PlatformSystem
         int width = 1280,
         int height = 720,
         bool hidden = false,
-        WindowMode mode = WindowMode.BorderlessFullscreen)
+        WindowMode mode = WindowMode.BorderlessFullscreen,
+        LogState* log = null)
     {
         byte gamepadReady = 1;
         if (!SDL.Init(SDL.InitFlags.Video | SDL.InitFlags.Events | SDL.InitFlags.Gamepad))
         {
             // Graceful fallback for restricted headless containers without gamepad support
             gamepadReady = 0;
+            if (log != null)
+                LogSystem.Warn(log, $"SDL_Init with Gamepad failed ({SDL.GetError()}); retrying without Gamepad subsystem");
             if (!SDL.Init(SDL.InitFlags.Video | SDL.InitFlags.Events))
-                throw new InvalidOperationException($"SDL_Init failed: {SDL.GetError()}");
+            {
+                string err = SDL.GetError();
+                if (log != null)
+                    LogSystem.Error(log, $"SDL_Init failed: {err}");
+                throw new InvalidOperationException($"SDL_Init failed: {err}");
+            }
         }
 
         WindowMode effectiveMode = hidden ? WindowMode.Windowed : mode;
@@ -84,7 +93,13 @@ public static unsafe class PlatformSystem
 
         nint win = SDL.CreateWindow(title, width, height, flags);
         if (win == nint.Zero)
-            throw new InvalidOperationException($"SDL_CreateWindow failed: {SDL.GetError()}");
+        {
+            string err = SDL.GetError();
+            if (log != null)
+                LogSystem.Error(log, $"SDL_CreateWindow('{title}', {width}x{height}) failed: {err}");
+            SDL.Quit();
+            throw new InvalidOperationException($"SDL_CreateWindow failed: {err}");
+        }
 
         if (!hidden && effectiveMode == WindowMode.BorderlessFullscreen)
         {
@@ -95,6 +110,11 @@ public static unsafe class PlatformSystem
         SDL.GetWindowSizeInPixels(win, out int pw, out int ph);
         if (pw <= 0) pw = width;
         if (ph <= 0) ph = height;
+
+        if (log != null)
+        {
+            LogSystem.Info(log, $"Platform window initialized: '{title}' mode={(hidden ? "HiddenWindowed" : effectiveMode.ToString())} pixels={pw}x{ph} windowed={width}x{height} gamepad={(gamepadReady != 0 ? "ON" : "OFF")}");
+        }
 
         return new PlatformWindow
         {
@@ -250,6 +270,9 @@ public static unsafe class PlatformSystem
                 case SDL.EventType.WindowFocusLost:
                     win.Focused = 0;
                     input.SetWindowFocused(false);
+                    // Release held keys/mouse buttons while preserving KeysPrev/MouseButtonsPrev so Is*Released fires cleanly
+                    for (int k = 0; k < 8; k++) input.KeysDown[k] = 0;
+                    input.MouseButtonsDown = 0;
                     break;
 
                 case SDL.EventType.WindowMinimized:
@@ -273,6 +296,15 @@ public static unsafe class PlatformSystem
                         win.Width = pw;
                         win.Height = ph;
                         win.Resized = 1;
+                    }
+                    if (win.Mode == WindowMode.Windowed)
+                    {
+                        SDL.GetWindowSize(win.Window, out int ww, out int wh);
+                        if (ww > 0 && wh > 0)
+                        {
+                            win.WindowedWidth = ww;
+                            win.WindowedHeight = wh;
+                        }
                     }
                     break;
 

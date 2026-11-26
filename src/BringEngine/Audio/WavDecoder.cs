@@ -79,8 +79,11 @@ public static unsafe class WavDecoder
 
                 if (formatTag == FormatExtensible && chunkSize >= 40)
                 {
-                    // KSDATAFORMAT_SUBTYPE_PCM (0x0001) or IEEE_FLOAT (0x0003) in first 2 bytes of SubFormat GUID at offset +24
-                    formatTag = BinaryPrimitives.ReadUInt16LittleEndian(wavBytes.Slice(pos + 24, 2));
+                    // KSDATAFORMAT_SUBTYPE_PCM (0x0001) or IEEE_FLOAT (0x0003): validate base GUID tail {xxxxxxxx-0000-0010-8000-00aa00389b71}
+                    if (IsKsDataFormatBaseGuidTail(wavBytes.Slice(pos + 26, 14)))
+                        formatTag = BinaryPrimitives.ReadUInt16LittleEndian(wavBytes.Slice(pos + 24, 2));
+                    else
+                        formatTag = 0;
                 }
                 hasFmt = true;
             }
@@ -91,10 +94,10 @@ public static unsafe class WavDecoder
                 if (hasFmt) break;
             }
 
-            // RIFF chunks are word-aligned (2 bytes)
-            int advance = chunkSize + (chunkSize & 1);
-            if (advance <= 0 || pos + advance > wavBytes.Length) break;
-            pos += advance;
+            // RIFF chunks are word-aligned (2 bytes); 64-bit advance handles 0-byte chunks safely
+            long advance = (long)chunkSize + (chunkSize & 1);
+            if (advance < 0 || pos + advance > wavBytes.Length) break;
+            pos += (int)advance;
         }
 
         if (!hasFmt || dataOffset < 0 || dataSize <= 0) return false;
@@ -123,7 +126,10 @@ public static unsafe class WavDecoder
             if (isFloat)
             {
                 for (int i = 0; i < totalSamples; i++)
-                    dst[i] = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(data.Slice(i * 4, 4)));
+                {
+                    float s = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(data.Slice(i * 4, 4)));
+                    dst[i] = float.IsFinite(s) ? s : 0f;
+                }
             }
             else if (bitsPerSample == 16)
             {
@@ -188,10 +194,25 @@ public static unsafe class WavDecoder
         }
     }
 
+    private static bool IsKsDataFormatBaseGuidTail(ReadOnlySpan<byte> tail14)
+    {
+        return tail14.Length == 14 &&
+               tail14[0] == 0x00 && tail14[1] == 0x00 &&
+               tail14[2] == 0x00 && tail14[3] == 0x00 &&
+               tail14[4] == 0x10 && tail14[5] == 0x00 &&
+               tail14[6] == 0x80 && tail14[7] == 0x00 &&
+               tail14[8] == 0x00 && tail14[9] == 0xAA &&
+               tail14[10] == 0x00 && tail14[11] == 0x38 &&
+               tail14[12] == 0x9B && tail14[13] == 0x71;
+    }
+
     private static float ReadSample(ReadOnlySpan<byte> data, int byteOffset, bool isFloat, ushort bits)
     {
         if (isFloat)
-            return BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(data.Slice(byteOffset, 4)));
+        {
+            float s = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(data.Slice(byteOffset, 4)));
+            return float.IsFinite(s) ? s : 0f;
+        }
         return bits switch
         {
             8 => (data[byteOffset] - 128) * (1.0f / 128.0f),
@@ -208,9 +229,17 @@ public static unsafe class WavDecoder
     /// </summary>
     public static byte[] EncodeWav16(float* interleavedSamples, int frameCount, int channels, int sampleRate)
     {
+        if (interleavedSamples == null || frameCount <= 0 || sampleRate <= 0)
+            return Array.Empty<byte>();
+
         int ch = channels <= 1 ? 1 : 2;
-        int totalSamples = frameCount * ch;
-        int dataBytes = totalSamples * 2;
+        long totalSamplesLong = (long)frameCount * ch;
+        long dataBytesLong = totalSamplesLong * 2;
+        if (dataBytesLong > int.MaxValue - 44)
+            return Array.Empty<byte>();
+
+        int totalSamples = (int)totalSamplesLong;
+        int dataBytes = (int)dataBytesLong;
         byte[] wav = new byte[44 + dataBytes];
         Span<byte> span = wav;
 
@@ -230,7 +259,8 @@ public static unsafe class WavDecoder
 
         for (int i = 0; i < totalSamples; i++)
         {
-            float clamped = DetMath.Clamp(interleavedSamples[i], -1f, 1f);
+            float raw = interleavedSamples[i];
+            float clamped = float.IsFinite(raw) ? DetMath.Clamp(raw, -1f, 1f) : 0f;
             short s16 = (short)(clamped >= 1f ? 32767 : (clamped <= -1f ? -32768 : (int)(clamped * 32767f)));
             BinaryPrimitives.WriteInt16LittleEndian(span.Slice(44 + i * 2, 2), s16);
         }
@@ -247,9 +277,14 @@ public static unsafe class WavDecoder
         float amplitude = 0.5f,
         int channels = 1)
     {
+        if (sampleRate <= 0) sampleRate = 48000;
+        if (!float.IsFinite(frequencyHz) || frequencyHz < 0f) frequencyHz = 0f;
+        if (!float.IsFinite(durationSeconds) || durationSeconds <= 0f) durationSeconds = 0f;
+        if (!float.IsFinite(amplitude)) amplitude = 0f;
+
         int ch = channels <= 1 ? 1 : 2;
-        int frames = (int)(durationSeconds * sampleRate);
-        if (frames < 1) frames = 1;
+        long framesLong = (long)(durationSeconds * sampleRate);
+        int frames = framesLong < 1 ? 1 : (framesLong > int.MaxValue / (ch * sizeof(float)) ? int.MaxValue / (ch * sizeof(float)) : (int)framesLong);
 
         nuint allocBytes = (nuint)((long)frames * ch * sizeof(float));
         float* buf = (float*)NativeMemoryTracker.AlignedAlloc(allocBytes, 64);

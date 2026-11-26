@@ -49,6 +49,7 @@ public unsafe struct TweenData
 {
     public TweenHandle Handle;
     public SceneId OwnerScene;
+    public EntityId OwnerEntity;
     public uint GroupId;
 
     public TweenTargetKind TargetKind;
@@ -96,6 +97,8 @@ public unsafe struct TweenTable
     public int FreeCount;
     public int NextSlot;
     public int ActiveCount;
+    public byte Stepping;
+    public byte StepMutated;
 
     public static TweenTable Create(ref LinearArena arena, int maxTweens = 4096)
     {
@@ -146,6 +149,7 @@ public static unsafe class TweenSystem
         TweenData data = template;
         data.Handle = handle;
         data.Flags |= 1; // Active
+        if (table.Stepping != 0) data.Flags |= 32; // Defer stepping newly-spawned callback tweens to next tick
         if (data.TimeScale <= 0f) data.TimeScale = 1f;
         if (data.Duration <= 0f) data.Duration = 0.0001f;
         table.Dense[denseIdx] = data;
@@ -171,11 +175,12 @@ public static unsafe class TweenSystem
         ref TweenTable table, float* target, float from, float to, float duration,
         EaseType ease = EaseType.OutQuad, float delay = 0f,
         TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
-        SceneId scene = default, uint groupId = 0)
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
     {
         return Spawn(ref table, new TweenData
         {
             OwnerScene = scene,
+            OwnerEntity = ownerEntity,
             GroupId = groupId,
             TargetKind = TweenTargetKind.PtrFloat,
             Ease = ease,
@@ -189,15 +194,39 @@ public static unsafe class TweenSystem
         });
     }
 
-    public static TweenHandle TweenVec3Ptr(
-        ref TweenTable table, Vec3* target, Vec3 from, Vec3 to, float duration,
+    public static TweenHandle PtrVec2(
+        ref TweenTable table, Vec2* target, Vec2 from, Vec2 to, float duration,
         EaseType ease = EaseType.OutQuad, float delay = 0f,
         TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
-        SceneId scene = default, uint groupId = 0)
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
     {
         return Spawn(ref table, new TweenData
         {
             OwnerScene = scene,
+            OwnerEntity = ownerEntity,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.PtrVec2,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = new Vec4(from.X, from.Y, 0, 0),
+            EndValue = new Vec4(to.X, to.Y, 0, 0),
+            TargetPtr = target,
+        });
+    }
+
+    public static TweenHandle TweenVec3Ptr(
+        ref TweenTable table, Vec3* target, Vec3 from, Vec3 to, float duration,
+        EaseType ease = EaseType.OutQuad, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            OwnerEntity = ownerEntity,
             GroupId = groupId,
             TargetKind = TweenTargetKind.PtrVec3,
             Ease = ease,
@@ -211,15 +240,39 @@ public static unsafe class TweenSystem
         });
     }
 
-    public static TweenHandle TweenColorPtr(
-        ref TweenTable table, ColorF* target, ColorF from, ColorF to, float duration,
+    public static TweenHandle PtrVec4(
+        ref TweenTable table, Vec4* target, Vec4 from, Vec4 to, float duration,
         EaseType ease = EaseType.OutQuad, float delay = 0f,
         TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
-        SceneId scene = default, uint groupId = 0)
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
     {
         return Spawn(ref table, new TweenData
         {
             OwnerScene = scene,
+            OwnerEntity = ownerEntity,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.PtrVec4,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = from,
+            EndValue = to,
+            TargetPtr = target,
+        });
+    }
+
+    public static TweenHandle TweenColorPtr(
+        ref TweenTable table, ColorF* target, ColorF from, ColorF to, float duration,
+        EaseType ease = EaseType.OutQuad, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            OwnerEntity = ownerEntity,
             GroupId = groupId,
             TargetKind = TweenTargetKind.PtrColorF,
             Ease = ease,
@@ -233,15 +286,39 @@ public static unsafe class TweenSystem
         });
     }
 
-    public static TweenHandle TweenFix32Ptr(
-        ref TweenTable table, Fix32* target, Fix32 from, Fix32 to, float duration,
-        EaseType ease = EaseType.OutQuad, float delay = 0f,
+    public static TweenHandle PtrQuat(
+        ref TweenTable table, Quat* target, Quat from, Quat to, float duration,
+        EaseType ease = EaseType.InOutQuad, float delay = 0f,
         TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
-        SceneId scene = default, uint groupId = 0)
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
     {
         return Spawn(ref table, new TweenData
         {
             OwnerScene = scene,
+            OwnerEntity = ownerEntity,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.PtrQuat,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = new Vec4(from.X, from.Y, from.Z, from.W),
+            EndValue = new Vec4(to.X, to.Y, to.Z, to.W),
+            TargetPtr = target,
+        });
+    }
+
+    public static TweenHandle TweenFix32Ptr(
+        ref TweenTable table, Fix32* target, Fix32 from, Fix32 to, float duration,
+        EaseType ease = EaseType.OutQuad, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            OwnerEntity = ownerEntity,
             GroupId = groupId,
             TargetKind = TweenTargetKind.PtrFix32,
             Ease = ease,
@@ -255,6 +332,29 @@ public static unsafe class TweenSystem
         });
     }
 
+    public static TweenHandle PtrFixVec3(
+        ref TweenTable table, FixVec3* target, FixVec3 from, FixVec3 to, float duration,
+        EaseType ease = EaseType.OutQuad, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            OwnerEntity = ownerEntity,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.PtrFixVec3,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = new Vec4(from.X.ToFloat(), from.Y.ToFloat(), from.Z.ToFloat(), 0),
+            EndValue = new Vec4(to.X.ToFloat(), to.Y.ToFloat(), to.Z.ToFloat(), 0),
+            TargetPtr = target,
+        });
+    }
+
     public static TweenHandle TweenTransformPos(
         ref TweenTable table, EntityId entity, Vec3 from, Vec3 to, float duration,
         EaseType ease = EaseType.OutCubic, float delay = 0f,
@@ -264,6 +364,7 @@ public static unsafe class TweenSystem
         return Spawn(ref table, new TweenData
         {
             OwnerScene = scene,
+            OwnerEntity = entity,
             GroupId = groupId,
             TargetKind = TweenTargetKind.TransformPosition,
             Ease = ease,
@@ -286,6 +387,7 @@ public static unsafe class TweenSystem
         return Spawn(ref table, new TweenData
         {
             OwnerScene = scene,
+            OwnerEntity = entity,
             GroupId = groupId,
             TargetKind = TweenTargetKind.TransformScale,
             Ease = ease,
@@ -308,6 +410,7 @@ public static unsafe class TweenSystem
         return Spawn(ref table, new TweenData
         {
             OwnerScene = scene,
+            OwnerEntity = entity,
             GroupId = groupId,
             TargetKind = TweenTargetKind.TransformRotation,
             Ease = ease,
@@ -318,6 +421,28 @@ public static unsafe class TweenSystem
             StartValue = new Vec4(from.X, from.Y, from.Z, from.W),
             EndValue = new Vec4(to.X, to.Y, to.Z, to.W),
             TargetHandleRaw = entity.Raw,
+        });
+    }
+
+    public static TweenHandle CameraPosition(
+        ref TweenTable table, CameraHandle camera, Vec3 from, Vec3 to, float duration,
+        EaseType ease = EaseType.OutCubic, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.CameraPosition,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = new Vec4(from, 0),
+            EndValue = new Vec4(to, 0),
+            TargetHandleRaw = camera.Raw,
         });
     }
 
@@ -338,11 +463,94 @@ public static unsafe class TweenSystem
         });
     }
 
+    public static TweenHandle CameraOrthoHeight(
+        ref TweenTable table, CameraHandle camera, float fromHeight, float toHeight, float duration,
+        EaseType ease = EaseType.OutCubic, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.CameraOrthoHeight,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = new Vec4(fromHeight, 0, 0, 0),
+            EndValue = new Vec4(toHeight, 0, 0, 0),
+            TargetHandleRaw = camera.Raw,
+        });
+    }
+
+    public static TweenHandle CameraOrbitYaw(
+        ref TweenTable table, CameraHandle camera, float fromYaw, float toYaw, float duration,
+        EaseType ease = EaseType.OutCubic, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.CameraOrbitYaw,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = new Vec4(fromYaw, 0, 0, 0),
+            EndValue = new Vec4(toYaw, 0, 0, 0),
+            TargetHandleRaw = camera.Raw,
+        });
+    }
+
+    public static TweenHandle CameraOrbitDistance(
+        ref TweenTable table, CameraHandle camera, float fromDist, float toDist, float duration,
+        EaseType ease = EaseType.OutCubic, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.CameraOrbitDistance,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = new Vec4(fromDist, 0, 0, 0),
+            EndValue = new Vec4(toDist, 0, 0, 0),
+            TargetHandleRaw = camera.Raw,
+        });
+    }
+
+    public static bool Pause(ref TweenTable table, TweenHandle handle)
+    {
+        TweenData* ptr = TryGetPtr(in table, handle);
+        if (ptr == null) return false;
+        ptr->Flags |= 2;
+        return true;
+    }
+
+    public static bool Resume(ref TweenTable table, TweenHandle handle)
+    {
+        TweenData* ptr = TryGetPtr(in table, handle);
+        if (ptr == null) return false;
+        ptr->Flags = (byte)(ptr->Flags & ~2);
+        return true;
+    }
+
     /// <summary>
     /// Chains 'next' to start automatically when 'first' completes (Tween Sequence!).
     /// </summary>
     public static void Chain(ref TweenTable table, TweenHandle first, TweenHandle next)
     {
+        if (first == next) return;
         TweenData* f = TryGetPtr(in table, first);
         TweenData* n = TryGetPtr(in table, next);
         if (f == null || n == null) return;
@@ -354,8 +562,7 @@ public static unsafe class TweenSystem
     {
         TweenData* ptr = TryGetPtr(in table, handle);
         if (ptr == null) return false;
-        int denseIdx = (int)(ptr - table.Dense);
-        RemoveDenseAt(ref table, denseIdx);
+        KillChainFromDense(ref table, (int)(ptr - table.Dense));
         return true;
     }
 
@@ -363,8 +570,8 @@ public static unsafe class TweenSystem
     {
         for (int i = table.ActiveCount - 1; i >= 0; i--)
         {
-            if (table.Dense[i].OwnerScene == scene)
-                RemoveDenseAt(ref table, i);
+            if (i < table.ActiveCount && table.Dense[i].OwnerScene == scene)
+                KillChainFromDense(ref table, i);
         }
     }
 
@@ -372,8 +579,25 @@ public static unsafe class TweenSystem
     {
         for (int i = table.ActiveCount - 1; i >= 0; i--)
         {
-            if (table.Dense[i].GroupId == groupId)
-                RemoveDenseAt(ref table, i);
+            if (i < table.ActiveCount && table.Dense[i].GroupId == groupId)
+                KillChainFromDense(ref table, i);
+        }
+    }
+
+    public static void KillByEntity(ref TweenTable table, EntityId entity)
+    {
+        if (!entity.IsValid) return;
+        for (int i = table.ActiveCount - 1; i >= 0; i--)
+        {
+            if (i >= table.ActiveCount) continue;
+            ref readonly TweenData tw = ref table.Dense[i];
+            bool matchesOwner = tw.OwnerEntity == entity;
+            bool matchesTransformTarget = (tw.TargetKind == TweenTargetKind.TransformPosition
+                || tw.TargetKind == TweenTargetKind.TransformScale
+                || tw.TargetKind == TweenTargetKind.TransformRotation)
+                && tw.TargetHandleRaw == entity.Raw;
+            if (matchesOwner || matchesTransformTarget)
+                KillChainFromDense(ref table, i);
         }
     }
 
@@ -386,6 +610,26 @@ public static unsafe class TweenSystem
                 if (paused) table.Dense[i].Flags |= 2;
                 else table.Dense[i].Flags = (byte)(table.Dense[i].Flags & ~2);
             }
+        }
+    }
+
+    private static void KillChainFromDense(ref TweenTable table, int denseIdx)
+    {
+        if (table.Stepping != 0) table.StepMutated = 1;
+        TweenHandle next = table.Dense[denseIdx].NextInSequence;
+        table.Dense[denseIdx].NextInSequence = TweenHandle.Invalid;
+        RemoveDenseAt(ref table, denseIdx);
+
+        int guard = 0;
+        while (next.IsValid && guard < table.Capacity)
+        {
+            TweenData* np = TryGetPtr(in table, next);
+            if (np == null) break;
+            TweenHandle nextNext = np->NextInSequence;
+            np->NextInSequence = TweenHandle.Invalid;
+            RemoveDenseAt(ref table, (int)(np - table.Dense));
+            next = nextNext;
+            guard++;
         }
     }
 
@@ -408,7 +652,7 @@ public static unsafe class TweenSystem
 
     /// <summary>
     /// Advances all active tweens linearly in cache-friendly order and writes interpolated values.
-    /// Zero heap allocations.
+    /// Re-entrancy safe against OnStep/OnComplete mutations and slot-order-independent for sequences. Zero heap allocations.
     /// </summary>
     public static void StepAll(
         ref TweenTable table,
@@ -416,73 +660,127 @@ public static unsafe class TweenSystem
         ref CameraTable cameras,
         float dt)
     {
-        int i = 0;
-        while (i < table.ActiveCount)
-        {
-            ref TweenData tw = ref table.Dense[i];
-            if (tw.IsPaused || tw.IsWaitingInSequence)
-            {
-                i++;
-                continue;
-            }
+        if (table.ActiveCount == 0) return;
 
-            float step = dt * tw.TimeScale;
-            if (tw.Delay > 0f)
+        for (int k = 0; k < table.ActiveCount; k++)
+            table.Dense[k].Flags = (byte)(table.Dense[k].Flags & ~32);
+
+        table.Stepping = 1;
+        table.StepMutated = 0;
+        try
+        {
+            int i = 0;
+            while (i < table.ActiveCount)
             {
-                tw.Delay -= step;
-                if (tw.Delay > 0f)
+                ref TweenData tw = ref table.Dense[i];
+                if ((tw.Flags & 32) != 0 || tw.IsPaused || tw.IsWaitingInSequence)
                 {
                     i++;
                     continue;
                 }
-                step = -tw.Delay;
-                tw.Delay = 0f;
-            }
 
-            tw.Elapsed += step;
-            float rawT = tw.Elapsed / tw.Duration;
-            bool finishedPass = rawT >= 1f;
-            float clampedT = DetMath.Clamp01(rawT);
-            float evalT = tw.IsReversed ? (1f - clampedT) : clampedT;
-            float eased = tw.UseCustomCurve ? tw.Curve.Evaluate(evalT) : Easing.Evaluate(tw.Ease, evalT);
+                tw.Flags |= 32; // Mark SteppedThisPass before any callback
+                TweenHandle handle = tw.Handle;
 
-            ApplyValue(in tw, eased, ref transforms, ref cameras);
-
-            if (finishedPass)
-            {
-                bool shouldLoop = tw.LoopMode != TweenLoopMode.Once && (tw.RemainingLoops != 0);
-                if (shouldLoop)
+                float step = dt * tw.TimeScale;
+                if (tw.Delay > 0f)
                 {
-                    if (tw.RemainingLoops > 0) tw.RemainingLoops--;
-                    tw.Elapsed -= tw.Duration;
-                    if (tw.LoopMode == TweenLoopMode.PingPong)
-                        tw.Flags ^= 4; // toggle Reversed
-                    i++;
+                    tw.Delay -= step;
+                    if (tw.Delay > 0f)
+                    {
+                        i++;
+                        continue;
+                    }
+                    step = -tw.Delay;
+                    tw.Delay = 0f;
+                }
+
+                tw.Elapsed += step;
+                float rawT = tw.Elapsed / tw.Duration;
+                bool finishedPass = rawT >= 1f;
+                float clampedT = DetMath.Clamp01(rawT);
+                float evalT = tw.IsReversed ? (1f - clampedT) : clampedT;
+                float eased = tw.UseCustomCurve ? tw.Curve.Evaluate(evalT) : Easing.Evaluate(tw.Ease, evalT);
+
+                ApplyValue(in tw, eased, ref transforms, ref cameras);
+
+                // Re-validate handle after ApplyValue because CustomCallback OnStep may kill/mutate tweens
+                TweenData* postPtr = TryGetPtr(in table, handle);
+                if (postPtr == null)
+                {
+                    if (table.StepMutated != 0)
+                    {
+                        table.StepMutated = 0;
+                        i = 0;
+                    }
+                    continue;
+                }
+
+                int curIdx = (int)(postPtr - table.Dense);
+                if (finishedPass)
+                {
+                    bool shouldLoop = postPtr->LoopMode != TweenLoopMode.Once && (postPtr->RemainingLoops != 0);
+                    if (shouldLoop)
+                    {
+                        if (postPtr->RemainingLoops > 0) postPtr->RemainingLoops--;
+                        postPtr->Elapsed -= postPtr->Duration;
+                        if (postPtr->LoopMode == TweenLoopMode.PingPong)
+                            postPtr->Flags ^= 4; // toggle Reversed
+                        if (table.StepMutated != 0) { table.StepMutated = 0; i = 0; }
+                        else i++;
+                    }
+                    else
+                    {
+                        TweenHandle next = postPtr->NextInSequence;
+                        var onComplete = postPtr->OnComplete;
+                        uint userData = postPtr->UserData;
+                        postPtr->NextInSequence = TweenHandle.Invalid;
+
+                        RemoveDenseAt(ref table, curIdx);
+
+                        if (next.IsValid)
+                        {
+                            TweenData* nextPtr = TryGetPtr(in table, next);
+                            if (nextPtr != null)
+                            {
+                                // Release sequence wait and mark SteppedThisPass so wakeup happens uniformly next tick regardless of slot order
+                                nextPtr->Flags = (byte)((nextPtr->Flags & ~16) | 32);
+                            }
+                        }
+
+                        if (onComplete != null)
+                            onComplete(userData);
+
+                        if (table.StepMutated != 0)
+                        {
+                            table.StepMutated = 0;
+                            i = 0;
+                        }
+                        else if (curIdx != i)
+                        {
+                            // A callback shifted our tween before removal; restart safely
+                            i = 0;
+                        }
+                    }
                 }
                 else
                 {
-                    TweenHandle next = tw.NextInSequence;
-                    var onComplete = tw.OnComplete;
-                    uint userData = tw.UserData;
-
-                    RemoveDenseAt(ref table, i);
-
-                    if (next.IsValid)
+                    if (table.StepMutated != 0)
                     {
-                        TweenData* nextPtr = TryGetPtr(in table, next);
-                        if (nextPtr != null)
-                            nextPtr->Flags = (byte)(nextPtr->Flags & ~16); // release sequence wait
+                        table.StepMutated = 0;
+                        i = 0;
                     }
-
-                    if (onComplete != null)
-                        onComplete(userData);
-                    // Note: do NOT increment i because swap-back moved last item into index i
+                    else
+                    {
+                        i++;
+                    }
                 }
             }
-            else
-            {
-                i++;
-            }
+        }
+        finally
+        {
+            table.Stepping = 0;
+            table.StepMutated = 0;
         }
     }
 

@@ -30,6 +30,7 @@ public unsafe struct TransformTable
     public int Capacity;
     public int Count;
     public byte MaxDepth;
+    public byte NeedsDepthRecompute;
 
     public static TransformTable Create(ref LinearArena arena, int maxEntities, int transformCapacity)
     {
@@ -68,6 +69,24 @@ public static unsafe class TransformSystem
         return (d >= 0 && d < table.Count && table.DenseEntity[d] == entity) ? d : -1;
     }
 
+    private static bool WouldCreateCycle(in TransformTable table, EntityId entity, EntityId parent)
+    {
+        if (!parent.IsValid) return false;
+        if (parent == entity) return true;
+        EntityId cur = parent;
+        int steps = 0;
+        int maxSteps = table.Count;
+        while (cur.IsValid && steps < maxSteps)
+        {
+            if (cur == entity) return true;
+            int cd = GetDenseIndex(in table, cur);
+            if (cd < 0) break;
+            cur = table.Parent[cd];
+            steps++;
+        }
+        return false;
+    }
+
     public static int Add(
         ref TransformTable table,
         EntityId entity,
@@ -76,15 +95,25 @@ public static unsafe class TransformSystem
         Vec3 localScale,
         EntityId parent = default)
     {
+        if (!entity.IsValid || entity.Index >= (uint)table.MaxEntities)
+            return -1;
+
+        if (WouldCreateCycle(in table, entity, parent))
+            parent = EntityId.Invalid;
+
         int existing = GetDenseIndex(in table, entity);
         if (existing >= 0)
         {
+            EntityId oldParent = table.Parent[existing];
             table.LocalPosition[existing] = localPosition;
             table.LocalRotation[existing] = localRotation;
             table.LocalScale[existing] = localScale;
             table.Parent[existing] = parent;
             table.Dirty[existing] = 1;
-            RecomputeDepth(ref table, existing);
+            if (parent.IsValid && GetDenseIndex(in table, parent) < 0)
+                table.NeedsDepthRecompute = 1;
+            if (oldParent != parent || table.NeedsDepthRecompute != 0)
+                RecomputeAllDepths(ref table);
             return existing;
         }
 
@@ -101,7 +130,14 @@ public static unsafe class TransformSystem
         table.Dirty[d] = 1;
         table.WorldMatrix[d] = Mat4.CreateTRS(localPosition, localRotation, localScale);
         table.WorldPosition[d] = localPosition;
-        RecomputeDepth(ref table, d);
+
+        if (parent.IsValid && GetDenseIndex(in table, parent) < 0)
+            table.NeedsDepthRecompute = 1;
+
+        if (table.NeedsDepthRecompute != 0)
+            RecomputeAllDepths(ref table);
+        else
+            RecomputeDepth(ref table, d);
         return d;
     }
 
@@ -113,6 +149,16 @@ public static unsafe class TransformSystem
     {
         int d = GetDenseIndex(in table, entity);
         if (d < 0) return false;
+
+        // Detach any direct children before removing so no dangling Parent links remain
+        for (int i = 0; i < table.Count; i++)
+        {
+            if (table.Parent[i] == entity)
+            {
+                table.Parent[i] = EntityId.Invalid;
+                table.Dirty[i] = 1;
+            }
+        }
 
         int last = --table.Count;
         if (d != last)
@@ -130,6 +176,7 @@ public static unsafe class TransformSystem
             table.EntityToDense[moved.Index] = d;
         }
         table.EntityToDense[entity.Index] = -1;
+        RecomputeAllDepths(ref table);
         return true;
     }
 
@@ -164,33 +211,46 @@ public static unsafe class TransformSystem
     {
         int d = GetDenseIndex(in table, entity);
         if (d < 0) return;
+        if (WouldCreateCycle(in table, entity, parent)) return;
         table.Parent[d] = parent;
         table.Dirty[d] = 1;
         RecomputeAllDepths(ref table);
     }
 
-    private static void RecomputeDepth(ref TransformTable table, int denseIdx)
+    private static bool RecomputeDepth(ref TransformTable table, int denseIdx)
     {
         byte depth = 0;
+        bool hasUnresolved = false;
         EntityId p = table.Parent[denseIdx];
+        int maxWalk = table.Count < 254 ? table.Count : 254;
         int guard = 0;
-        while (p.IsValid && guard < 32)
+        while (p.IsValid && guard < maxWalk)
         {
             int pd = GetDenseIndex(in table, p);
-            if (pd < 0) break;
+            if (pd < 0)
+            {
+                hasUnresolved = true;
+                break;
+            }
             depth++;
             p = table.Parent[pd];
             guard++;
         }
         table.Depth[denseIdx] = depth;
         if (depth > table.MaxDepth) table.MaxDepth = depth;
+        return hasUnresolved;
     }
 
     public static void RecomputeAllDepths(ref TransformTable table)
     {
         table.MaxDepth = 0;
+        bool anyUnresolved = false;
         for (int i = 0; i < table.Count; i++)
-            RecomputeDepth(ref table, i);
+        {
+            if (RecomputeDepth(ref table, i))
+                anyUnresolved = true;
+        }
+        table.NeedsDepthRecompute = (byte)(anyUnresolved ? 1 : 0);
     }
 
     /// <summary>
@@ -248,6 +308,8 @@ public static unsafe class TransformSystem
     {
         int count = table.Count;
         if (count == 0) return;
+        if (table.NeedsDepthRecompute != 0)
+            RecomputeAllDepths(ref table);
 
         fixed (TransformTable* tPtr = &table)
         {

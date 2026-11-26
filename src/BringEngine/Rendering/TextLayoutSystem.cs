@@ -12,7 +12,7 @@ using BringEngine.Simulation.World;
 namespace BringEngine.Rendering;
 
 /// <summary>
-/// GPU-ready 128-byte SDF glyph instance matching sdf_text.hlsl exactly.
+/// GPU-ready 144-byte SDF glyph instance matching sdf_text.hlsl exactly.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct GlyphGpuInstance
@@ -24,7 +24,8 @@ public struct GlyphGpuInstance
     public ColorF FillColor;
     public ColorF OutlineColor;
     public ColorF GlowColor;
-    public Vec4 StyleParams;    // x = onEdge (0.706), y = outlineWidth, z = softness, w = glowIntensity
+    public Vec4 StyleParams;    // x = onEdge (0.502), y = outlineWidth, z = softness, w = glowIntensity
+    public Vec4 CustomParams;   // tweenable custom shader parameters forwarded from TextData.CustomParams
 }
 
 /// <summary>
@@ -62,10 +63,11 @@ public static unsafe class TextLayoutSystem
         ArenaMarker mark = scratchArena.SaveMarker();
         try
         {
+            int maxLines = totalChars + 1;
             LaidChar* laid = scratchArena.AllocUninitialized<LaidChar>(totalChars, 16);
-            int* lineStarts = scratchArena.AllocUninitialized<int>(64, 16);
-            int* lineEnds = scratchArena.AllocUninitialized<int>(64, 16);
-            float* lineWidths = scratchArena.AllocUninitialized<float>(64, 16);
+            int* lineStarts = scratchArena.AllocUninitialized<int>(maxLines, 16);
+            int* lineEnds = scratchArena.AllocUninitialized<int>(maxLines, 16);
+            float* lineWidths = scratchArena.AllocUninitialized<float>(maxLines, 16);
 
             int laidCount = 0;
             int lineCount = 0;
@@ -82,9 +84,17 @@ public static unsafe class TextLayoutSystem
             for (int c = 0; c < totalChars; c++)
             {
                 byte ch = utf8[c];
+                if ((ch & 0x80) != 0)
+                {
+                    // Collapse multi-byte UTF-8 sequence into a single fallback glyph
+                    while (c + 1 < totalChars && (utf8[c + 1] & 0xC0) == 0x80)
+                        c++;
+                    ch = (byte)'?';
+                }
+
                 if (ch == (byte)'\n')
                 {
-                    if (lineCount < 63)
+                    if (lineCount + 1 < maxLines)
                     {
                         lineEnds[lineCount] = laidCount;
                         lineWidths[lineCount] = penX;
@@ -106,22 +116,33 @@ public static unsafe class TextLayoutSystem
                     penX += font.AsciiKerning[prevGlyph * SdfFontLoader.AsciiCount + gi];
 
                 // Word wrap check
-                if (penX + gm.Advance > maxLocalWidth && penX > 0f && lineCount < 63)
+                if (penX + gm.Advance > maxLocalWidth && penX > 0f && lineCount + 1 < maxLines)
                 {
                     if (lastSpaceLaidIdx >= lineStarts[lineCount] && lastSpaceLaidIdx < laidCount)
                     {
-                        float shiftX = laid[lastSpaceLaidIdx].X;
                         lineEnds[lineCount] = lastSpaceLaidIdx;
                         lineWidths[lineCount] = lastSpacePenX;
                         lineCount++;
-                        lineStarts[lineCount] = lastSpaceLaidIdx;
+
+                        // Skip the trailing space itself so the wrapped line starts flush at X = 0
+                        int nextStart = lastSpaceLaidIdx + 1;
+                        lineStarts[lineCount] = nextStart;
                         penY -= lineHeight;
-                        for (int k = lastSpaceLaidIdx; k < laidCount; k++)
+                        if (nextStart < laidCount)
                         {
-                            laid[k].X -= shiftX;
-                            laid[k].Y -= lineHeight;
+                            float shiftX = laid[nextStart].X;
+                            for (int k = nextStart; k < laidCount; k++)
+                            {
+                                laid[k].X -= shiftX;
+                                laid[k].Y -= lineHeight;
+                            }
+                            penX -= shiftX;
                         }
-                        penX -= shiftX;
+                        else
+                        {
+                            penX = 0f;
+                            prevGlyph = -1;
+                        }
                         lastSpaceLaidIdx = -1;
                     }
                     else
@@ -132,6 +153,14 @@ public static unsafe class TextLayoutSystem
                         lineStarts[lineCount] = laidCount;
                         penX = 0f;
                         penY -= lineHeight;
+                        prevGlyph = -1;
+                        lastSpaceLaidIdx = -1;
+                    }
+
+                    if (ch == (byte)' ')
+                    {
+                        prevGlyph = -1;
+                        continue;
                     }
                 }
 
@@ -146,7 +175,7 @@ public static unsafe class TextLayoutSystem
                 prevGlyph = gi;
             }
 
-            if (lineCount < 64)
+            if (lineCount < maxLines)
             {
                 lineEnds[lineCount] = laidCount;
                 lineWidths[lineCount] = penX;
@@ -299,6 +328,7 @@ public static unsafe class TextLayoutSystem
                         OutlineColor = shCol,
                         GlowColor = ColorF.Transparent,
                         StyleParams = new Vec4(onEdge, td.OutlineWidth, td.Softness * 2.2f, 0f),
+                        CustomParams = td.CustomParams,
                     });
                     emitted++;
                 }
@@ -319,6 +349,7 @@ public static unsafe class TextLayoutSystem
                         OutlineColor = outCol,
                         GlowColor = td.GlowColor,
                         StyleParams = new Vec4(onEdge, td.OutlineWidth, td.Softness, glowInt),
+                        CustomParams = td.CustomParams,
                     });
                     emitted++;
                 }

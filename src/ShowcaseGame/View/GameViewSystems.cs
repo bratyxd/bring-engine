@@ -79,7 +79,7 @@ public static unsafe class GameViewSystems
             Name = StringId.Hash("title_rune"),
             StartFrame = 4, FrameCount = 4, Columns = 4, Rows = 2, Fps = 6f, Loop = 1,
         });
-        v->TitleRuneAnimIdx = AnimationSystem.AddSpritePlayer(ref w.Animations, v->TitleRuneEntity, runeClip, sc);
+        v->TitleRuneAnim = AnimationSystem.AddSpritePlayer(ref w.Animations, v->TitleRuneEntity, runeClip, sc);
 
         // Giant 3D Animated & Shadered SDF Title Text!
         FontHandle font = AssetSystem.FindFont(in w.Assets, StringId.Hash("main_font"));
@@ -156,8 +156,9 @@ public static unsafe class GameViewSystems
         // Spin energy core & update animated rune UV
         TransformSystem.SetLocalRotation(ref w.Transforms, v->TitleCoreEntity, Quat.FromAxisAngle(Vec3.UnitY, v->TitleOrbitAngle * 2.2f));
         SpriteData* runeSp = RenderComponentSystem.TryGetSprite(in w.RenderComponents, v->TitleRuneSprite);
-        if (runeSp != null && (uint)v->TitleRuneAnimIdx < (uint)w.Animations.SpritePlayerCount)
-            runeSp->UvRect = w.Animations.SpritePlayers[v->TitleRuneAnimIdx].CurrentUvRect;
+        SpriteAnimPlayerData* runeAnim = AnimationSystem.TryGetSpritePlayer(in w.Animations, v->TitleRuneAnim);
+        if (runeSp != null && runeAnim != null)
+            runeSp->UvRect = runeAnim->CurrentUvRect;
 
         if (w.Input.IsKeyPressed(KeyCode.Return) || w.Input.IsKeyPressed(KeyCode.Space))
             v->RequestStartArena = 1;
@@ -178,7 +179,7 @@ public static unsafe class GameViewSystems
         // Clear view handle tables
         for (int i = 0; i < GameSimState.MaxEnemies; i++) { v->EnemyEntities[i] = EntityId.Invalid; v->EnemyHpBarEntities[i] = EntityId.Invalid; v->EnemyHpBars[i] = SpriteHandle.Invalid; }
         for (int i = 0; i < GameSimState.MaxProjectiles; i++) { v->ProjEntities[i] = EntityId.Invalid; v->ProjSprites[i] = SpriteHandle.Invalid; }
-        for (int i = 0; i < GameSimState.MaxPickups; i++) { v->PickupEntities[i] = EntityId.Invalid; v->PickupSprites[i] = SpriteHandle.Invalid; v->PickupSpriteAnims[i] = -1; }
+        for (int i = 0; i < GameSimState.MaxPickups; i++) { v->PickupEntities[i] = EntityId.Invalid; v->PickupSprites[i] = SpriteHandle.Invalid; v->PickupSpriteAnims[i] = SpriteAnimPlayerHandle.Invalid; }
         for (int i = 0; i < GameViewState.MaxFloatingTexts; i++) v->FloatingTexts[i] = default;
 
         // 1. Checkered PBR Arena Floor
@@ -227,7 +228,13 @@ public static unsafe class GameViewSystems
             Name = StringId.Hash("arena_rune"),
             StartFrame = 4, FrameCount = 4, Columns = 4, Rows = 2, Fps = 7f, Loop = 1,
         });
-        v->FloorRuneAnimIdx = AnimationSystem.AddSpritePlayer(ref w.Animations, v->FloorRuneEntity, runeClip, sc);
+        v->FloorRuneAnim = AnimationSystem.AddSpritePlayer(ref w.Animations, v->FloorRuneEntity, runeClip, sc);
+
+        v->PickupStarClipIndex = AnimationSystem.RegisterSpriteClip(ref w.Animations, new SpriteAnimClipData
+        {
+            Name = StringId.Hash("pickup_star"),
+            StartFrame = 0, FrameCount = 4, Columns = 4, Rows = 2, Fps = 8f, Loop = 1,
+        });
 
         // 5. Player Skinned Animated Hero Mech (.glb)
         GltfHandle heroGltf = AssetSystem.FindGltf(in w.Assets, StringId.Hash("arena_hero"));
@@ -313,8 +320,9 @@ public static unsafe class GameViewSystems
         // Spin central hologram core & rune sprite
         TransformSystem.SetLocalRotation(ref w.Transforms, v->CoreEntity, Quat.FromAxisAngle(Vec3.UnitY, w.TotalTime * 1.4f));
         SpriteData* runeSp = RenderComponentSystem.TryGetSprite(in w.RenderComponents, v->FloorRuneSprite);
-        if (runeSp != null && (uint)v->FloorRuneAnimIdx < (uint)w.Animations.SpritePlayerCount)
-            runeSp->UvRect = w.Animations.SpritePlayers[v->FloorRuneAnimIdx].CurrentUvRect;
+        SpriteAnimPlayerData* runeAnim = AnimationSystem.TryGetSpritePlayer(in w.Animations, v->FloorRuneAnim);
+        if (runeSp != null && runeAnim != null)
+            runeSp->UvRect = runeAnim->CurrentUvRect;
 
         // 2. Sync Enemies (skinned glTF models + 3D billboarded 2D health bar sprites!)
         GltfHandle chaserGltf = AssetSystem.FindGltf(in w.Assets, StringId.Hash("arena_chaser"));
@@ -445,24 +453,20 @@ public static unsafe class GameViewSystems
                         DepthTest = 1,
                         Visible = 1,
                     });
-                    int starClip = AnimationSystem.RegisterSpriteClip(ref w.Animations, new SpriteAnimClipData
-                    {
-                        Name = StringId.Hash("pickup_star"),
-                        StartFrame = 0, FrameCount = 4, Columns = 4, Rows = 2, Fps = 8f, Loop = 1,
-                    });
-                    v->PickupSpriteAnims[i] = AnimationSystem.AddSpritePlayer(ref w.Animations, ke, starClip, sc);
+                    v->PickupSpriteAnims[i] = AnimationSystem.AddSpritePlayer(ref w.Animations, ke, v->PickupStarClipIndex, sc);
                 }
                 TransformSystem.SetLocalPosition(ref w.Transforms, v->PickupEntities[i], pos);
                 SpriteData* psp = RenderComponentSystem.TryGetSprite(in w.RenderComponents, v->PickupSprites[i]);
-                if (psp != null && (uint)v->PickupSpriteAnims[i] < (uint)w.Animations.SpritePlayerCount)
-                    psp->UvRect = w.Animations.SpritePlayers[v->PickupSpriteAnims[i]].CurrentUvRect;
+                SpriteAnimPlayerData* pickupAnim = AnimationSystem.TryGetSpritePlayer(in w.Animations, v->PickupSpriteAnims[i]);
+                if (psp != null && pickupAnim != null)
+                    psp->UvRect = pickupAnim->CurrentUvRect;
             }
             else if (v->PickupEntities[i].IsValid)
             {
                 EngineWorldSystem.DestroyEntity(ref w, v->PickupEntities[i]);
                 v->PickupEntities[i] = EntityId.Invalid;
                 v->PickupSprites[i] = SpriteHandle.Invalid;
-                v->PickupSpriteAnims[i] = -1;
+                v->PickupSpriteAnims[i] = SpriteAnimPlayerHandle.Invalid;
             }
         }
 

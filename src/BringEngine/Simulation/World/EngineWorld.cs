@@ -59,10 +59,37 @@ public static unsafe class EngineWorldSystem
     public static void DestroyEntity(ref EngineWorld world, EntityId entity)
     {
         if (!EntitySystem.IsAlive(in world.Entities, entity)) return;
-        TransformSystem.Remove(ref world.Transforms, entity);
-        AnimationSystem.RemoveByEntity(ref world.Animations, entity);
-        RenderComponentSystem.RemoveByEntity(ref world.RenderComponents, entity);
-        EntitySystem.Destroy(ref world.Entities, entity);
+
+        // Iterative zero-GC DFS over transform hierarchy so child/descendant entities (e.g. glTF sub-nodes) are destroyed too
+        const int StackCap = 256;
+        EntityId* stack = stackalloc EntityId[StackCap];
+        int sp = 0;
+        stack[sp++] = entity;
+
+        while (sp > 0)
+        {
+            EntityId cur = stack[--sp];
+            if (!EntitySystem.IsAlive(in world.Entities, cur)) continue;
+
+            // Collect direct children before TransformSystem.Remove clears their Parent links
+            for (int i = 0; i < world.Transforms.Count; i++)
+            {
+                if (world.Transforms.Parent[i] == cur)
+                {
+                    EntityId child = world.Transforms.DenseEntity[i];
+                    if (sp < StackCap)
+                        stack[sp++] = child;
+                    else
+                        DestroyEntity(ref world, child);
+                }
+            }
+
+            TransformSystem.Remove(ref world.Transforms, cur);
+            AnimationSystem.RemoveByEntity(ref world.Animations, cur);
+            RenderComponentSystem.RemoveByEntity(ref world.RenderComponents, cur);
+            TweenSystem.KillByEntity(ref world.Tweens, cur);
+            EntitySystem.Destroy(ref world.Entities, cur);
+        }
     }
 
     public static void DestroySceneObjects(ref EngineWorld world, SceneId scene, ref LinearArena tempArena)
@@ -77,8 +104,12 @@ public static unsafe class EngineWorldSystem
         var entities = EntitySystem.CollectByScene(in world.Entities, scene, ref tempArena);
         for (int i = 0; i < entities.Length; i++)
         {
-            TransformSystem.Remove(ref world.Transforms, entities[i]);
-            EntitySystem.Destroy(ref world.Entities, entities[i]);
+            EntityId e = entities[i];
+            TransformSystem.Remove(ref world.Transforms, e);
+            AnimationSystem.RemoveByEntity(ref world.Animations, e);
+            RenderComponentSystem.RemoveByEntity(ref world.RenderComponents, e);
+            TweenSystem.KillByEntity(ref world.Tweens, e);
+            EntitySystem.Destroy(ref world.Entities, e);
         }
         tempArena.Rollback(mark);
     }

@@ -57,6 +57,9 @@ public static unsafe class JobSystemTests
         Assert.Run("JobSystem_AsyncBackgroundJob_PollAndCooperativeCancel", &TestAsyncPollAndCancel);
         Assert.Run("JobSystem_PerWorkerScratchAndZeroGcHotLoop", &TestPerWorkerScratchAndZeroGc);
         Assert.Run("JobSystem_EngineSubsystems_ParallelParticlesAndTransformsBitExact", &TestParallelParticlesAndTransformsBitExact);
+        Assert.Run("JobSystem_SingleThreadZeroWorkers_CombineSpanAndCompleteAll", &TestZeroWorkersCombineSpanAndCompleteAll);
+        Assert.Run("JobSystem_WorkerExceptionPropagationAndZeroLeaks", &TestWorkerExceptionPropagationAndZeroLeaks);
+        Assert.Run("JobSystem_DepLinkExhaustionDoesNotDeadlock", &TestDepLinkExhaustionDoesNotDeadlock);
     }
 
     private static void ParallelSquareKernel(void* userData, int begin, int end, int workerIndex)
@@ -396,5 +399,175 @@ public static unsafe class JobSystemTests
         }
 
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after parallel engine subsystems test");
+    }
+
+    private static void InlineCounterJob(void* ud, int w)
+    {
+        _ = w;
+        Interlocked.Increment(ref *(int*)ud);
+    }
+
+    private static void InlineRangeWriteKernel(void* ud, int begin, int end, int w)
+    {
+        _ = w;
+        int* arr = (int*)ud;
+        for (int i = begin; i < end; i++) arr[i] = i + 1;
+    }
+
+    private static void ThrowWorkerJob(void* ud, int w)
+    {
+        _ = ud; _ = w;
+        throw new InvalidOperationException("worker-fault-99");
+    }
+
+    private static void SpinWaitFlagJob(void* ud, int w)
+    {
+        _ = w;
+        int* gate = (int*)ud;
+        while (Volatile.Read(ref *gate) == 0)
+            Thread.Yield();
+    }
+
+    private static void TestZeroWorkersCombineSpanAndCompleteAll()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+
+        // 1. workerCount = 0 deterministic inline execution
+        JobScheduler* sched0 = alloc.Persistent.Alloc<JobScheduler>(1, 64);
+        JobSystem.Start(sched0, ref alloc.Persistent, workerCount: 0);
+        try
+        {
+            int counter = 0;
+            JobHandle hInline = JobSystem.Schedule(sched0, &counter, &InlineCounterJob);
+            Assert.True(!hInline.IsValid && counter == 1, "workerCount=0 Schedule executes inline");
+
+            int* arr = alloc.Persistent.Alloc<int>(32, 64);
+            JobHandle hPar0 = JobSystem.ScheduleParallelFor(sched0, 32, 8, arr, &InlineRangeWriteKernel);
+            Assert.True(!hPar0.IsValid && arr[31] == 32, "workerCount=0 ScheduleParallelFor executes inline");
+        }
+        finally
+        {
+            JobSystem.Stop(sched0);
+        }
+
+        // 2. CombineDependencies(span), CompleteAll, RequestCancel on count<=0 & stale/invalid handles
+        JobScheduler* sched = alloc.Persistent.Alloc<JobScheduler>(1, 64);
+        JobSystem.Start(sched, ref alloc.Persistent, workerCount: 2);
+        try
+        {
+            int* gate = alloc.Persistent.Alloc<int>(1, 64);
+            *gate = 0;
+            JobHandle dep = JobSystem.Schedule(sched, gate, &SpinWaitFlagJob);
+            JobHandle emptyRange = JobSystem.ScheduleParallelFor(sched, count: 0, batchSize: 4, null, &InlineRangeWriteKernel, dependency: dep);
+            Assert.True(emptyRange != dep, "count<=0 returns safe distinct handle");
+            JobSystem.RequestCancel(sched, emptyRange);
+            Assert.True(!JobSystem.IsCancelRequested(sched, dep), "RequestCancel on count<=0 handle must NOT cancel dependency");
+            Volatile.Write(ref *gate, 1);
+            JobSystem.Complete(sched, emptyRange);
+            Assert.True(JobSystem.IsComplete(sched, dep), "Dependency completed after count<=0 handle");
+
+            // Invalid/stale cancel checks
+            JobSystem.RequestCancel(sched, JobHandle.Invalid);
+            Assert.True(!JobSystem.IsCancelRequested(sched, JobHandle.Invalid), "Invalid handle IsCancelRequested == false");
+            Assert.True(!JobSystem.IsCancelRequested(sched, JobHandle.Create(0, 4000)), "Stale handle IsCancelRequested == false");
+
+            // CombineDependencies(ReadOnlySpan<JobHandle>) with duplicates, invalid, and multi-handles
+            int* hits = alloc.Persistent.Alloc<int>(1, 64);
+            JobHandle j1 = JobSystem.Schedule(sched, hits, &InlineCounterJob);
+            JobHandle j2 = JobSystem.Schedule(sched, hits, &InlineCounterJob);
+            JobHandle j3 = JobSystem.Schedule(sched, hits, &InlineCounterJob);
+            Span<JobHandle> span = stackalloc JobHandle[] { JobHandle.Invalid, j1, j1, j2, j3 };
+            JobHandle combined = JobSystem.CombineDependencies(sched, span);
+            JobHandle after = JobSystem.Schedule(sched, hits, &InlineCounterJob, dependency: combined);
+
+            Span<JobHandle> all = stackalloc JobHandle[] { j1, j2, j3, combined, after };
+            JobSystem.CompleteAll(sched, all);
+            Assert.Equal(4, *hits, "CombineDependencies(span) + CompleteAll executed all 4 jobs");
+        }
+        finally
+        {
+            JobSystem.Stop(sched);
+            alloc.Dispose();
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after workerCount=0 / CombineSpan test");
+    }
+
+    private static void TestWorkerExceptionPropagationAndZeroLeaks()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        JobScheduler* sched = alloc.Persistent.Alloc<JobScheduler>(1, 64);
+        JobSystem.Start(sched, ref alloc.Persistent, workerCount: 2);
+
+        bool threw = false;
+        try
+        {
+            JobHandle h = JobSystem.Schedule(sched, null, &ThrowWorkerJob);
+            JobSystem.Complete(sched, h);
+        }
+        catch (InvalidOperationException ex)
+        {
+            threw = ex.InnerException is InvalidOperationException inner && inner.Message.Contains("worker-fault-99", StringComparison.Ordinal);
+        }
+        finally
+        {
+            JobSystem.Stop(sched);
+            alloc.Dispose();
+        }
+
+        Assert.True(threw, "Worker exception propagated via Complete() with original inner exception");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after worker exception");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after worker exception");
+    }
+
+    private static void TestDepLinkExhaustionDoesNotDeadlock()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        // Small DepLink pool (32) to force exhaustion cleanly while root job is held
+        JobScheduler* sched = alloc.Persistent.Alloc<JobScheduler>(1, 64);
+        JobSystem.Start(sched, ref alloc.Persistent, workerCount: 2, maxJobs: 64, maxDepLinks: 32);
+
+        try
+        {
+            int* gate = alloc.Persistent.Alloc<int>(1, 64);
+            *gate = 0;
+            JobHandle root = JobSystem.Schedule(sched, gate, &SpinWaitFlagJob);
+
+            int dummy = 0;
+            bool threwOom = false;
+            for (int i = 0; i < 40; i++)
+            {
+                try
+                {
+                    _ = JobSystem.Schedule(sched, &dummy, &InlineCounterJob, dependency: root);
+                }
+                catch (OutOfMemoryException)
+                {
+                    threwOom = true;
+                    break;
+                }
+            }
+            Assert.True(threwOom, "DepLink pool exhaustion threw OutOfMemoryException");
+
+            // Release root job -> MUST NOT deadlock on DepLock!
+            Volatile.Write(ref *gate, 1);
+            JobSystem.Complete(sched, root);
+
+            // Scheduler must still be healthy after exhaustion + drain
+            int afterCount = 0;
+            JobHandle followUp = JobSystem.Schedule(sched, &afterCount, &InlineCounterJob);
+            JobSystem.Complete(sched, followUp);
+            Assert.Equal(1, afterCount, "Scheduler recovered cleanly after DepLink exhaustion without DepLock deadlock");
+        }
+        finally
+        {
+            JobSystem.Stop(sched);
+            alloc.Dispose();
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after DepLink exhaustion test");
     }
 }

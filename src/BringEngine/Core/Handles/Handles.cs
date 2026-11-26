@@ -16,11 +16,20 @@ public static class HandlePacking
     public const uint GenerationMask = 0x0FFFu;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static uint NextGeneration(uint generation)
+    {
+        uint next = (generation + 1u) & GenerationMask;
+        return next == 0 ? 1u : next;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static uint Pack(uint index, uint generation)
     {
+        if (index > IndexMask)
+            throw new ArgumentOutOfRangeException(nameof(index), index, $"Handle index exceeds 20-bit max ({IndexMask}).");
         uint gen = generation & GenerationMask;
         if (gen == 0) gen = 1;
-        return (gen << GenerationShift) | (index & IndexMask);
+        return (gen << GenerationShift) | index;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -35,7 +44,7 @@ public readonly struct EntityId : IEquatable<EntityId>
 {
     public readonly uint Raw;
     public static readonly EntityId Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -57,7 +66,7 @@ public readonly struct SceneId : IEquatable<SceneId>
 {
     public readonly uint Raw;
     public static readonly SceneId Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -75,7 +84,7 @@ public readonly struct BundleId : IEquatable<BundleId>
 {
     public readonly uint Raw;
     public static readonly BundleId Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -93,7 +102,7 @@ public readonly struct MeshHandle : IEquatable<MeshHandle>
 {
     public readonly uint Raw;
     public static readonly MeshHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -111,7 +120,7 @@ public readonly struct TextureHandle : IEquatable<TextureHandle>
 {
     public readonly uint Raw;
     public static readonly TextureHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -129,7 +138,7 @@ public readonly struct MaterialHandle : IEquatable<MaterialHandle>
 {
     public readonly uint Raw;
     public static readonly MaterialHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -147,7 +156,7 @@ public readonly struct ShaderHandle : IEquatable<ShaderHandle>
 {
     public readonly uint Raw;
     public static readonly ShaderHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -165,7 +174,7 @@ public readonly struct FontHandle : IEquatable<FontHandle>
 {
     public readonly uint Raw;
     public static readonly FontHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -183,7 +192,7 @@ public readonly struct GltfHandle : IEquatable<GltfHandle>
 {
     public readonly uint Raw;
     public static readonly GltfHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -201,7 +210,7 @@ public readonly struct AnimClipHandle : IEquatable<AnimClipHandle>
 {
     public readonly uint Raw;
     public static readonly AnimClipHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -219,7 +228,7 @@ public readonly struct SkeletonHandle : IEquatable<SkeletonHandle>
 {
     public readonly uint Raw;
     public static readonly SkeletonHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -237,7 +246,7 @@ public readonly struct TweenHandle : IEquatable<TweenHandle>
 {
     public readonly uint Raw;
     public static readonly TweenHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -255,7 +264,7 @@ public readonly struct EmitterHandle : IEquatable<EmitterHandle>
 {
     public readonly uint Raw;
     public static readonly EmitterHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -273,7 +282,7 @@ public readonly struct CameraHandle : IEquatable<CameraHandle>
 {
     public readonly uint Raw;
     public static readonly CameraHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -291,7 +300,7 @@ public readonly struct SpriteHandle : IEquatable<SpriteHandle>
 {
     public readonly uint Raw;
     public static readonly SpriteHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -309,7 +318,7 @@ public readonly struct TextHandle : IEquatable<TextHandle>
 {
     public readonly uint Raw;
     public static readonly TextHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -327,7 +336,7 @@ public readonly struct JobHandle : IEquatable<JobHandle>
 {
     public readonly uint Raw;
     public static readonly JobHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -348,7 +357,7 @@ public readonly struct HttpRequestHandle : IEquatable<HttpRequestHandle>
 {
     public readonly uint Raw;
     public static readonly HttpRequestHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -369,7 +378,7 @@ public readonly struct WebSocketHandle : IEquatable<WebSocketHandle>
 {
     public readonly uint Raw;
     public static readonly WebSocketHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -391,7 +400,7 @@ public readonly struct LogFileHandle : IEquatable<LogFileHandle>
     public readonly uint Raw;
     public static readonly LogFileHandle Default = default;
     public static readonly LogFileHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -412,7 +421,7 @@ public readonly struct SaveOpHandle : IEquatable<SaveOpHandle>
 {
     public readonly uint Raw;
     public static readonly SaveOpHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -433,7 +442,7 @@ public readonly struct AudioClipHandle : IEquatable<AudioClipHandle>
 {
     public readonly uint Raw;
     public static readonly AudioClipHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -454,7 +463,7 @@ public readonly struct AudioVoiceHandle : IEquatable<AudioVoiceHandle>
 {
     public readonly uint Raw;
     public static readonly AudioVoiceHandle Invalid = default;
-    public bool IsValid => Raw != 0;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
     public uint Index => HandlePacking.UnpackIndex(Raw);
     public uint Generation => HandlePacking.UnpackGeneration(Raw);
 
@@ -468,4 +477,46 @@ public readonly struct AudioVoiceHandle : IEquatable<AudioVoiceHandle>
     public static bool operator ==(AudioVoiceHandle a, AudioVoiceHandle b) => a.Raw == b.Raw;
     public static bool operator !=(AudioVoiceHandle a, AudioVoiceHandle b) => a.Raw != b.Raw;
     public override string ToString() => IsValid ? $"AudioVoice({Index}:g{Generation})" : "AudioVoice(Invalid)";
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct AnimPlayerHandle : IEquatable<AnimPlayerHandle>
+{
+    public readonly uint Raw;
+    public static readonly AnimPlayerHandle Invalid = default;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public AnimPlayerHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static AnimPlayerHandle Create(uint index, uint generation) => new AnimPlayerHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(AnimPlayerHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is AnimPlayerHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(AnimPlayerHandle a, AnimPlayerHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(AnimPlayerHandle a, AnimPlayerHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"AnimPlayer({Index}:g{Generation})" : "AnimPlayer(Invalid)";
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct SpriteAnimPlayerHandle : IEquatable<SpriteAnimPlayerHandle>
+{
+    public readonly uint Raw;
+    public static readonly SpriteAnimPlayerHandle Invalid = default;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public SpriteAnimPlayerHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static SpriteAnimPlayerHandle Create(uint index, uint generation) => new SpriteAnimPlayerHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(SpriteAnimPlayerHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is SpriteAnimPlayerHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(SpriteAnimPlayerHandle a, SpriteAnimPlayerHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(SpriteAnimPlayerHandle a, SpriteAnimPlayerHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"SpriteAnimPlayer({Index}:g{Generation})" : "SpriteAnimPlayer(Invalid)";
 }

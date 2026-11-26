@@ -53,7 +53,14 @@ PSInput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
 
     float c = cos(p.RotExtra.x);
     float s = sin(p.RotExtra.x);
-    float2 rotO = float2(o.x * c - o.y * s, o.x * s + o.y * c) * p.PosSize.w;
+    float2 scaledO = o;
+    if (p.RotExtra.y > 0.5)
+    {
+        float stretch = p.RotExtra.y > 1.1 ? p.RotExtra.y : 2.5;
+        scaledO.x *= stretch;
+        scaledO.y *= 0.5;
+    }
+    float2 rotO = float2(scaledO.x * c - scaledO.y * s, scaledO.x * s + scaledO.y * c) * p.PosSize.w;
 
     float3 worldPos = p.PosSize.xyz + CameraRightTime.xyz * rotO.x + CameraUpPad.xyz * rotO.y;
 

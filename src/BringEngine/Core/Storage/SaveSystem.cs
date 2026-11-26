@@ -6,6 +6,7 @@ using System.Text;
 using System.Threading;
 using BringEngine.Assets.Compression;
 using BringEngine.Core.Handles;
+using BringEngine.Core.Logging;
 using BringEngine.Core.Memory;
 using BringEngine.Core.Threading;
 using BringEngine.Networking;
@@ -80,7 +81,7 @@ public unsafe struct SaveResult
     public byte* DataPtr;
     public int DataLength;
     public nuint DataAllocSize;
-    public FixedString64 SlotName;
+    public FixedString256 SlotName;
     public FixedString256 Error;
 
     public readonly bool IsSuccess => Status == SaveStatus.Ok;
@@ -114,7 +115,7 @@ internal unsafe struct SaveCommand
     public PackCompressionMode Compression;
     public byte CreateOrDeleteBackup;
     public uint GameSchemaVersion;
-    public FixedString64 SlotName;
+    public FixedString256 SlotName;
     public byte* PayloadPtr;
     public int PayloadLength;
     public nuint PayloadAllocSize;
@@ -152,6 +153,7 @@ public unsafe struct SaveSystemState
     public byte Active;
     public int WorkerThreadId;
     internal int ShutdownFlag;
+    internal LogState* Log;
 
     public CachePaddedInt PendingCount;
     public CachePaddedLong TotalSavesCompleted;
@@ -190,7 +192,8 @@ public static unsafe class SaveSystem
         ReadOnlySpan<char> appName = default,
         int maxPendingOps = SaveSystemState.DefaultMaxPendingOps,
         int maxSaveBytes = SaveSystemState.DefaultMaxSaveBytes,
-        ReadOnlySpan<char> directoryOverride = default)
+        ReadOnlySpan<char> directoryOverride = default,
+        LogState* log = null)
     {
         if (state == null) throw new ArgumentNullException(nameof(state));
         if (maxPendingOps < 4) maxPendingOps = 4;
@@ -223,29 +226,43 @@ public static unsafe class SaveSystem
             throw new InvalidOperationException("Maximum concurrent SaveSystemState instances exceeded.");
 
         *state = default;
-        state->Slots = persistentArena.Alloc<SaveOpSlotMeta>(maxPendingOps, 64);
-        for (int i = 0; i < maxPendingOps; i++)
+        try
         {
-            state->Slots[i].Generation = 1;
-            state->Slots[i].State = 0;
-        }
-        state->CmdQueue = persistentArena.Alloc<SaveCommand>(qCap, 64);
-        state->CmdMask = qCap - 1;
-        state->DoneQueue = persistentArena.Alloc<SaveResult>(qCap, 64);
-        state->DoneMask = qCap - 1;
-        state->MaxPendingOps = maxPendingOps;
-        state->MaxSaveBytes = maxSaveBytes;
-        state->PoolSlot = poolSlot;
-        state->Active = 1;
+            state->Slots = persistentArena.Alloc<SaveOpSlotMeta>(maxPendingOps, 64);
+            for (int i = 0; i < maxPendingOps; i++)
+            {
+                state->Slots[i].Generation = 1;
+                state->Slots[i].State = 0;
+            }
+            state->CmdQueue = persistentArena.Alloc<SaveCommand>(qCap, 64);
+            state->CmdMask = qCap - 1;
+            state->DoneQueue = persistentArena.Alloc<SaveResult>(qCap, 64);
+            state->DoneMask = qCap - 1;
+            state->MaxPendingOps = maxPendingOps;
+            state->MaxSaveBytes = maxSaveBytes;
+            state->PoolSlot = poolSlot;
+            state->Log = log;
+            state->Active = 1;
 
-        nint rawPtr = (nint)state;
-        var thread = new Thread(WorkerEntry)
+            nint rawPtr = (nint)state;
+            var thread = new Thread(WorkerEntry)
+            {
+                Name = "BringEngine.SaveWorker",
+                IsBackground = true,
+            };
+            s_pools[poolSlot].WorkerThread = thread;
+            thread.Start(rawPtr);
+        }
+        catch
         {
-            Name = "BringEngine.SaveWorker",
-            IsBackground = true,
-        };
-        s_pools[poolSlot].WorkerThread = thread;
-        thread.Start(rawPtr);
+            state->Active = 0;
+            s_pools[poolSlot].WakeEvent?.Dispose();
+            lock (s_poolLock) { s_pools[poolSlot] = default; }
+            throw;
+        }
+
+        if (log != null && log->Active != 0)
+            LogSystem.Info(log, $"SaveSystem started: dir={savesDir} maxPendingOps={maxPendingOps} maxSaveBytes={maxSaveBytes}");
     }
 
     /// <summary>
@@ -264,6 +281,12 @@ public static unsafe class SaveSystem
         try { s_pools[poolSlot].WakeEvent?.Set(); } catch { }
         s_pools[poolSlot].WorkerThread?.Join();
 
+        while (TryDequeueCmd(state, out SaveCommand leftoverCmd))
+        {
+            if (leftoverCmd.PayloadPtr != null && leftoverCmd.PayloadAllocSize > 0)
+                NativeMemoryTracker.AlignedFree(leftoverCmd.PayloadPtr, leftoverCmd.PayloadAllocSize);
+        }
+
         while (TryDequeueDoneRaw(state, out SaveResult leftover))
             ReleaseResult(ref leftover);
 
@@ -272,6 +295,9 @@ public static unsafe class SaveSystem
         {
             s_pools[poolSlot] = default;
         }
+
+        if (state->Log != null && state->Log->Active != 0)
+            LogSystem.Info(state->Log, $"SaveSystem stopped (saves={state->TotalSavesCompleted.Value}, loads={state->TotalLoadsCompleted.Value}, backups={state->TotalBackupRecoveries.Value})");
     }
 
     // =========================================================================
@@ -362,8 +388,7 @@ public static unsafe class SaveSystem
         if (idx < (uint)state->MaxPendingOps)
         {
             AcquireSpinLock(ref state->SlotLock.Value);
-            uint nextGen = (state->Slots[idx].Generation + 1) & HandlePacking.GenerationMask;
-            if (nextGen == 0) nextGen = 1;
+            uint nextGen = HandlePacking.NextGeneration(state->Slots[idx].Generation);
             Volatile.Write(ref state->Slots[idx].Generation, nextGen);
             Volatile.Write(ref state->Slots[idx].State, 0);
             ReleaseSpinLock(ref state->SlotLock.Value);
@@ -525,6 +550,13 @@ public static unsafe class SaveSystem
             payload.CopyTo(new Span<byte>(payloadPtr, payload.Length));
         }
 
+        // Pre-sanitize slotName into FixedString256 with 0 GC bytes so async & sync resolve identical paths
+        ReadOnlySpan<char> fallback = (opKind != SaveOpKind.Delete && kind == SavePayloadKind.Raw)
+            ? "settings.json".AsSpan()
+            : "save.bsav".AsSpan();
+        Span<char> safeBuf = stackalloc char[128];
+        int safeLen = PlatformPaths.SanitizeFileNameToSpan(slotName, fallback, safeBuf);
+
         SaveOpHandle handle = SaveOpHandle.Create((uint)slotIdx, gen);
         var cmd = new SaveCommand
         {
@@ -536,19 +568,31 @@ public static unsafe class SaveSystem
             Compression = compression,
             CreateOrDeleteBackup = backupFlag ? (byte)1 : (byte)0,
             GameSchemaVersion = schemaVersion,
-            SlotName = FixedString64.From(slotName),
+            SlotName = FixedString256.From(safeBuf.Slice(0, safeLen)),
             PayloadPtr = payloadPtr,
             PayloadLength = payload.Length,
             PayloadAllocSize = payloadAlloc,
         };
 
+        Interlocked.Increment(ref state->PendingCount.Value);
+
         AcquireSpinLock(ref state->CmdLock.Value);
+        if (state->Active == 0 || Volatile.Read(ref state->ShutdownFlag) != 0)
+        {
+            ReleaseSpinLock(ref state->CmdLock.Value);
+            Interlocked.Decrement(ref state->PendingCount.Value);
+            if (payloadPtr != null && payloadAlloc > 0)
+                NativeMemoryTracker.AlignedFree(payloadPtr, payloadAlloc);
+            AcquireSpinLock(ref state->SlotLock.Value);
+            Volatile.Write(ref state->Slots[slotIdx].State, 0);
+            ReleaseSpinLock(ref state->SlotLock.Value);
+            return SaveOpHandle.Invalid;
+        }
         int tail = state->CmdTail;
         state->CmdQueue[tail & state->CmdMask] = cmd;
         state->CmdTail = tail + 1;
         ReleaseSpinLock(ref state->CmdLock.Value);
 
-        Interlocked.Increment(ref state->PendingCount.Value);
         try { s_pools[state->PoolSlot].WakeEvent?.Set(); } catch { }
         return handle;
     }
@@ -568,7 +612,10 @@ public static unsafe class SaveSystem
                 SaveResult res;
                 try
                 {
-                    string safeName = PlatformPaths.SanitizeFileName(cmd.SlotName.ToString().AsSpan(), "save.bsav");
+                    string fallback = (cmd.OpKind != SaveOpKind.Delete && cmd.PayloadKind == SavePayloadKind.Raw)
+                        ? "settings.json"
+                        : "save.bsav";
+                    string safeName = cmd.SlotName.Length > 0 ? cmd.SlotName.ToString() : fallback;
                     if (cmd.OpKind == SaveOpKind.Save)
                     {
                         ReadOnlySpan<byte> payload = cmd.PayloadPtr != null && cmd.PayloadLength > 0
@@ -590,7 +637,7 @@ public static unsafe class SaveSystem
                         {
                             OpKind = SaveOpKind.Delete,
                             Status = SaveStatus.Ok,
-                            SlotName = FixedString64.From(safeName),
+                            SlotName = FixedString256.From(safeName),
                         };
                     }
                 }
@@ -612,8 +659,8 @@ public static unsafe class SaveSystem
 
                 res.Handle = cmd.Handle;
                 res.UserTag = cmd.UserTag;
-                Interlocked.Decrement(ref state->PendingCount.Value);
                 EnqueueDone(state, cmd.SlotIndex, in res);
+                Interlocked.Decrement(ref state->PendingCount.Value);
                 continue;
             }
 
@@ -642,14 +689,15 @@ public static unsafe class SaveSystem
             Compression = kind == SavePayloadKind.Raw ? PackCompressionMode.None : compression,
             GameSchemaVersion = schemaVersion,
             SavedUtcTicks = DateTime.UtcNow.Ticks,
-            SlotName = FixedString64.From(safeName),
+            SlotName = FixedString256.From(safeName),
         };
 
+        string tmpPath = string.Empty;
         try
         {
             Directory.CreateDirectory(savesDir);
             string targetPath = Path.Combine(savesDir, safeName);
-            string tmpPath = targetPath + ".tmp";
+            tmpPath = targetPath + ".tmp";
             string bakPath = targetPath + ".bak";
 
             if (kind == SavePayloadKind.Raw)
@@ -704,8 +752,14 @@ public static unsafe class SaveSystem
         }
         catch (Exception ex)
         {
+            if (!string.IsNullOrEmpty(tmpPath))
+            {
+                try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+            }
             result.Status = SaveStatus.IoError;
             result.Error = FixedString256.From(ex.Message);
+            if (state->Log != null && state->Log->Active != 0)
+                LogSystem.Error(state->Log, $"SaveSystem failed saving '{safeName}': {ex.Message}");
         }
 
         return result;
@@ -726,14 +780,14 @@ public static unsafe class SaveSystem
                 OpKind = SaveOpKind.Load,
                 Status = SaveStatus.NotFound,
                 PayloadKind = rawMode ? SavePayloadKind.Raw : SavePayloadKind.Binary,
-                SlotName = FixedString64.From(safeName),
+                SlotName = FixedString256.From(safeName),
                 Error = FixedString256.From("Save file not found."),
             };
         }
 
         SaveResult primary = hasPrimary
             ? TryReadSingleFile(targetPath, safeName, rawMode, state->MaxSaveBytes)
-            : new SaveResult { OpKind = SaveOpKind.Load, Status = SaveStatus.NotFound, SlotName = FixedString64.From(safeName) };
+            : new SaveResult { OpKind = SaveOpKind.Load, Status = SaveStatus.NotFound, SlotName = FixedString256.From(safeName) };
 
         if (primary.Status == SaveStatus.Ok)
         {
@@ -750,11 +804,21 @@ public static unsafe class SaveSystem
                 backup.LoadedFromBackup = 1;
                 Interlocked.Increment(ref state->TotalLoadsCompleted.Value);
                 Interlocked.Increment(ref state->TotalBackupRecoveries.Value);
+                if (state->Log != null && state->Log->Active != 0)
+                    LogSystem.Warn(state->Log, $"SaveSystem recovered '{safeName}' from .bak backup (schema v{backup.GameSchemaVersion})");
                 return backup;
             }
             ReleaseResult(ref backup);
+            if (!hasPrimary)
+            {
+                if (state->Log != null && state->Log->Active != 0)
+                    LogSystem.Error(state->Log, $"SaveSystem failed loading '{safeName}': primary missing and .bak status={backup.Status}");
+                return backup;
+            }
         }
 
+        if (state->Log != null && state->Log->Active != 0)
+            LogSystem.Error(state->Log, $"SaveSystem failed loading '{safeName}': status={primary.Status}");
         return primary;
     }
 
@@ -765,7 +829,7 @@ public static unsafe class SaveSystem
             OpKind = SaveOpKind.Load,
             Status = SaveStatus.IoError,
             PayloadKind = rawMode ? SavePayloadKind.Raw : SavePayloadKind.Binary,
-            SlotName = FixedString64.From(safeName),
+            SlotName = FixedString256.From(safeName),
         };
 
         try
@@ -834,10 +898,19 @@ public static unsafe class SaveSystem
             }
 
             if (hdr.UncompressedBytes < 0 || hdr.UncompressedBytes > maxSaveBytes ||
-                hdr.CompressedBytes < 0 || fileLen - hdrSize != hdr.CompressedBytes)
+                hdr.CompressedBytes < 0 || fileLen - hdrSize != hdr.CompressedBytes ||
+                (hdr.UncompressedBytes == 0 && hdr.CompressedBytes != 0))
             {
                 result.Status = SaveStatus.Corrupted;
                 result.Error = FixedString256.From("BSAV payload size mismatch or exceeds MaxSaveBytes.");
+                return result;
+            }
+
+            SavePayloadKind payloadKind = (SavePayloadKind)hdr.PayloadKind;
+            if (payloadKind != SavePayloadKind.JsonUtf8 && payloadKind != SavePayloadKind.Binary && payloadKind != SavePayloadKind.Chunked)
+            {
+                result.Status = SaveStatus.Corrupted;
+                result.Error = FixedString256.From("Invalid BSAV payload kind.");
                 return result;
             }
 
@@ -959,7 +1032,7 @@ public static unsafe class SaveSystem
     {
         OpKind = opKind,
         Status = status,
-        SlotName = FixedString64.From(slotName),
+        SlotName = FixedString256.From(slotName),
         Error = FixedString256.From(msg),
     };
 

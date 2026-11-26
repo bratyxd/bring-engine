@@ -17,10 +17,12 @@ public static class DetMath
     public const float Rad2Deg = 180.0f / Pi;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static float Clamp(float v, float min, float max) => v < min ? min : (v > max ? max : v);
+    public static float Clamp(float v, float min, float max)
+        => !(v >= min) ? min : (v > max ? max : v);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
+    public static float Clamp01(float v)
+        => !(v > 0f) ? 0f : (v > 1f ? 1f : v);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float Lerp(float a, float b, float t) => a + (b - a) * t;
@@ -28,7 +30,10 @@ public static class DetMath
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float SmoothStep(float edge0, float edge1, float x)
     {
-        float t = Clamp01((x - edge0) / (edge1 - edge0));
+        float diff = edge1 - edge0;
+        if (Abs(diff) < 1e-12f || float.IsNaN(diff))
+            return x >= edge1 ? 1f : 0f;
+        float t = Clamp01((x - edge0) / diff);
         return t * t * (3f - 2f * t);
     }
 
@@ -42,13 +47,14 @@ public static class DetMath
     public static float Max(float a, float b) => a > b ? a : b;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static float Sqrt(float v) => v <= 0f ? 0f : MathF.Sqrt(v);
+    public static float Sqrt(float v) => !(v > 0f) ? 0f : MathF.Sqrt(v);
 
     /// <summary>
     /// Deterministic minimax polynomial Sin (max error ~1e-6), independent of platform libm.
     /// </summary>
     public static float Sin(float x)
     {
+        if (!float.IsFinite(x)) return 0f;
         // Range reduce to [-Pi, Pi]
         float k = MathF.Floor((x + Pi) / TwoPi);
         x -= k * TwoPi;
@@ -88,8 +94,122 @@ public static class DetMath
         return a;
     }
 
-    public static float Pow(float b, float e) => MathF.Pow(b, e);
-    public static float Exp(float x) => MathF.Exp(x);
+    /// <summary>
+    /// Deterministic minimax polynomial Acos (zero libm transcendental calls).
+    /// </summary>
+    public static float Acos(float x)
+    {
+        if (float.IsNaN(x)) return HalfPi;
+        bool negate = x < 0f;
+        float ax = negate ? -x : x;
+        if (ax >= 1f) return negate ? Pi : 0f;
+
+        double d = ax;
+        double p = ((((((-0.0012624911 * d + 0.0066700901) * d - 0.0170881256) * d + 0.0308918810) * d
+            - 0.0501743046) * d + 0.0889789874) * d - 0.2145988016) * d + 1.5707963050;
+        float res = (float)(System.Math.Sqrt(1.0 - d) * p);
+        return negate ? Pi - res : res;
+    }
+
+    /// <summary>Deterministic natural exponential (zero libm transcendental calls).</summary>
+    public static float Exp(float x) => (float)ExpD(x);
+
+    /// <summary>Deterministic base-2 exponential (zero libm transcendental calls).</summary>
+    public static float Exp2(float x)
+    {
+        const double Ln2 = 0.69314718055994530942;
+        return (float)ExpD((double)x * Ln2);
+    }
+
+    /// <summary>Deterministic natural logarithm (zero libm transcendental calls).</summary>
+    public static float Log(float x) => (float)LogD(x);
+
+    /// <summary>Deterministic power function b^e (zero libm transcendental calls).</summary>
+    public static float Pow(float b, float e)
+    {
+        if (e == 0f || b == 1f) return 1f;
+        if (float.IsNaN(b) || float.IsNaN(e)) return float.NaN;
+        if (b == 0f) return e > 0f ? 0f : float.PositiveInfinity;
+
+        if (b < 0f)
+        {
+            if (float.IsInfinity(e))
+            {
+                if (b == -1f) return 1f;
+                return (Abs(b) > 1f) == (e > 0f) ? float.PositiveInfinity : 0f;
+            }
+            if (e != MathF.Truncate(e)) return float.NaN;
+            double ae = System.Math.Abs((double)e);
+            bool odd = ae <= 16777216.0 && (((long)ae & 1L) != 0);
+            float mag = (float)ExpD((double)e * LogD(-(double)b));
+            return odd ? -mag : mag;
+        }
+
+        return (float)ExpD((double)e * LogD((double)b));
+    }
+
+    private static double ExpD(double xd)
+    {
+        if (double.IsNaN(xd)) return double.NaN;
+        if (xd >= 709.782712893384) return double.PositiveInfinity;
+        if (xd <= -745.1332191019412) return 0.0;
+
+        const double Log2E = 1.44269504088896340736;
+        const double Ln2Hi = 0.69314718036912381649;
+        const double Ln2Lo = 1.9082149292705877e-10;
+
+        double kReal = System.Math.Round(xd * Log2E);
+        int k = (int)kReal;
+        double u = (xd - kReal * Ln2Hi) - kReal * Ln2Lo;
+
+        double p = 1.0 + u * (1.0 + u * (0.5 + u * (1.0 / 6.0 + u * (1.0 / 24.0 + u * (1.0 / 120.0
+            + u * (1.0 / 720.0 + u * (1.0 / 5040.0 + u * (1.0 / 40320.0 + u * (1.0 / 362880.0)))))))));
+
+        if (k >= -1022)
+        {
+            double scale = BitConverter.Int64BitsToDouble((long)(k + 1023) << 52);
+            return p * scale;
+        }
+        else
+        {
+            double scale1 = BitConverter.Int64BitsToDouble(1L << 52);
+            double scale2 = BitConverter.Int64BitsToDouble((long)(k + 2045) << 52);
+            return (p * scale1) * scale2;
+        }
+    }
+
+    private static double LogD(double xd)
+    {
+        if (double.IsNaN(xd) || xd < 0.0) return double.NaN;
+        if (xd == 0.0) return double.NegativeInfinity;
+        if (double.IsPositiveInfinity(xd)) return double.PositiveInfinity;
+
+        long bits = BitConverter.DoubleToInt64Bits(xd);
+        int exp = (int)(bits >> 52) - 1023;
+        if (exp == -1023)
+        {
+            xd *= 18014398509481984.0;
+            bits = BitConverter.DoubleToInt64Bits(xd);
+            exp = (int)(bits >> 52) - 1023 - 54;
+        }
+
+        long mantBits = (bits & 0x000F_FFFF_FFFF_FFFFL) | (1023L << 52);
+        double m = BitConverter.Int64BitsToDouble(mantBits);
+        const double Sqrt2 = 1.4142135623730950488;
+        if (m > Sqrt2)
+        {
+            m *= 0.5;
+            exp++;
+        }
+
+        double t = (m - 1.0) / (m + 1.0);
+        double t2 = t * t;
+        double poly = 1.0 + t2 * (1.0 / 3.0 + t2 * (1.0 / 5.0 + t2 * (1.0 / 7.0 + t2 * (1.0 / 9.0 + t2 * (1.0 / 11.0 + t2 * (1.0 / 13.0))))));
+        double lnM = 2.0 * t * poly;
+
+        const double Ln2 = 0.69314718055994530942;
+        return exp * Ln2 + lnM;
+    }
 }
 
 /// <summary>
@@ -139,9 +259,10 @@ public struct DetRng
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int NextInt(int minInclusive, int maxExclusive)
     {
-        uint range = (uint)(maxExclusive - minInclusive);
+        if (maxExclusive <= minInclusive) return minInclusive;
+        uint range = (uint)((long)maxExclusive - minInclusive);
         if (range <= 1) return minInclusive;
-        return minInclusive + (int)(NextUInt() % range);
+        return (int)(minInclusive + (long)(NextUInt() % range));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -364,6 +485,7 @@ public struct Quat : IEquatable<Quat>
         if (f.LengthSq() < 1e-8f) return Identity;
         Vec3 r = Vec3.Cross(f, up).Normalized();
         if (r.LengthSq() < 1e-8f) r = Vec3.Cross(f, Vec3.UnitX).Normalized();
+        if (r.LengthSq() < 1e-8f) r = Vec3.Cross(f, Vec3.UnitZ).Normalized();
         Vec3 u = Vec3.Cross(r, f);
 
         // Build rotation matrix with columns (r, u, -f) and extract quaternion
@@ -428,7 +550,7 @@ public struct Quat : IEquatable<Quat>
         if (dot > 0.9995f)
             return new Quat(DetMath.Lerp(a.X, b.X, t), DetMath.Lerp(a.Y, b.Y, t), DetMath.Lerp(a.Z, b.Z, t), DetMath.Lerp(a.W, b.W, t)).Normalized();
 
-        float theta0 = MathF.Acos(DetMath.Clamp(dot, -1f, 1f));
+        float theta0 = DetMath.Acos(DetMath.Clamp(dot, -1f, 1f));
         float theta = theta0 * t;
         float sinTheta = DetMath.Sin(theta);
         float sinTheta0 = DetMath.Sin(theta0);
@@ -494,6 +616,7 @@ public struct Mat4
         if (f.LengthSq() < 1e-8f) f = Vec3.Forward;
         Vec3 r = Vec3.Cross(f, up).Normalized();
         if (r.LengthSq() < 1e-8f) r = Vec3.Cross(f, Vec3.UnitX).Normalized();
+        if (r.LengthSq() < 1e-8f) r = Vec3.Cross(f, Vec3.UnitZ).Normalized();
         Vec3 u = Vec3.Cross(r, f);
 
         return new Mat4
@@ -598,7 +721,7 @@ public struct Mat4
         float b11 = a22 * a33 - a23 * a32;
 
         float det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
-        if (DetMath.Abs(det) < 1e-12f)
+        if (!(DetMath.Abs(det) >= 1e-12f))
         {
             inv = Identity;
             return false;
@@ -646,6 +769,8 @@ public struct Bounds3
         Max = new Vec3(float.MinValue, float.MinValue, float.MinValue),
     };
 
+    public readonly bool IsEmpty => !(Min.X <= Max.X && Min.Y <= Max.Y && Min.Z <= Max.Z);
+
     public readonly Vec3 Center => (Min + Max) * 0.5f;
     public readonly Vec3 Extents => (Max - Min) * 0.5f;
 
@@ -659,6 +784,7 @@ public struct Bounds3
 
     public readonly Bounds3 Transform(in Mat4 m)
     {
+        if (IsEmpty) return Empty;
         Vec3 c = Center;
         Vec3 e = Extents;
         Vec3 wc = Mat4.TransformPoint(in m, c);
@@ -724,6 +850,7 @@ public struct Frustum
 
     public readonly bool IntersectsBounds(in Bounds3 bounds)
     {
+        if (bounds.IsEmpty) return false;
         Vec3 c = bounds.Center;
         Vec3 e = bounds.Extents;
         if (IsOutside(in Left, c, e)) return false;

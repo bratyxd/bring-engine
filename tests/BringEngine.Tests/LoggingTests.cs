@@ -1,7 +1,9 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Logging;
 using BringEngine.Core.Math;
@@ -19,6 +21,9 @@ public static unsafe class LoggingTests
         Assert.Run("LogSystem_MultipleFilesCustomLimitsAndCloseFile", &TestMultipleFilesAndCustomLimits);
         Assert.Run("LogSystem_ZeroGcInterpolatedHotLoopFilteredSkipAndMultiThread", &TestZeroGcFilteredSkipAndMultiThread);
         Assert.Run("LogSystem_DedicatedWriterThreadAndAutoExceptionErrorLogging", &TestDedicatedThreadAndAutoExceptionLogging);
+        Assert.Run("LogSystem_OverflowDropNewest_SlotExhaustionAndGenerationReuse", &TestOverflowDropNewestSlotExhaustionAndGenReuse);
+        Assert.Run("LogSystem_TruncationNonAsciiZeroGcAllHandlesAndRuntimeMinLevel", &TestTruncationNonAsciiAllHandlesAndMinLevel);
+        Assert.Run("LogSystem_UnobservedCancellationSkipAndCloseRace", &TestUnobservedCancellationSkipAndCloseRace);
     }
 
     private static string CreateTempLogDir(string suffix)
@@ -41,6 +46,14 @@ public static unsafe class LoggingTests
         while (sr.ReadLine() is string line)
             list.Add(line);
         return list.ToArray();
+    }
+
+    private static byte[] ReadAllBytesShared(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var ms = new MemoryStream();
+        fs.CopyTo(ms);
+        return ms.ToArray();
     }
 
     private static void TestPlatformPathAndFormat()
@@ -386,5 +399,209 @@ public static unsafe class LoggingTests
         try { throw new InvalidOperationException("post-stop-safe"); } catch (InvalidOperationException) { }
 
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after auto-exception logging test");
+    }
+
+    private static void TestOverflowDropNewestSlotExhaustionAndGenReuse()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tempDir = CreateTempLogDir("dropnewest");
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        LogState* log = alloc.Persistent.Alloc<LogState>(1, 64);
+
+        try
+        {
+            // Small ring (64) with DropNewest policy
+            LogSystem.Start(
+                log, ref alloc.Persistent, appName: "DropTest",
+                minLevel: LogLevel.Info,
+                overflowPolicy: LogOverflowPolicy.DropNewest,
+                maxFiles: 3,
+                queueCapacity: 64,
+                directoryOverride: tempDir,
+                hookExceptions: false);
+
+            // Burst heavily without waiting -> non-blocking, TotalDropped > 0
+            for (int i = 0; i < 8000; i++)
+                LogSystem.Info(log, $"burst-{i}-payload-padding-to-exercise-ring");
+            LogSystem.Flush(log);
+            Assert.True(log->TotalWritten.Value > 0, "DropNewest wrote entries");
+            Assert.True(log->TotalLogged.Value + log->TotalDropped.Value == 8000, "Logged + Dropped == total attempts");
+
+            // Slot exhaustion + duplicate filename rejection + generation reuse
+            LogFileHandle dupDefault = LogSystem.OpenFile(log, LogState.DefaultFileName);
+            Assert.True(!dupDefault.IsValid, "Duplicate OpenFile for engine.log rejected");
+
+            LogFileHandle f1 = LogSystem.OpenFile(log, "slot_a.log");
+            LogFileHandle f2 = LogSystem.OpenFile(log, "slot_b.log");
+            Assert.True(f1.IsValid && f2.IsValid, "Slots 1 & 2 opened");
+
+            LogFileHandle fDup = LogSystem.OpenFile(log, "slot_a.log");
+            Assert.True(!fDup.IsValid, "Duplicate OpenFile for slot_a.log rejected");
+
+            LogFileHandle f3 = LogSystem.OpenFile(log, "slot_c.log");
+            Assert.True(!f3.IsValid, "MaxFiles=3 exhaustion returns Invalid");
+
+            LogSystem.CloseFile(log, f1);
+            LogFileHandle f1Reopened = LogSystem.OpenFile(log, "slot_a2.log");
+            Assert.True(f1Reopened.IsValid && f1Reopened.Index == f1.Index && f1Reopened.Generation != f1.Generation,
+                "Reopened slot increments generation");
+
+            // Stale handle write & close must not affect reopened slot
+            LogSystem.Info(log, f1, "stale-write-ignored");
+            LogSystem.CloseFile(log, f1);
+            LogSystem.Info(log, f1Reopened, "active-write-preserved");
+            LogSystem.Flush(log);
+
+            string[] linesA2 = ReadAllLinesShared(LogSystem.GetFilePath(log, f1Reopened));
+            Assert.Equal(1, linesA2.Length, "Reopened slot kept only active write");
+            Assert.True(linesA2[0].Contains("active-write-preserved", StringComparison.Ordinal), "Active write content exact");
+        }
+        finally
+        {
+            LogSystem.Stop(log);
+            alloc.Dispose();
+            TryDeleteDir(tempDir);
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after DropNewest/slot test");
+    }
+
+    private static void TestTruncationNonAsciiAllHandlesAndMinLevel()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tempDir = CreateTempLogDir("trunc");
+
+        // Pre-seed oversized engine.log (> 20 lines) to test startup compaction
+        string seedPath = Path.Combine(tempDir, LogState.DefaultFileName);
+        var seedLines = new string[35];
+        for (int i = 0; i < 35; i++) seedLines[i] = $"[2026-01-01 00:00:00.000] [INFO ] seed-{i}";
+        File.WriteAllLines(seedPath, seedLines);
+
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        LogState* log = alloc.Persistent.Alloc<LogState>(1, 64);
+
+        try
+        {
+            LogSystem.Start(log, ref alloc.Persistent, appName: "TruncTest", defaultMaxLines: 20, minLevel: LogLevel.Warn, directoryOverride: tempDir, hookExceptions: false);
+            Assert.Equal((byte)LogLevel.Warn, (byte)LogSystem.GetMinLevel(log), "Initial MinLevel == Warn");
+            LogSystem.Info(log, "filtered-before-minlevel-change");
+            LogSystem.SetMinLevel(log, LogLevel.Info);
+            Assert.Equal((byte)LogLevel.Info, (byte)LogSystem.GetMinLevel(log), "Runtime MinLevel updated to Info");
+
+            // Huge non-ASCII string (> 492 bytes) -> fast O(1) bounded truncation with '...' & valid UTF-8
+            string hugeUni = new string('界', 2000);
+            LogSystem.Info(log, $"uni={hugeUni}");
+
+            // Warmup & zero-GC verification across all 25 engine handle structs
+            var eH = EntityId.Create(1, 2);
+            var sH = SceneId.Create(2, 3);
+            var bH = BundleId.Create(3, 4);
+            var mH = MeshHandle.Create(4, 5);
+            var tH = TextureHandle.Create(5, 6);
+            var matH = MaterialHandle.Create(6, 7);
+            var shH = ShaderHandle.Create(7, 8);
+            var fH = FontHandle.Create(8, 9);
+            var gH = GltfHandle.Create(9, 10);
+            var acH = AnimClipHandle.Create(10, 11);
+            var skH = SkeletonHandle.Create(11, 12);
+            var apH = AnimPlayerHandle.Create(12, 13);
+            var sapH = SpriteAnimPlayerHandle.Create(13, 14);
+            var twH = TweenHandle.Create(14, 15);
+            var emH = EmitterHandle.Create(15, 16);
+            var camH = CameraHandle.Create(16, 17);
+            var spH = SpriteHandle.Create(17, 18);
+            var txtH = TextHandle.Create(18, 19);
+            var jH = JobHandle.Create(19, 20);
+            var httpH = HttpRequestHandle.Create(20, 21);
+            var wsH = WebSocketHandle.Create(21, 22);
+            var lfH = LogFileHandle.Create(22, 23);
+            var svH = SaveOpHandle.Create(23, 24);
+            var auCH = AudioClipHandle.Create(24, 25);
+            var auVH = AudioVoiceHandle.Create(25, 26);
+
+            LogSystem.Info(log, $"H1 {eH} {sH} {bH} {mH} {tH} {matH} {shH} {fH} {gH}");
+            LogSystem.Info(log, $"H2 {acH} {skH} {apH} {sapH} {twH} {emH} {camH} {spH} {txtH}");
+            LogSystem.Info(log, $"H3 {jH} {httpH} {wsH} {lfH} {svH} {auCH} {auVH}");
+            LogSystem.Flush(log);
+
+            long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 20; i++)
+            {
+                LogSystem.Info(log, $"H1 {eH} {sH} {bH} {mH} {tH} {matH} {shH} {fH} {gH}");
+                LogSystem.Info(log, $"H2 {acH} {skH} {apH} {sapH} {twH} {emH} {camH} {spH} {txtH}");
+                LogSystem.Info(log, $"H3 {jH} {httpH} {wsH} {lfH} {svH} {auCH} {auVH}");
+            }
+            long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+            Assert.Equal(0L, gcAfter - gcBefore, "Formatting all 25 engine handle structs allocates 0 GC bytes");
+
+            LogSystem.Flush(log);
+            byte[] rawBytes = ReadAllBytesShared(seedPath);
+            string decoded = Encoding.UTF8.GetString(rawBytes);
+            Assert.True(!decoded.Contains('\uFFFD'), "Truncated non-ASCII log has zero invalid UTF-8 replacement chars");
+            string[] finalLines = ReadAllLinesShared(seedPath);
+            Assert.Equal(20, finalLines.Length, "Startup + runtime compaction enforced exact 20 lines");
+        }
+        finally
+        {
+            LogSystem.Stop(log);
+            alloc.Dispose();
+            TryDeleteDir(tempDir);
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after truncation/all-handles test");
+    }
+
+    private static void TestUnobservedCancellationSkipAndCloseRace()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tempDir = CreateTempLogDir("unobs");
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        LogState* log = alloc.Persistent.Alloc<LogState>(1, 64);
+
+        try
+        {
+            LogSystem.Start(log, ref alloc.Persistent, appName: "UnobsTest", minLevel: LogLevel.Info, directoryOverride: tempDir, hookExceptions: true, includeCancellationExceptions: false);
+
+            // Spawn faulted task with OperationCanceledException and allow finalization
+            static void CreateCanceledTask()
+            {
+                _ = Task.FromException(new OperationCanceledException("unobserved-cancel-skip"));
+            }
+            CreateCanceledTask();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            LogSystem.Flush(log);
+
+            string[] lines = ReadAllLinesShared(LogSystem.GetFilePath(log));
+            for (int i = 0; i < lines.Length; i++)
+                Assert.True(!lines[i].Contains("unobserved-cancel-skip", StringComparison.Ordinal), "Unobserved cancellation skipped");
+
+            // Concurrent CloseFile race on the same handle
+            LogFileHandle raceH = LogSystem.OpenFile(log, "race.log");
+            Assert.True(raceH.IsValid, "race.log opened");
+            nint lp = (nint)log;
+            var t1 = new Thread(() => LogSystem.CloseFile((LogState*)lp, raceH));
+            var t2 = new Thread(() => LogSystem.CloseFile((LogState*)lp, raceH));
+            t1.Start();
+            t2.Start();
+            t1.Join();
+            t2.Join();
+
+            LogFileHandle reopened = LogSystem.OpenFile(log, "race2.log");
+            Assert.True(reopened.IsValid, "Can reopen after concurrent CloseFile");
+            LogSystem.Info(log, reopened, "after-concurrent-close");
+            LogSystem.Flush(log);
+            Assert.Equal(1, ReadAllLinesShared(LogSystem.GetFilePath(log, reopened)).Length, "Reopened file unaffected by concurrent CloseFile");
+        }
+        finally
+        {
+            LogSystem.Stop(log);
+            alloc.Dispose();
+            TryDeleteDir(tempDir);
+        }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after unobserved/close-race test");
+        Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live blocks after unobserved/close-race test");
     }
 }

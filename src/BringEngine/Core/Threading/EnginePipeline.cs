@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using BringEngine.Core.Memory;
@@ -88,6 +89,9 @@ public static unsafe class EnginePipelineSystem
         delegate*<void*, ref PipelineFrameInput, ref RenderPacket, void> logicCallback,
         in RenderShaderDefaults builtinShaders)
     {
+        if (statePtr == null) throw new ArgumentNullException(nameof(statePtr));
+        if (logicCallback == null) throw new ArgumentNullException(nameof(logicCallback));
+
         int slot = -1;
         lock (s_slotLock)
         {
@@ -116,15 +120,26 @@ public static unsafe class EnginePipelineSystem
         statePtr->Active = 1;
         statePtr->ShutdownFlag = 0;
 
-        nint rawPtr = (nint)statePtr;
-        var thread = new Thread(LogicWorkerEntry)
+        try
         {
-            Name = "BringEngine.LogicThread",
-            IsBackground = true,
-            Priority = ThreadPriority.AboveNormal,
-        };
-        s_sync[slot].LogicThread = thread;
-        thread.Start(rawPtr);
+            nint rawPtr = (nint)statePtr;
+            var thread = new Thread(LogicWorkerEntry)
+            {
+                Name = "BringEngine.LogicThread",
+                IsBackground = true,
+                Priority = ThreadPriority.AboveNormal,
+            };
+            s_sync[slot].LogicThread = thread;
+            thread.Start(rawPtr);
+        }
+        catch
+        {
+            statePtr->Active = 0;
+            s_sync[slot].LogicStart?.Dispose();
+            s_sync[slot].LogicDone?.Dispose();
+            lock (s_slotLock) { s_sync[slot] = default; }
+            throw;
+        }
     }
 
     private static void LogicWorkerEntry(object? arg)
@@ -177,6 +192,9 @@ public static unsafe class EnginePipelineSystem
         bool captureToOffscreen = false,
         FrameProfiler* profiler = null)
     {
+        if (state == null || state->Active == 0)
+            throw new InvalidOperationException("EnginePipeline is not active.");
+
         int slot = state->SyncSlot;
         state->PendingInput = frameInput;
 
@@ -188,26 +206,46 @@ public static unsafe class EnginePipelineSystem
 
         // 2. Simultaneously submit Frame N-1 on Main/Render Thread (reads Packet[ReadSlot] in alloc.FrameBack)
         RenderSubmitTimings submitTimings = default;
-        if (state->HasRenderablePacket != 0)
+        Exception? renderErr = null;
+        try
         {
-            int readSlot = state->WriteSlot ^ 1;
-            ref readonly RenderPacket readPacket = ref (readSlot == 0 ? ref state->Packet0 : ref state->Packet1);
-            if (readPacket.Valid != 0)
+            if (state->HasRenderablePacket != 0)
             {
-                bool measureGpu = profiler != null && profiler->Enabled != 0 && profiler->MeasureGpuWithFence != 0;
-                submitTimings = BatchRenderer.SubmitRenderPacket(ref gpu, in readPacket, captureToOffscreen, measureGpu);
-                state->RenderFramesSubmitted++;
+                int readSlot = state->WriteSlot ^ 1;
+                ref readonly RenderPacket readPacket = ref (readSlot == 0 ? ref state->Packet0 : ref state->Packet1);
+                if (readPacket.Valid != 0)
+                {
+                    bool measureGpu = profiler != null && profiler->Enabled != 0 && profiler->MeasureGpuWithFence != 0;
+                    submitTimings = BatchRenderer.SubmitRenderPacket(ref gpu, in readPacket, captureToOffscreen, measureGpu);
+                    state->RenderFramesSubmitted++;
+                }
             }
         }
-
-        // 3. Rendezvous barrier: wait for Logic Thread to complete Frame N
-        s_sync[slot].LogicDone!.WaitOne();
-
-        Exception? err = s_sync[slot].WorkerError;
-        if (err != null)
+        catch (Exception ex)
         {
-            s_sync[slot].WorkerError = null;
-            throw new InvalidOperationException("Logic thread encountered an unhandled exception.", err);
+            renderErr = ex;
+        }
+        finally
+        {
+            // 3. Rendezvous barrier: ALWAYS wait for Logic Thread to complete Frame N before returning
+            s_sync[slot].LogicDone!.WaitOne();
+        }
+
+        Exception? workerErr = Interlocked.Exchange(ref s_sync[slot].WorkerError, null);
+        if (workerErr != null || renderErr != null)
+        {
+            // Reset Frame arena so partial Frame N allocations do not accumulate on recovery
+            alloc.BeginFrame();
+            if (workerErr != null)
+            {
+                if (state->WriteSlot == 0) state->Packet0.Valid = 0;
+                else state->Packet1.Valid = 0;
+            }
+            if (renderErr != null && workerErr != null)
+                throw new AggregateException("Both render and logic threads encountered unhandled exceptions.", renderErr, workerErr);
+            if (renderErr != null)
+                ExceptionDispatchInfo.Capture(renderErr).Throw();
+            throw new InvalidOperationException("Logic thread encountered an unhandled exception.", workerErr);
         }
 
         state->LastRenderCpuMs = submitTimings.TotalRenderCpuMs;
@@ -237,9 +275,12 @@ public static unsafe class EnginePipelineSystem
     /// </summary>
     public static void FlushBeforeSceneTransition(EnginePipelineState* state, ref GpuContext gpu)
     {
-        state->Packet0.Valid = 0;
-        state->Packet1.Valid = 0;
-        state->HasRenderablePacket = 0;
+        if (state != null)
+        {
+            state->Packet0.Valid = 0;
+            state->Packet1.Valid = 0;
+            state->HasRenderablePacket = 0;
+        }
         if (gpu.Initialized != 0 && gpu.Device != nint.Zero)
             SDL3.SDL.WaitForGPUIdle(gpu.Device);
     }

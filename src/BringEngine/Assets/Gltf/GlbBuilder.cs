@@ -255,13 +255,13 @@ public static unsafe class GlbBuilder
             Vec3 a = ring[f];
             Vec3 b = ring[(f + 1) & 3];
 
-            // Upper face (a, top, b) -> note right-handed CCW outward normal: Cross(b-a, top-a)
-            Vec3 nUp = Vec3.Cross(b - a, top - a).Normalized();
-            AddTri(a, b, top, nUp, 0.5f, 0.5f, 1f);
+            // Upper face (b, a, top) -> right-handed CCW outward normal: Cross(a-b, top-b)
+            Vec3 nUp = Vec3.Cross(a - b, top - b).Normalized();
+            AddTri(b, a, top, nUp, 0.5f, 0.5f, 1f);
 
-            // Lower face (b, a, bot)
-            Vec3 nDn = Vec3.Cross(a - b, bot - b).Normalized();
-            AddTri(b, a, bot, nDn, 0.5f, 0.5f, 0f);
+            // Lower face (a, b, bot) -> right-handed CCW outward normal: Cross(b-a, bot-a)
+            Vec3 nDn = Vec3.Cross(b - a, bot - a).Normalized();
+            AddTri(a, b, bot, nDn, 0.5f, 0.5f, 0f);
         }
 
         void AddTri(Vec3 p0, Vec3 p1, Vec3 p2, Vec3 n, float wTop0, float wTop1, float wTop2)

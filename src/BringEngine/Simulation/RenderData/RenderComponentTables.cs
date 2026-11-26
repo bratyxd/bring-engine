@@ -21,9 +21,11 @@ public struct MeshRendererData
     public MaterialHandle Material;
     public ColorF Tint;
     public uint LayerMask;
-    public int AnimPlayerIndex; // -1 if static mesh, >= 0 for GPU skinned mesh!
+    public AnimPlayerHandle AnimPlayer;
     public byte Visible;
     public byte CastShadow;
+
+    public readonly bool HasAnimPlayer => AnimPlayer.IsValid;
 }
 
 public enum SpriteBillboardMode : byte
@@ -218,6 +220,10 @@ public unsafe struct RenderComponentTables
 
 public static unsafe class RenderComponentSystem
 {
+    /// <summary>
+    /// Appends a 3D mesh renderer component. Note: the returned dense index is valid only until
+    /// RemoveByEntity or RemoveByScene performs swap-back compaction.
+    /// </summary>
     public static int AddMeshRenderer(
         ref RenderComponentTables t,
         EntityId entity,
@@ -226,7 +232,7 @@ public static unsafe class RenderComponentSystem
         SceneId scene = default,
         ColorF? tint = null,
         uint layerMask = 1u,
-        int animPlayerIndex = -1)
+        AnimPlayerHandle animPlayer = default)
     {
         if (t.MeshRendererCount >= t.MaxMeshRenderers)
             throw new OutOfMemoryException("MeshRenderers capacity exceeded.");
@@ -239,7 +245,7 @@ public static unsafe class RenderComponentSystem
             Material = material,
             Tint = tint ?? ColorF.White,
             LayerMask = layerMask,
-            AnimPlayerIndex = animPlayerIndex,
+            AnimPlayer = animPlayer,
             Visible = 1,
             CastShadow = 1,
         };
@@ -248,9 +254,17 @@ public static unsafe class RenderComponentSystem
 
     public static SpriteHandle AddSprite(ref RenderComponentTables t, in SpriteData template)
     {
-        uint slot = t.SpriteFreeCount > 0 ? t.SpriteFreeSlots[--t.SpriteFreeCount] : (uint)t.SpriteNextSlot++;
-        if (slot >= (uint)t.SpriteCapacity)
-            throw new OutOfMemoryException("SpriteTable capacity exceeded.");
+        uint slot;
+        if (t.SpriteFreeCount > 0)
+        {
+            slot = t.SpriteFreeSlots[--t.SpriteFreeCount];
+        }
+        else
+        {
+            if (t.SpriteNextSlot >= t.SpriteCapacity)
+                throw new OutOfMemoryException("SpriteTable capacity exceeded.");
+            slot = (uint)t.SpriteNextSlot++;
+        }
 
         var h = SpriteHandle.Create(slot, t.SpriteGens[slot]);
         int d = t.SpriteCount++;
@@ -354,9 +368,17 @@ public static unsafe class RenderComponentSystem
 
     public static TextHandle AddText(ref RenderComponentTables t, in TextData template)
     {
-        uint slot = t.TextFreeCount > 0 ? t.TextFreeSlots[--t.TextFreeCount] : (uint)t.TextNextSlot++;
-        if (slot >= (uint)t.TextCapacity)
-            throw new OutOfMemoryException("TextTable capacity exceeded.");
+        uint slot;
+        if (t.TextFreeCount > 0)
+        {
+            slot = t.TextFreeSlots[--t.TextFreeCount];
+        }
+        else
+        {
+            if (t.TextNextSlot >= t.TextCapacity)
+                throw new OutOfMemoryException("TextTable capacity exceeded.");
+            slot = (uint)t.TextNextSlot++;
+        }
 
         var h = TextHandle.Create(slot, t.TextGens[slot]);
         int d = t.TextCount++;

@@ -307,6 +307,9 @@ public static unsafe class AssetSystem
 
     public static TextureHandle RegisterTexture(ref AssetRegistry reg, in TextureAssetData data)
     {
+        if (data.Width <= 0 || data.Height <= 0)
+            throw new ArgumentOutOfRangeException(nameof(data), "Texture width and height must be > 0.");
+
         for (int i = 0; i < reg.MaxTextures; i++)
         {
             if (reg.TextureAlive[i] == 0)
@@ -469,7 +472,8 @@ public static unsafe class AssetSystem
             {
                 if (reg.Meshes[i].GpuSlot >= 0 && reg.ReleaseGpuMesh != null)
                     reg.ReleaseGpuMesh(reg.GpuContextPtr, reg.Meshes[i].GpuSlot);
-                if (reg.Meshes[i].Name.IsValid) reg.MeshByName.Remove(reg.Meshes[i].Name.Value);
+                if (reg.Meshes[i].Name.IsValid && reg.MeshByName.TryGet(reg.Meshes[i].Name.Value, out uint cur) && cur == reg.Meshes[i].Handle.Raw)
+                    reg.MeshByName.Remove(reg.Meshes[i].Name.Value);
                 reg.MeshAlive[i] = 0;
                 reg.LiveMeshCount--;
                 uint g = (reg.MeshGens[i] + 1) & HandlePacking.GenerationMask;
@@ -482,7 +486,8 @@ public static unsafe class AssetSystem
             {
                 if (reg.Textures[i].GpuSlot >= 0 && reg.ReleaseGpuTexture != null)
                     reg.ReleaseGpuTexture(reg.GpuContextPtr, reg.Textures[i].GpuSlot);
-                if (reg.Textures[i].Name.IsValid) reg.TextureByName.Remove(reg.Textures[i].Name.Value);
+                if (reg.Textures[i].Name.IsValid && reg.TextureByName.TryGet(reg.Textures[i].Name.Value, out uint cur) && cur == reg.Textures[i].Handle.Raw)
+                    reg.TextureByName.Remove(reg.Textures[i].Name.Value);
                 reg.TextureAlive[i] = 0;
                 reg.LiveTextureCount--;
                 uint g = (reg.TextureGens[i] + 1) & HandlePacking.GenerationMask;
@@ -493,7 +498,8 @@ public static unsafe class AssetSystem
         {
             if (reg.MaterialAlive[i] != 0 && reg.Materials[i].OwnerBundle == bundle)
             {
-                if (reg.Materials[i].Name.IsValid) reg.MaterialByName.Remove(reg.Materials[i].Name.Value);
+                if (reg.Materials[i].Name.IsValid && reg.MaterialByName.TryGet(reg.Materials[i].Name.Value, out uint cur) && cur == reg.Materials[i].Handle.Raw)
+                    reg.MaterialByName.Remove(reg.Materials[i].Name.Value);
                 reg.MaterialAlive[i] = 0;
                 reg.LiveMaterialCount--;
                 uint g = (reg.MaterialGens[i] + 1) & HandlePacking.GenerationMask;
@@ -504,7 +510,8 @@ public static unsafe class AssetSystem
         {
             if (reg.FontAlive[i] != 0 && reg.Fonts[i].OwnerBundle == bundle)
             {
-                if (reg.Fonts[i].Name.IsValid) reg.FontByName.Remove(reg.Fonts[i].Name.Value);
+                if (reg.Fonts[i].Name.IsValid && reg.FontByName.TryGet(reg.Fonts[i].Name.Value, out uint cur) && cur == reg.Fonts[i].Handle.Raw)
+                    reg.FontByName.Remove(reg.Fonts[i].Name.Value);
                 reg.FontAlive[i] = 0;
                 reg.LiveFontCount--;
                 uint g = (reg.FontGens[i] + 1) & HandlePacking.GenerationMask;
@@ -515,7 +522,8 @@ public static unsafe class AssetSystem
         {
             if (reg.GltfAlive[i] != 0 && reg.GltfModels[i].OwnerBundle == bundle)
             {
-                if (reg.GltfModels[i].Name.IsValid) reg.GltfByName.Remove(reg.GltfModels[i].Name.Value);
+                if (reg.GltfModels[i].Name.IsValid && reg.GltfByName.TryGet(reg.GltfModels[i].Name.Value, out uint cur) && cur == reg.GltfModels[i].Handle.Raw)
+                    reg.GltfByName.Remove(reg.GltfModels[i].Name.Value);
                 reg.GltfAlive[i] = 0;
                 reg.LiveGltfCount--;
                 uint g = (reg.GltfGens[i] + 1) & HandlePacking.GenerationMask;
@@ -526,7 +534,8 @@ public static unsafe class AssetSystem
         {
             if (reg.SpriteRegions[i].Valid != 0 && reg.SpriteRegions[i].OwnerBundle == bundle)
             {
-                if (reg.SpriteRegions[i].Name.IsValid) reg.SpriteRegionByName.Remove(reg.SpriteRegions[i].Name.Value);
+                if (reg.SpriteRegions[i].Name.IsValid && reg.SpriteRegionByName.TryGet(reg.SpriteRegions[i].Name.Value, out int curSlot) && curSlot == i)
+                    reg.SpriteRegionByName.Remove(reg.SpriteRegions[i].Name.Value);
                 reg.SpriteRegions[i] = default;
                 reg.LiveSpriteRegionCount--;
             }

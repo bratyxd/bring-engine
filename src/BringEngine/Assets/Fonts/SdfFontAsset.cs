@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using BringEngine.Core.Handles;
+using BringEngine.Core.Logging;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
 using StbTrueTypeSharp;
@@ -26,16 +27,32 @@ public static unsafe class SdfFontLoader
         StringId name,
         float pixelSize = 48f,
         int atlasSize = 512,
-        int sdfPadding = 8)
+        int sdfPadding = 8,
+        LogState* log = null)
     {
+        ValidateBakeArgs(pixelSize, atlasSize, sdfPadding);
+
+        if (!string.IsNullOrEmpty(preferredTtfPath) && !File.Exists(preferredTtfPath) && log != null)
+            LogSystem.Warn(log, $"Preferred TTF font '{preferredTtfPath}' not found; falling back to system/procedural font.");
+
         string? resolved = ResolveTtfPath(preferredTtfPath);
         if (resolved != null && File.Exists(resolved))
         {
             byte[] ttfBytes = File.ReadAllBytes(resolved);
-            return BakeSdfFromMemory(ttfBytes, ref bundleArena, ref assets, bundle, name, pixelSize, atlasSize, sdfPadding);
+            return BakeSdfFromMemory(ttfBytes, ref bundleArena, ref assets, bundle, name, pixelSize, atlasSize, sdfPadding, log);
         }
 
         return BakeProceduralFallbackSdf(ref bundleArena, ref assets, bundle, name, pixelSize, atlasSize, sdfPadding);
+    }
+
+    private static void ValidateBakeArgs(float pixelSize, int atlasSize, int sdfPadding)
+    {
+        if (!float.IsFinite(pixelSize) || pixelSize <= 0f)
+            throw new ArgumentOutOfRangeException(nameof(pixelSize), pixelSize, "Font pixelSize must be finite and > 0.");
+        if (atlasSize < 16)
+            throw new ArgumentOutOfRangeException(nameof(atlasSize), atlasSize, "Font atlasSize must be >= 16.");
+        if (sdfPadding <= 0)
+            throw new ArgumentOutOfRangeException(nameof(sdfPadding), sdfPadding, "Font sdfPadding must be > 0.");
     }
 
     public static string? ResolveTtfPath(string? preferredPath)
@@ -71,13 +88,18 @@ public static unsafe class SdfFontLoader
         StringId name,
         float pixelSize = 48f,
         int atlasSize = 512,
-        int sdfPadding = 8)
+        int sdfPadding = 8,
+        LogState* log = null)
     {
+        if (ttfData == null || ttfData.Length == 0)
+            throw new ArgumentException("TTF font buffer cannot be empty.", nameof(ttfData));
+        ValidateBakeArgs(pixelSize, atlasSize, sdfPadding);
+
         // Symmetric SDF edge (128 = 0.502) gives full [128..255] interior range so small UI glyphs stay 100% opaque
         const byte onEdgeValue = 128;
         float pixelDistScale = onEdgeValue / (float)sdfPadding;
 
-        byte* atlasPixels = bundleArena.Alloc<byte>(atlasSize * atlasSize, 64);
+        byte* atlasPixels = bundleArena.Alloc<byte>(checked(atlasSize * atlasSize), 64);
         GlyphMetrics* glyphs = bundleArena.Alloc<GlyphMetrics>(AsciiCount, 64);
         float* kernTable = bundleArena.Alloc<float>(AsciiCount * AsciiCount, 64);
 
@@ -92,6 +114,7 @@ public static unsafe class SdfFontLoader
             StbTrueType.stbtt_GetFontVMetrics(fontInfo, &ascentI, &descentI, &lineGapI);
 
             int penX = 2, penY = 2, shelfHeight = 0;
+            int overflowedGlyphs = 0;
             float invAtlas = 1f / atlasSize;
 
             for (int idx = 0; idx < AsciiCount; idx++)
@@ -118,7 +141,7 @@ public static unsafe class SdfFontLoader
                         shelfHeight = 0;
                     }
 
-                    if (penY + gh + 2 < atlasSize)
+                    if (penY + gh + 2 < atlasSize && penX + gw + 2 < atlasSize)
                     {
                         for (int row = 0; row < gh; row++)
                         {
@@ -137,10 +160,17 @@ public static unsafe class SdfFontLoader
                         penX += gw + 2;
                         if (gh > shelfHeight) shelfHeight = gh;
                     }
+                    else
+                    {
+                        overflowedGlyphs++;
+                    }
 
                     StbTrueType.stbtt_FreeSDF(sdf, null);
                 }
             }
+
+            if (overflowedGlyphs > 0 && log != null)
+                LogSystem.Warn(log, $"SDF font atlas ({atlasSize}x{atlasSize}) omitted {overflowedGlyphs} glyph(s) due to atlas overflow.");
 
             // Precompute O(1) ASCII kerning table
             for (int a = 0; a < AsciiCount; a++)

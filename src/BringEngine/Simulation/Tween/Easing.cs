@@ -58,24 +58,24 @@ public static class Easing
 
             EaseType.InCubic => t * t * t,
             EaseType.OutCubic => 1f - (1f - t) * (1f - t) * (1f - t),
-            EaseType.InOutCubic => t < 0.5f ? 4f * t * t * t : 1f - DetMath.Pow(-2f * t + 2f, 3f) * 0.5f,
+            EaseType.InOutCubic => InOutCubic(t),
 
             EaseType.InQuart => t * t * t * t,
-            EaseType.OutQuart => 1f - DetMath.Pow(1f - t, 4f),
-            EaseType.InOutQuart => t < 0.5f ? 8f * t * t * t * t : 1f - DetMath.Pow(-2f * t + 2f, 4f) * 0.5f,
+            EaseType.OutQuart => OutQuart(t),
+            EaseType.InOutQuart => InOutQuart(t),
 
             EaseType.InQuint => t * t * t * t * t,
-            EaseType.OutQuint => 1f - DetMath.Pow(1f - t, 5f),
-            EaseType.InOutQuint => t < 0.5f ? 16f * t * t * t * t * t : 1f - DetMath.Pow(-2f * t + 2f, 5f) * 0.5f,
+            EaseType.OutQuint => OutQuint(t),
+            EaseType.InOutQuint => InOutQuint(t),
 
             EaseType.InSine => 1f - DetMath.Cos(t * DetMath.HalfPi),
             EaseType.OutSine => DetMath.Sin(t * DetMath.HalfPi),
             EaseType.InOutSine => -(DetMath.Cos(DetMath.Pi * t) - 1f) * 0.5f,
 
-            EaseType.InExpo => t == 0f ? 0f : DetMath.Pow(2f, 10f * t - 10f),
-            EaseType.OutExpo => t == 1f ? 1f : 1f - DetMath.Pow(2f, -10f * t),
+            EaseType.InExpo => t == 0f ? 0f : DetMath.Exp2(10f * t - 10f),
+            EaseType.OutExpo => t == 1f ? 1f : 1f - DetMath.Exp2(-10f * t),
             EaseType.InOutExpo => t == 0f ? 0f : t == 1f ? 1f :
-                t < 0.5f ? DetMath.Pow(2f, 20f * t - 10f) * 0.5f : (2f - DetMath.Pow(2f, -20f * t + 10f)) * 0.5f,
+                t < 0.5f ? DetMath.Exp2(20f * t - 10f) * 0.5f : (2f - DetMath.Exp2(-20f * t + 10f)) * 0.5f,
 
             EaseType.InCirc => 1f - DetMath.Sqrt(1f - t * t),
             EaseType.OutCirc => DetMath.Sqrt(1f - (t - 1f) * (t - 1f)),
@@ -98,6 +98,43 @@ public static class Easing
             EaseType.SmoothStep => t * t * (3f - 2f * t),
             _ => t,
         };
+    }
+
+    private static float InOutCubic(float t)
+    {
+        if (t < 0.5f) return 4f * t * t * t;
+        float u = -2f * t + 2f;
+        return 1f - u * u * u * 0.5f;
+    }
+
+    private static float OutQuart(float t)
+    {
+        float u = 1f - t;
+        float u2 = u * u;
+        return 1f - u2 * u2;
+    }
+
+    private static float InOutQuart(float t)
+    {
+        if (t < 0.5f) return 8f * t * t * t * t;
+        float u = -2f * t + 2f;
+        float u2 = u * u;
+        return 1f - u2 * u2 * 0.5f;
+    }
+
+    private static float OutQuint(float t)
+    {
+        float u = 1f - t;
+        float u2 = u * u;
+        return 1f - u2 * u2 * u;
+    }
+
+    private static float InOutQuint(float t)
+    {
+        if (t < 0.5f) return 16f * t * t * t * t * t;
+        float u = -2f * t + 2f;
+        float u2 = u * u;
+        return 1f - u2 * u2 * u * 0.5f;
     }
 
     private static float InBack(float t)
@@ -129,7 +166,7 @@ public static class Easing
         if (t <= 0f) return 0f;
         if (t >= 1f) return 1f;
         const float c4 = DetMath.TwoPi / 3f;
-        return -DetMath.Pow(2f, 10f * t - 10f) * DetMath.Sin((t * 10f - 10.75f) * c4);
+        return -DetMath.Exp2(10f * t - 10f) * DetMath.Sin((t * 10f - 10.75f) * c4);
     }
 
     private static float OutElastic(float t)
@@ -137,7 +174,7 @@ public static class Easing
         if (t <= 0f) return 0f;
         if (t >= 1f) return 1f;
         const float c4 = DetMath.TwoPi / 3f;
-        return DetMath.Pow(2f, -10f * t) * DetMath.Sin((t * 10f - 0.75f) * c4) + 1f;
+        return DetMath.Exp2(-10f * t) * DetMath.Sin((t * 10f - 0.75f) * c4) + 1f;
     }
 
     private static float InOutElastic(float t)
@@ -146,8 +183,8 @@ public static class Easing
         if (t >= 1f) return 1f;
         const float c5 = DetMath.TwoPi / 4.5f;
         return t < 0.5f
-            ? -(DetMath.Pow(2f, 20f * t - 10f) * DetMath.Sin((20f * t - 11.125f) * c5)) * 0.5f
-            : (DetMath.Pow(2f, -20f * t + 10f) * DetMath.Sin((20f * t - 11.125f) * c5)) * 0.5f + 1f;
+            ? -(DetMath.Exp2(20f * t - 10f) * DetMath.Sin((20f * t - 11.125f) * c5)) * 0.5f
+            : (DetMath.Exp2(-20f * t + 10f) * DetMath.Sin((20f * t - 11.125f) * c5)) * 0.5f + 1f;
     }
 
     private static float OutBounce(float t)

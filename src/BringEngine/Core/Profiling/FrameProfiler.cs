@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 using BringEngine.Core.Memory;
 
 namespace BringEngine.Core.Profiling;
@@ -102,17 +103,20 @@ public static unsafe class ProfilerSystem
     {
         if (p.Enabled == 0) return;
 
-        // Snapshot previous frame scopes for UI / inspection
-        p.LastFrameScopeCount = p.ActiveScopeCount;
-        if (p.ActiveScopeCount > 0 && p.ActiveScopes != null && p.LastFrameScopes != null)
+        // Copy scopes BEFORE publishing LastFrameScopeCount so concurrent readers never see tearing
+        int prevCount = Volatile.Read(ref p.ActiveScopeCount);
+        if (prevCount < 0) prevCount = 0;
+        if (prevCount > FrameProfiler.MaxScopesPerFrame) prevCount = FrameProfiler.MaxScopesPerFrame;
+        if (prevCount > 0 && p.ActiveScopes != null && p.LastFrameScopes != null)
         {
-            nuint bytes = (nuint)(p.ActiveScopeCount * sizeof(ProfileScopeSample));
+            nuint bytes = (nuint)(prevCount * sizeof(ProfileScopeSample));
             Buffer.MemoryCopy(p.ActiveScopes, p.LastFrameScopes, bytes, bytes);
         }
+        Volatile.Write(ref p.LastFrameScopeCount, prevCount);
 
-        p.ActiveScopeCount = 0;
-        p.CurrentDepth = 0;
-        p.GpuWaitTicks = 0;
+        Volatile.Write(ref p.ActiveScopeCount, 0);
+        Volatile.Write(ref p.CurrentDepth, 0);
+        Volatile.Write(ref p.GpuWaitTicks, 0);
         p.GpuFrameMs = 0.0;
         p.LogicCpuMs = 0.0;
         p.RenderCpuMs = 0.0;
@@ -126,16 +130,29 @@ public static unsafe class ProfilerSystem
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int BeginScope(ref FrameProfiler p, ReadOnlySpan<char> name)
     {
-        if (p.Enabled == 0 || p.ActiveScopes == null || p.ActiveScopeCount >= FrameProfiler.MaxScopesPerFrame)
+        if (p.Enabled == 0 || p.ActiveScopes == null)
             return -1;
 
-        int idx = p.ActiveScopeCount++;
+        int idx;
+        while (true)
+        {
+            int cur = Volatile.Read(ref p.ActiveScopeCount);
+            if (cur >= FrameProfiler.MaxScopesPerFrame)
+                return -1;
+            if (Interlocked.CompareExchange(ref p.ActiveScopeCount, cur + 1, cur) == cur)
+            {
+                idx = cur;
+                break;
+            }
+        }
+
+        int depth = Interlocked.Increment(ref p.CurrentDepth) - 1;
         p.ActiveScopes[idx] = new ProfileScopeSample
         {
             Name = FixedString64.From(name),
             StartTick = Stopwatch.GetTimestamp(),
             DurationMs = 0.0,
-            Depth = p.CurrentDepth++,
+            Depth = depth,
             Completed = 0,
         };
         return idx;
@@ -144,14 +161,20 @@ public static unsafe class ProfilerSystem
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void EndScope(ref FrameProfiler p, int scopeIndex)
     {
-        if (p.Enabled == 0 || scopeIndex < 0 || scopeIndex >= p.ActiveScopeCount)
+        int count = Volatile.Read(ref p.ActiveScopeCount);
+        if (p.Enabled == 0 || p.ActiveScopes == null || scopeIndex < 0 || scopeIndex >= count)
             return;
 
         long now = Stopwatch.GetTimestamp();
         ref ProfileScopeSample s = ref p.ActiveScopes[scopeIndex];
         s.DurationMs = (now - s.StartTick) * s_ticksToMs;
         s.Completed = 1;
-        if (p.CurrentDepth > 0) p.CurrentDepth--;
+        while (true)
+        {
+            int d = Volatile.Read(ref p.CurrentDepth);
+            if (d <= 0) break;
+            if (Interlocked.CompareExchange(ref p.CurrentDepth, d - 1, d) == d) break;
+        }
     }
 
     /// <summary>
@@ -186,7 +209,7 @@ public static unsafe class ProfilerSystem
     {
         if (p.Enabled == 0) return;
         p.GpuFrameMs = gpuMs < 0.0 ? 0.0 : gpuMs;
-        p.GpuWaitTicks += waitTicks;
+        Interlocked.Add(ref p.GpuWaitTicks, waitTicks);
     }
 
     /// <summary>
@@ -197,7 +220,7 @@ public static unsafe class ProfilerSystem
     {
         if (p.Enabled == 0) return;
         p.CpuEndTick = Stopwatch.GetTimestamp();
-        long pureCpuTicks = (p.CpuEndTick - p.FrameStartTick) - p.GpuWaitTicks;
+        long pureCpuTicks = (p.CpuEndTick - p.FrameStartTick) - Volatile.Read(ref p.GpuWaitTicks);
         if (pureCpuTicks < 0) pureCpuTicks = 0;
         double totalCpuMs = pureCpuTicks * s_ticksToMs;
 
@@ -274,8 +297,10 @@ public static unsafe class ProfilerSystem
     {
         if (p.LastFrameScopes != null)
         {
+            int count = Volatile.Read(ref Unsafe.AsRef(in p.LastFrameScopeCount));
+            if (count > FrameProfiler.MaxScopesPerFrame) count = FrameProfiler.MaxScopesPerFrame;
             FixedString64 target = FixedString64.From(scopeName);
-            for (int i = 0; i < p.LastFrameScopeCount; i++)
+            for (int i = 0; i < count; i++)
             {
                 if (p.LastFrameScopes[i].Name.Equals(target))
                 {

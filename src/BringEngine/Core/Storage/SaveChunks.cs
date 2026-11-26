@@ -86,7 +86,13 @@ public unsafe struct SaveChunkWriter
             return false;
         }
 
-        int needed = Buffer.Count + ChunkHeaderSize + payload.Length;
+        long neededLong = (long)Buffer.Count + ChunkHeaderSize + payload.Length;
+        if (neededLong > int.MaxValue)
+        {
+            Overflow = 1;
+            return false;
+        }
+        int needed = (int)neededLong;
         if (needed > Buffer.Capacity)
         {
             try
@@ -160,7 +166,7 @@ public unsafe struct SaveChunkReader
         if (Malformed != 0 || Data == null || Position >= Length)
             return false;
 
-        if (Position + SaveChunkWriter.ChunkHeaderSize > Length)
+        if (Position > Length - SaveChunkWriter.ChunkHeaderSize)
         {
             Malformed = 1;
             return false;
@@ -173,7 +179,7 @@ public unsafe struct SaveChunkReader
         int payloadLen = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(hdr + 12, 4));
 
         int dataStart = Position + SaveChunkWriter.ChunkHeaderSize;
-        if (payloadLen < 0 || dataStart + payloadLen > Length)
+        if (payloadLen < 0 || payloadLen > Length - dataStart)
         {
             Malformed = 1;
             return false;

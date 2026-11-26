@@ -1,7 +1,9 @@
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Unicode;
 
 namespace BringEngine.Core.Memory;
 
@@ -19,19 +21,36 @@ public readonly struct StringId : IEquatable<StringId>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public StringId(ulong value) => Value = value;
 
-    public static StringId Hash(ReadOnlySpan<char> text)
+    public static unsafe StringId Hash(ReadOnlySpan<char> text)
     {
         if (text.IsEmpty) return Empty;
         ulong h = 14695981039346656037UL;
-        for (int i = 0; i < text.Length; i++)
+        int i = 0;
+        for (; i < text.Length; i++)
         {
             char c = text[i];
-            h ^= (byte)(c & 0xFF);
+            if (c > 0x7F) break;
+            h ^= (byte)c;
             h *= 1099511628211UL;
-            if (c > 0xFF)
+        }
+        if (i < text.Length)
+        {
+            byte* stackBuf = stackalloc byte[256];
+            Span<byte> dst = new Span<byte>(stackBuf, 256);
+            ReadOnlySpan<char> remaining = text.Slice(i);
+            while (!remaining.IsEmpty)
             {
-                h ^= (byte)(c >> 8);
-                h *= 1099511628211UL;
+                bool isFinal = remaining.Length <= 85;
+                Utf8.FromUtf16(
+                    remaining, dst, out int charsRead, out int bytesWritten,
+                    replaceInvalidSequences: true, isFinalBlock: isFinal);
+                for (int b = 0; b < bytesWritten; b++)
+                {
+                    h ^= stackBuf[b];
+                    h *= 1099511628211UL;
+                }
+                if (charsRead <= 0) break;
+                remaining = remaining.Slice(charsRead);
             }
         }
         return new StringId(h == 0 ? 1UL : h);
@@ -72,17 +91,31 @@ public unsafe struct FixedString64 : IEquatable<FixedString64>
         FixedString64 s = default;
         if (text.IsEmpty) return s;
         Span<byte> dst = new Span<byte>(s.Data, MaxBytes);
-        int maxChars = text.Length;
-        while (maxChars > 0 && Encoding.UTF8.GetByteCount(text.Slice(0, maxChars)) > MaxBytes)
-            maxChars--;
-        s.Length = Encoding.UTF8.GetBytes(text.Slice(0, maxChars), dst);
+        OperationStatus status = Utf8.FromUtf16(
+            text, dst, out int charsRead, out int bytesWritten,
+            replaceInvalidSequences: true, isFinalBlock: false);
+        if (status == OperationStatus.NeedMoreData && bytesWritten < MaxBytes)
+        {
+            Utf8.FromUtf16(
+                text.Slice(charsRead), dst.Slice(bytesWritten), out _, out int extra,
+                replaceInvalidSequences: true, isFinalBlock: true);
+            bytesWritten += extra;
+        }
+        s.Length = bytesWritten;
         return s;
     }
 
     public static FixedString64 FromUtf8(ReadOnlySpan<byte> utf8)
     {
         FixedString64 s = default;
-        int len = utf8.Length < MaxBytes ? utf8.Length : MaxBytes;
+        int len = utf8.Length;
+        if (len > MaxBytes)
+        {
+            len = MaxBytes;
+            int minLen = len > 3 ? len - 3 : 0;
+            while (len > minLen && (utf8[len] & 0xC0) == 0x80)
+                len--;
+        }
         s.Length = len;
         if (len > 0)
             utf8.Slice(0, len).CopyTo(new Span<byte>(s.Data, len));
@@ -130,17 +163,31 @@ public unsafe struct FixedString256
         FixedString256 s = default;
         if (text.IsEmpty) return s;
         Span<byte> dst = new Span<byte>(s.Data, MaxBytes);
-        int maxChars = text.Length;
-        while (maxChars > 0 && Encoding.UTF8.GetByteCount(text.Slice(0, maxChars)) > MaxBytes)
-            maxChars--;
-        s.Length = Encoding.UTF8.GetBytes(text.Slice(0, maxChars), dst);
+        OperationStatus status = Utf8.FromUtf16(
+            text, dst, out int charsRead, out int bytesWritten,
+            replaceInvalidSequences: true, isFinalBlock: false);
+        if (status == OperationStatus.NeedMoreData && bytesWritten < MaxBytes)
+        {
+            Utf8.FromUtf16(
+                text.Slice(charsRead), dst.Slice(bytesWritten), out _, out int extra,
+                replaceInvalidSequences: true, isFinalBlock: true);
+            bytesWritten += extra;
+        }
+        s.Length = bytesWritten;
         return s;
     }
 
     public static FixedString256 FromUtf8(ReadOnlySpan<byte> utf8)
     {
         FixedString256 s = default;
-        int len = utf8.Length < MaxBytes ? utf8.Length : MaxBytes;
+        int len = utf8.Length;
+        if (len > MaxBytes)
+        {
+            len = MaxBytes;
+            int minLen = len > 3 ? len - 3 : 0;
+            while (len > minLen && (utf8[len] & 0xC0) == 0x80)
+                len--;
+        }
         s.Length = len;
         if (len > 0)
             utf8.Slice(0, len).CopyTo(new Span<byte>(s.Data, len));
@@ -223,6 +270,8 @@ public unsafe struct NativeList<T> where T : unmanaged
 
     public static NativeList<T> CreateInArena(ref LinearArena arena, int capacity, nuint alignment = 16)
     {
+        if (capacity < 0)
+            throw new ArgumentOutOfRangeException(nameof(capacity));
         T* data = capacity > 0 ? arena.AllocUninitialized<T>(capacity, alignment) : null;
         return new NativeList<T>
         {
@@ -235,8 +284,13 @@ public unsafe struct NativeList<T> where T : unmanaged
 
     public static NativeList<T> CreateGrowable(int initialCapacity = 16)
     {
+        if (initialCapacity < 0)
+            throw new ArgumentOutOfRangeException(nameof(initialCapacity));
         int cap = initialCapacity < 4 ? 4 : initialCapacity;
-        T* data = (T*)NativeMemoryTracker.AlignedAllocZeroed((nuint)sizeof(T) * (nuint)cap, 64);
+        ulong bytes = (ulong)sizeof(T) * (ulong)cap;
+        if (bytes > int.MaxValue)
+            throw new OutOfMemoryException($"NativeList<{typeof(T).Name}> initial capacity {cap} exceeds maximum.");
+        T* data = (T*)NativeMemoryTracker.AlignedAllocZeroed((nuint)bytes, 64);
         return new NativeList<T>
         {
             Data = data,
@@ -266,7 +320,7 @@ public unsafe struct NativeList<T> where T : unmanaged
         {
             if (_ownsMemory == 0)
                 throw new InvalidOperationException($"Arena-backed NativeList<{typeof(T).Name}> exceeded fixed capacity {Capacity}.");
-            Grow(Capacity == 0 ? 8 : Capacity * 2);
+            EnsureCapacity(Count + 1);
         }
         Data[Count++] = item;
     }
@@ -278,7 +332,7 @@ public unsafe struct NativeList<T> where T : unmanaged
         {
             if (_ownsMemory == 0)
                 throw new InvalidOperationException($"Arena-backed NativeList<{typeof(T).Name}> exceeded fixed capacity {Capacity}.");
-            Grow(Capacity == 0 ? 8 : Capacity * 2);
+            EnsureCapacity(Count + 1);
         }
         ref T slot = ref Data[Count++];
         slot = default;
@@ -287,12 +341,25 @@ public unsafe struct NativeList<T> where T : unmanaged
 
     public void EnsureCapacity(int minCapacity)
     {
-        if (Capacity >= minCapacity) return;
+        if (minCapacity <= Capacity) return;
         if (_ownsMemory == 0)
             throw new InvalidOperationException("Cannot grow an arena-backed NativeList.");
-        int newCap = Capacity == 0 ? 8 : Capacity;
-        while (newCap < minCapacity) newCap *= 2;
-        Grow(newCap);
+        int elemSize = sizeof(T);
+        int maxElements = elemSize > 0 ? int.MaxValue / elemSize : int.MaxValue;
+        if (minCapacity > maxElements)
+            throw new OutOfMemoryException($"NativeList<{typeof(T).Name}> requested capacity {minCapacity} exceeds max elements ({maxElements}).");
+
+        long newCap = Capacity <= 0 ? 8L : (long)Capacity;
+        while (newCap < minCapacity)
+        {
+            newCap *= 2L;
+            if (newCap > maxElements)
+            {
+                newCap = minCapacity;
+                break;
+            }
+        }
+        Grow((int)newCap);
     }
 
     private void Grow(int newCapacity)
@@ -312,6 +379,8 @@ public unsafe struct NativeList<T> where T : unmanaged
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void RemoveAtSwapBack(int index)
     {
+        if ((uint)index >= (uint)Count)
+            throw new ArgumentOutOfRangeException(nameof(index));
         int last = --Count;
         if (index != last)
             Data[index] = Data[last];
@@ -353,6 +422,11 @@ public unsafe struct NativeSparseSet<T> where T : unmanaged
 
     public static NativeSparseSet<T> Create(ref LinearArena arena, int maxEntityId, int denseCapacity)
     {
+        if (maxEntityId <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxEntityId), "maxEntityId must be positive.");
+        if (denseCapacity <= 0)
+            throw new ArgumentOutOfRangeException(nameof(denseCapacity), "denseCapacity must be positive.");
+
         int* sparse = arena.AllocUninitialized<int>(maxEntityId, 64);
         for (int i = 0; i < maxEntityId; i++) sparse[i] = -1;
 
@@ -388,8 +462,10 @@ public unsafe struct NativeSparseSet<T> where T : unmanaged
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ref T AddOrReplace(uint entityIndex, in T value)
     {
+        if (entityIndex >= (uint)MaxEntityId)
+            throw new ArgumentOutOfRangeException(nameof(entityIndex));
         int existing = Sparse[entityIndex];
-        if (existing >= 0)
+        if (existing >= 0 && existing < Count && DenseIds[existing] == entityIndex)
         {
             DenseValues[existing] = value;
             return ref DenseValues[existing];
@@ -408,10 +484,11 @@ public unsafe struct NativeSparseSet<T> where T : unmanaged
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public readonly ref T GetRef(uint entityIndex)
     {
+        if (entityIndex >= (uint)MaxEntityId)
+            throw new ArgumentOutOfRangeException(nameof(entityIndex));
         int d = Sparse[entityIndex];
-#if DEBUG
-        if (d < 0) throw new InvalidOperationException($"Entity {entityIndex} does not have component {typeof(T).Name}.");
-#endif
+        if (d < 0 || d >= Count || DenseIds[d] != entityIndex)
+            throw new InvalidOperationException($"Entity {entityIndex} does not have component {typeof(T).Name}.");
         return ref DenseValues[d];
     }
 
@@ -467,8 +544,13 @@ public unsafe struct NativeHashMap<TValue> where TValue : unmanaged
 
     public static NativeHashMap<TValue> Create(ref LinearArena arena, int minCapacity)
     {
+        if (minCapacity < 0)
+            throw new ArgumentOutOfRangeException(nameof(minCapacity));
+        long target = (long)minCapacity * 2L;
+        if (target > 0x4000_0000L)
+            throw new OutOfMemoryException($"NativeHashMap<{typeof(TValue).Name}> capacity {minCapacity} exceeds maximum.");
         int cap = 16;
-        while (cap < minCapacity * 2) cap <<= 1;
+        while (cap < target) cap <<= 1;
 
         ulong* keys = arena.Alloc<ulong>(cap, 64);
         TValue* values = arena.Alloc<TValue>(cap, 64);
@@ -559,6 +641,15 @@ public unsafe struct NativeHashMap<TValue> where TValue : unmanaged
             slot = (slot + 1) & Mask;
         }
 
+        if (firstTombstone >= 0)
+        {
+            Keys[firstTombstone] = key;
+            Values[firstTombstone] = value;
+            States[firstTombstone] = 1;
+            Count++;
+            return;
+        }
+
         throw new OutOfMemoryException($"NativeHashMap<{typeof(TValue).Name}> capacity {Capacity} exhausted.");
     }
 
@@ -571,8 +662,23 @@ public unsafe struct NativeHashMap<TValue> where TValue : unmanaged
             if (st == 0) return false;
             if (st == 1 && Keys[slot] == key)
             {
-                States[slot] = 2;
                 Count--;
+                int next = (slot + 1) & Mask;
+                if (States[next] == 0)
+                {
+                    States[slot] = 0;
+                    // Also clear any contiguous preceding tombstones that now terminate at empty slot
+                    int cur = (slot - 1) & Mask;
+                    for (int back = 0; back < Capacity && States[cur] == 2; back++)
+                    {
+                        States[cur] = 0;
+                        cur = (cur - 1) & Mask;
+                    }
+                }
+                else
+                {
+                    States[slot] = 2;
+                }
                 return true;
             }
             slot = (slot + 1) & Mask;
