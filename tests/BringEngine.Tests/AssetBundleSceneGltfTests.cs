@@ -429,7 +429,8 @@ public static unsafe class AssetBundleSceneGltfTests
             Assert.Near(1.75f, world.Animations.FrameJointPalette[1].C3.Y, 1e-3f, "ChildJoint inherits ParentJoint Y == 1.75");
 
             // 2. Embedded base64 data: image URI > 1KB with baseDirectory: null
-            string b64Png = Convert.ToBase64String(png32);
+            byte[] randPng32 = MakeRandomPngBytes(32, 32);
+            string b64Png = Convert.ToBase64String(randPng32);
             Assert.True(b64Png.Length > 1024, $"Base64 PNG > 1KB ({b64Png.Length} chars)");
             string b64Gltf = "{"
                 + "\"asset\":{\"version\":\"2.0\"},"
@@ -470,7 +471,7 @@ public static unsafe class AssetBundleSceneGltfTests
     private static void TestGltfCorruptAndInstantiateCleanup()
     {
         NativeMemoryTracker.ResetStatsForTest();
-        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 512 * 1024, 1 * 1024 * 1024, 128 * 1024);
+        var alloc = EngineAllocators.Create(8 * 1024 * 1024, 512 * 1024, 1 * 1024 * 1024, 128 * 1024);
         var world = EngineWorld.Create(ref alloc.Persistent, 64, 32);
         var bundleArena = LinearArena.Create(1 * 1024 * 1024);
         var bundleId = BundleId.Create(4, 1);
@@ -744,6 +745,26 @@ public static unsafe class AssetBundleSceneGltfTests
                 rgba[o + 2] = (byte)((x * 71 + y * 29) & 0xFF);
                 rgba[o + 3] = 255;
             }
+        }
+        using var ms = new MemoryStream();
+        new ImageWriter().WritePng(rgba, w, h, ColorComponents.RedGreenBlueAlpha, ms);
+        return ms.ToArray();
+    }
+
+    private static byte[] MakeRandomPngBytes(int w, int h)
+    {
+        byte[] rgba = new byte[w * h * 4];
+        uint state = 0x9E3779B9u;
+        for (int i = 0; i < w * h; i++)
+        {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            int o = i * 4;
+            rgba[o + 0] = (byte)(state & 0xFF);
+            rgba[o + 1] = (byte)((state >> 8) & 0xFF);
+            rgba[o + 2] = (byte)((state >> 16) & 0xFF);
+            rgba[o + 3] = 255;
         }
         using var ms = new MemoryStream();
         new ImageWriter().WritePng(rgba, w, h, ColorComponents.RedGreenBlueAlpha, ms);

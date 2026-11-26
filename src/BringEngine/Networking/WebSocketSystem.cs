@@ -884,6 +884,17 @@ file static class WsAsyncWorker
         Task? sendTask = null;
         CancellationTokenSource? loopCts = null;
         bool connectTimedOut = false;
+        bool slotFinished = false;
+
+        static async Task StopSendTaskAsync(Task? st, CancellationTokenSource? lcts, AutoResetEvent sw)
+        {
+            if (st != null)
+            {
+                try { lcts?.Cancel(); } catch { }
+                try { sw.Set(); } catch { }
+                try { await st.ConfigureAwait(false); } catch { }
+            }
+        }
 
         try
         {
@@ -930,6 +941,8 @@ file static class WsAsyncWorker
                 if (ws.State == WebSocketState.Aborted && !sawClose)
                 {
                     WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Faulted);
+                    WebSocketSystem.FinishConnectionFromWorker(statePtr, slotIdx);
+                    slotFinished = true;
                     FixedString256 errInfo = FixedString256.From("WebSocket connection aborted.");
                     WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Error, info: in errInfo);
                 }
@@ -950,6 +963,8 @@ file static class WsAsyncWorker
                         }
                     }
                     WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Closed);
+                    WebSocketSystem.FinishConnectionFromWorker(statePtr, slotIdx);
+                    slotFinished = true;
                     FixedString256 info = FixedString256.From(closeDesc);
                     WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Closed, closeStatus: closeCode, info: in info);
                 }
@@ -957,11 +972,15 @@ file static class WsAsyncWorker
         }
         catch (OperationCanceledException)
         {
+            await StopSendTaskAsync(sendTask, loopCts, sendWake).ConfigureAwait(false);
+            sendTask = null;
             if (!guard.Stopped && WebSocketSystem.IsActive(statePtr))
             {
                 if (connectTimedOut)
                 {
                     WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Faulted);
+                    WebSocketSystem.FinishConnectionFromWorker(statePtr, slotIdx);
+                    slotFinished = true;
                     FixedString256 info = FixedString256.From("Connection timed out.");
                     WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Error, info: in info);
                 }
@@ -971,24 +990,34 @@ file static class WsAsyncWorker
                     ushort closeCode = reqCode != 0 ? reqCode : (ushort)1000;
                     FixedString256 info = reqReason.Length > 0 ? reqReason : FixedString256.From("Connection closed.");
                     WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Closed);
+                    WebSocketSystem.FinishConnectionFromWorker(statePtr, slotIdx);
+                    slotFinished = true;
                     WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Closed, closeStatus: closeCode, info: in info);
                 }
             }
         }
         catch (ObjectDisposedException)
         {
+            await StopSendTaskAsync(sendTask, loopCts, sendWake).ConfigureAwait(false);
+            sendTask = null;
             if (!guard.Stopped && WebSocketSystem.IsActive(statePtr))
             {
                 WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Closed);
+                WebSocketSystem.FinishConnectionFromWorker(statePtr, slotIdx);
+                slotFinished = true;
                 FixedString256 info = FixedString256.From("Connection closed.");
                 WebSocketSystem.PushEventFromWorker(statePtr, handle, WebSocketEventKind.Closed, closeStatus: 1000, info: in info);
             }
         }
         catch (Exception ex)
         {
+            await StopSendTaskAsync(sendTask, loopCts, sendWake).ConfigureAwait(false);
+            sendTask = null;
             if (!guard.Stopped)
             {
                 WebSocketSystem.SetConnState(statePtr, slotIdx, WebSocketStateKind.Faulted);
+                WebSocketSystem.FinishConnectionFromWorker(statePtr, slotIdx);
+                slotFinished = true;
                 if (WebSocketSystem.IsActive(statePtr))
                 {
                     FixedString256 info = FixedString256.From(ex.Message);
@@ -998,15 +1027,10 @@ file static class WsAsyncWorker
         }
         finally
         {
-            if (sendTask != null)
-            {
-                try { loopCts?.Cancel(); } catch { }
-                try { sendWake.Set(); } catch { }
-                try { await sendTask.ConfigureAwait(false); } catch { }
-            }
+            await StopSendTaskAsync(sendTask, loopCts, sendWake).ConfigureAwait(false);
             loopCts?.Dispose();
 
-            if (!guard.Stopped)
+            if (!guard.Stopped && !slotFinished)
                 WebSocketSystem.FinishConnectionFromWorker(statePtr, slotIdx);
 
             Interlocked.Decrement(ref guard.ActiveWorkers);

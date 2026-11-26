@@ -426,11 +426,11 @@ public static unsafe class RenderTests
         float lcX2 = secondLineX - gmB.BearingX;
         Assert.Near(lcX1, lcX2, 1e-3f, "Wrapped line starts at exact same local X as line 1 (no leading space indent)");
 
-        // F6 & SHD-07: Single 256-char shadowed TextData must emit 512 glyphs (not truncated at 192) & forward CustomParams
+        // F6 & SHD-07: Single FixedString256-max (252-char) shadowed TextData must emit 504 glyphs (not truncated at 192) & forward CustomParams
         var longEnt = EntitySystem.Spawn(ref world.Entities);
         TransformSystem.Add(ref world.Transforms, longEnt, Vec3.Zero);
         TransformSystem.PropagateHierarchy(ref world.Transforms);
-        string longStr = new string('A', 256);
+        string longStr = new string('A', FixedString256.MaxBytes);
         var longTd = RenderComponentSystem.DefaultHudText(longEnt, fontH, longStr, default);
         longTd.CustomParams = new Vec4(1.5f, 2.5f, 3.5f, 4.5f);
         RenderComponentSystem.AddText(ref world.RenderComponents, in longTd);
@@ -438,9 +438,9 @@ public static unsafe class RenderTests
         alloc.BeginFrame();
         var shaders = new RenderShaderDefaults { SdfText = ShaderHandle.Create(1, 1) };
         BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref alloc.Frame, ref alloc.Scratch, out RenderPacket packet);
-        Assert.Equal(512, packet.Glyphs.Count, "Single 256-char shadowed TextData emits all 512 glyphs");
+        Assert.Equal(FixedString256.MaxBytes * 2, packet.Glyphs.Count, "Single FixedString256.MaxBytes shadowed TextData emits all 504 glyphs");
         Assert.Near(1.5f, packet.Glyphs[0].CustomParams.X, 1e-4f, "GlyphGpuInstance forwards TextData.CustomParams.X");
-        Assert.Near(4.5f, packet.Glyphs[511].CustomParams.W, 1e-4f, "GlyphGpuInstance forwards TextData.CustomParams.W");
+        Assert.Near(4.5f, packet.Glyphs[FixedString256.MaxBytes * 2 - 1].CustomParams.W, 1e-4f, "GlyphGpuInstance forwards TextData.CustomParams.W");
 
         bundleArena.Dispose();
         alloc.Dispose();
@@ -528,6 +528,7 @@ public static unsafe class RenderTests
             RenderComponentSystem.AddText(ref world.RenderComponents, in td2);
 
             CameraSystem.CreatePerspective(ref world.Cameras, new Vec3(0f, 2f, 12f), Vec3.Zero);
+            CameraSystem.CreateOrthographicUI(ref world.Cameras, 1280f, 720f, depthOrder: 10);
             TransformSystem.PropagateHierarchy(ref world.Transforms);
             CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, 1f / 60f, 1280, 720);
 

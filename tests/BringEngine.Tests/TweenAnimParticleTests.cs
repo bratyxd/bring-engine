@@ -553,11 +553,16 @@ public static unsafe class TweenAnimParticleTests
         var smallPool = ParticleTable.Create(ref alloc.Persistent, 16, 8);
         var fastCfg = ParticleSystem.DefaultEmitter(Vec3.Zero, seed: 42);
         fastCfg.EmitRate = 1e9f;
-        ParticleSystem.CreateEmitter(ref smallPool, in fastCfg);
+        fastCfg.LifetimeMin = 200f;
+        fastCfg.LifetimeMax = 200f;
+        var fastEmH = ParticleSystem.CreateEmitter(ref smallPool, in fastCfg);
         ParticleSystem.Step(ref smallPool, in transforms, 100f);
         Assert.Equal(16, smallPool.ParticleCount, "EmitAccumulator overflow clamped cleanly to capacity");
+        Assert.True(ParticleSystem.DestroyEmitter(ref smallPool, fastEmH), "DestroyEmitter cleans up saturated emitter");
+        Assert.Equal(0, smallPool.ParticleCount, "DestroyEmitter synchronously removed saturated particles");
 
         // 3. Local-space (WorldSpace = 0) FollowEntity + hold last position on entity removal + DestroyEmitter
+        var localPool = ParticleTable.Create(ref alloc.Persistent, 16, 8);
         var target = EntitySystem.Spawn(ref entities);
         TransformSystem.Add(ref transforms, target, new Vec3(5, 0, 0));
         TransformSystem.PropagateHierarchy(ref transforms);
@@ -572,27 +577,28 @@ public static unsafe class TweenAnimParticleTests
         localCfg.LifetimeMin = 5f; localCfg.LifetimeMax = 5f;
         localCfg.AtlasColumns = 2; localCfg.AtlasRows = 2;
         var scA = SceneId.Create(1, 1);
-        var emH = ParticleSystem.CreateEmitter(ref smallPool, in localCfg, scA);
-        ParticleSystem.Burst(ref smallPool, emH, 1);
-        ParticleSystem.Step(ref smallPool, in transforms, 0.01f);
-        int localIdx = smallPool.ParticleCount - 1;
-        float x0 = smallPool.PosX[localIdx];
+        var emH = ParticleSystem.CreateEmitter(ref localPool, in localCfg, scA);
+        ParticleSystem.Burst(ref localPool, emH, 1);
+        ParticleSystem.Step(ref localPool, in transforms, 0.01f);
+        int localIdx = localPool.ParticleCount - 1;
+        float x0 = localPool.PosX[localIdx];
 
         // Move target by +10 in X -> local-space particle shifts by +10
         TransformSystem.SetLocalPosition(ref transforms, target, new Vec3(15, 0, 0));
         TransformSystem.PropagateHierarchy(ref transforms);
-        ParticleSystem.Step(ref smallPool, in transforms, 0.01f);
-        Assert.Near(x0 + 10f, smallPool.PosX[localIdx], 0.1f, "Local-space particle followed entity movement");
+        ParticleSystem.Step(ref localPool, in transforms, 0.01f);
+        Assert.Near(x0 + 10f, localPool.PosX[localIdx], 0.1f, "Local-space particle followed entity movement");
 
         // Remove target -> emitter holds last position (15, 0, 0) instead of snapping to Vec3.Zero
         TransformSystem.Remove(ref transforms, target);
-        ParticleSystem.Step(ref smallPool, in transforms, 0.01f);
-        Assert.Near(15f, ParticleSystem.TryGetEmitter(in smallPool, emH)->Position.X, 1e-4f, "Emitter holds last position on target removal");
+        ParticleSystem.Step(ref localPool, in transforms, 0.01f);
+        Assert.Near(15f, ParticleSystem.TryGetEmitter(in localPool, emH)->Position.X, 1e-4f, "Emitter holds last position on target removal");
 
         // DestroyEmitter invalidates handle & removes particles
-        Assert.True(ParticleSystem.DestroyEmitter(ref smallPool, emH), "DestroyEmitter succeeded");
-        Assert.True(ParticleSystem.TryGetEmitter(in smallPool, emH) == null, "Stale EmitterHandle rejected");
-        ParticleSystem.DestroyByScene(ref smallPool, scA);
+        Assert.True(ParticleSystem.DestroyEmitter(ref localPool, emH), "DestroyEmitter succeeded");
+        Assert.Equal(0, localPool.ParticleCount, "DestroyEmitter removed local particle");
+        Assert.True(ParticleSystem.TryGetEmitter(in localPool, emH) == null, "Stale EmitterHandle rejected");
+        ParticleSystem.DestroyByScene(ref localPool, scA);
 
         // 4. Parallel parity >= 2048 particles vs single-threaded bit-for-bit + 0 GC
         var pSingle = ParticleTable.Create(ref alloc.Persistent, 4096, 16);

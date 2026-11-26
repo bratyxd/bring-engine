@@ -764,7 +764,7 @@ public static unsafe class AssetPackingAndNineSliceTests
     private static void TestTextureNon4x4PunchthroughAndGuards()
     {
         NativeMemoryTracker.ResetStatsForTest();
-        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 256 * 1024, 512 * 1024, 128 * 1024);
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 256 * 1024, 512 * 1024, 128 * 1024);
         var world = EngineWorld.Create(ref alloc.Persistent, 64, 16);
         var bundleArena = LinearArena.Create(512 * 1024);
         var bundleId = BundleId.Create(6, 1);
@@ -841,7 +841,7 @@ public static unsafe class AssetPackingAndNineSliceTests
     private static void TestCorruptStreamsAndContainers()
     {
         NativeMemoryTracker.ResetStatsForTest();
-        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 256 * 1024, 512 * 1024, 128 * 1024);
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 256 * 1024, 512 * 1024, 128 * 1024);
         var world = EngineWorld.Create(ref alloc.Persistent, 64, 32);
         var bundleArena = LinearArena.Create(512 * 1024);
         var bundleId = BundleId.Create(7, 1);

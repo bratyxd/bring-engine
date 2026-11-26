@@ -1754,8 +1754,8 @@ public static unsafe class BatchRenderer
         // Snap center along light right/up axes to exact shadow texel increments to prevent shimmer
         float texelWorld = (2f * halfExtent) / mapSize;
         Vec3 center = lighting.ShadowCenter;
-        float sx = MathF.Floor(Vec3.Dot(center, right) / texelWorld) * texelWorld;
-        float sy = MathF.Floor(Vec3.Dot(center, lightUp) / texelWorld) * texelWorld;
+        float sx = MathF.Round(Vec3.Dot(center, right) / texelWorld) * texelWorld;
+        float sy = MathF.Round(Vec3.Dot(center, lightUp) / texelWorld) * texelWorld;
         float sz = Vec3.Dot(center, forward);
         Vec3 snappedCenter = right * sx + lightUp * sy + forward * sz;
 

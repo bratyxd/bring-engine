@@ -1086,11 +1086,30 @@ public static class NetworkingTests
             Assert.True(!overflowH.IsValid, "5th concurrent request returns Invalid on full pool");
 
             for (int i = 0; i < 4; i++) HttpSystem.Cancel(http, held[i]);
-            for (int i = 0; i < 4; i++)
+            bool[] gotHeld = new bool[4];
+            int heldDone = 0;
+            Stopwatch heldSw = Stopwatch.StartNew();
+            while (heldDone < 4 && heldSw.ElapsedMilliseconds < 5000)
             {
-                HttpResponse rc = WaitHttpResponse(http, held[i]);
-                HttpSystem.ReleaseResponse(ref rc);
+                if (HttpSystem.PollCompleted(http, out HttpResponse rc))
+                {
+                    for (int i = 0; i < 4; i++)
+                    {
+                        if (!gotHeld[i] && rc.Handle == held[i])
+                        {
+                            gotHeld[i] = true;
+                            heldDone++;
+                            break;
+                        }
+                    }
+                    HttpSystem.ReleaseResponse(ref rc);
+                }
+                else
+                {
+                    Thread.Sleep(2);
+                }
             }
+            Assert.Equal(4, heldDone, "All 4 cancelled HTTP requests drained");
             HttpRequestHandle recovered = HttpSystem.Get(http, $"{baseUrl}/method");
             Assert.True(recovered.IsValid, "Slot pool recovered after draining");
             HttpResponse rr = WaitHttpResponse(http, recovered);
@@ -1257,12 +1276,26 @@ public static class NetworkingTests
             WebSocketHandle cOver = WebSocketSystem.Connect(ws, $"{baseWsUrl}/echo");
             Assert.True(!cOver.IsValid, "3rd concurrent connection rejected when maxConnections==2");
 
-            WebSocketEvent ec1 = WaitWsEvent(ws, c1);
-            Assert.Equal((byte)WebSocketEventKind.Connected, (byte)ec1.Kind, "c1 connected");
-            WebSocketSystem.ReleaseEvent(ref ec1);
-            WebSocketEvent ec2 = WaitWsEvent(ws, c2);
-            Assert.Equal((byte)WebSocketEventKind.Connected, (byte)ec2.Kind, "c2 connected");
-            WebSocketSystem.ReleaseEvent(ref ec2);
+            bool c1Connected = false;
+            bool c2Connected = false;
+            Stopwatch connSw = Stopwatch.StartNew();
+            while ((!c1Connected || !c2Connected) && connSw.ElapsedMilliseconds < 5000)
+            {
+                if (WebSocketSystem.PollEvent(ws, out WebSocketEvent evConn))
+                {
+                    if (evConn.Handle == c1 && evConn.Kind == WebSocketEventKind.Connected)
+                        c1Connected = true;
+                    else if (evConn.Handle == c2 && evConn.Kind == WebSocketEventKind.Connected)
+                        c2Connected = true;
+                    WebSocketSystem.ReleaseEvent(ref evConn);
+                }
+                else
+                {
+                    Thread.Sleep(2);
+                }
+            }
+            Assert.True(c1Connected, "c1 connected");
+            Assert.True(c2Connected, "c2 connected");
 
             // 4. SendText > 1024 chars (<= maxMessageBytes=1024? Wait: 900 ASCII chars vs 1500? Use 1024 max, test > 1024 SendText rejected or 0-byte frame)
             // Send 0-byte binary and 0-byte text frames
@@ -1285,8 +1318,8 @@ public static class NetworkingTests
             Assert.Equal((ushort)4001, evC2Close.CloseStatus, "Custom closeStatus 4001 preserved (N-09)");
             WebSocketSystem.ReleaseEvent(ref evC2Close);
 
-            // Stale handle c2 rejection
-            Assert.Equal((byte)WebSocketStateKind.Disconnected, (byte)WebSocketSystem.GetState(ws, c2), "Stale handle GetState after slot reuse/close");
+            // Closed handle keeps Closed state until its slot is reused, and rejects sends
+            Assert.Equal((byte)WebSocketStateKind.Closed, (byte)WebSocketSystem.GetState(ws, c2), "Closed handle GetState == Closed before slot reuse");
             Assert.True(!WebSocketSystem.SendBinary(ws, c2, "x"u8), "SendBinary on closed/stale handle returns false");
 
             // 5. Server sends Close while client is sending frames (N-02)
@@ -1299,6 +1332,7 @@ public static class NetworkingTests
 
             // 6. MaxMessageBytes overrun (> 1024 bytes from server) -> Error event with 0 leaks
             WebSocketHandle cOverrun = WebSocketSystem.Connect(ws, $"{baseWsUrl}/bigmsg");
+            Assert.Equal((byte)WebSocketStateKind.Disconnected, (byte)WebSocketSystem.GetState(ws, c1), "Stale handle GetState == Disconnected after slot reuse");
             WebSocketEvent evConnOver = WaitWsEvent(ws, cOverrun);
             Assert.Equal((byte)WebSocketEventKind.Connected, (byte)evConnOver.Kind, "cOverrun connected");
             WebSocketSystem.ReleaseEvent(ref evConnOver);

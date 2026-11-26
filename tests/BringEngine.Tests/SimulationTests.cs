@@ -203,7 +203,7 @@ public static unsafe class SimulationTests
     private static void TestEngineWorldAndCleanup()
     {
         NativeMemoryTracker.ResetStatsForTest();
-        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 128 * 1024, 128 * 1024, 64 * 1024);
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 128 * 1024, 128 * 1024, 64 * 1024);
         var world = EngineWorld.Create(ref alloc.Persistent, 512, 128);
 
         var sceneA = SceneId.Create(1, 1);
@@ -706,7 +706,7 @@ public static unsafe class SimulationTests
         s_sceneViewCount = 0;
         string tempLogDir = Path.Combine(Path.GetTempPath(), "bring_scene_log_" + Guid.NewGuid().ToString("N"));
 
-        var alloc = EngineAllocators.Create(1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
         LogState* log = alloc.Persistent.Alloc<LogState>(1, 64);
         LogSystem.Start(log, ref alloc.Persistent, appName: "SceneTest", directoryOverride: tempLogDir, minLevel: LogLevel.Info, mirrorToConsole: false, hookExceptions: false);
 
