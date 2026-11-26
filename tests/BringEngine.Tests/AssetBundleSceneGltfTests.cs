@@ -542,25 +542,33 @@ public static unsafe class AssetBundleSceneGltfTests
             // 8. Instantiate failure rollback (exhaust EntityTable with maxEntities=3 on 3-node skinned HeroMech: 1 root + 3 nodes = 4 entities)
             var hero = GlbBuilder.CreateHeroMechSpec(ColorF.Red, ColorF.Gold);
             byte[] heroGlb = GlbBuilder.BuildGlb(in hero, includeDemoAnimation: true);
-            GltfHandle heroH = GltfLoader.LoadFromMemory(heroGlb, null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("hero_fail"));
-
             var tinyWorld = EngineWorld.Create(ref alloc.Persistent, maxEntities: 3, maxParticles: 8);
-            nuint scratchBefore = alloc.Scratch.Offset;
-            bool threwOom = false;
+            GltfHandle heroH = GltfLoader.LoadFromMemory(heroGlb, null, ref bundleArena, ref alloc.Scratch, ref tinyWorld.Assets, ref tinyWorld.Animations, bundleId, StringId.Hash("hero_fail"));
+
             try
             {
-                GltfLoader.Instantiate(ref tinyWorld, ref alloc.Scratch, heroH, Vec3.Zero, Quat.Identity, Vec3.One);
+                nuint scratchBefore = alloc.Scratch.Offset;
+                bool threwOom = false;
+                try
+                {
+                    GltfLoader.Instantiate(ref tinyWorld, ref alloc.Scratch, heroH, Vec3.Zero, Quat.Identity, Vec3.One);
+                }
+                catch (OutOfMemoryException)
+                {
+                    threwOom = true;
+                }
+                Assert.True(threwOom, "Instantiate throws OutOfMemoryException when EntityTable exhausted");
+                Assert.Equal(0, tinyWorld.Entities.AliveCount, "Instantiate failure cleaned up all spawned entities");
+                Assert.Equal(0, tinyWorld.Transforms.Count, "Instantiate failure cleaned up all transforms");
+                Assert.Equal(0, tinyWorld.Animations.PlayerCount, "Instantiate failure cleaned up AnimPlayer");
+                Assert.Equal(0, tinyWorld.RenderComponents.MeshRendererCount, "Instantiate failure cleaned up MeshRenderers");
+                Assert.Equal(scratchBefore, alloc.Scratch.Offset, "Instantiate failure rolled back ScratchArena");
             }
-            catch (OutOfMemoryException)
+            finally
             {
-                threwOom = true;
+                AssetSystem.UnloadByBundle(ref tinyWorld.Assets, bundleId);
+                AnimationSystem.UnregisterByBundle(ref tinyWorld.Animations, bundleId);
             }
-            Assert.True(threwOom, "Instantiate throws OutOfMemoryException when EntityTable exhausted");
-            Assert.Equal(0, tinyWorld.Entities.AliveCount, "Instantiate failure cleaned up all spawned entities");
-            Assert.Equal(0, tinyWorld.Transforms.Count, "Instantiate failure cleaned up all transforms");
-            Assert.Equal(0, tinyWorld.Animations.PlayerCount, "Instantiate failure cleaned up AnimPlayer");
-            Assert.Equal(0, tinyWorld.RenderComponents.MeshRendererCount, "Instantiate failure cleaned up MeshRenderers");
-            Assert.Equal(scratchBefore, alloc.Scratch.Offset, "Instantiate failure rolled back ScratchArena");
         }
         finally
         {
