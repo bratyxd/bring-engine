@@ -1571,7 +1571,7 @@ public static unsafe class RenderTests
     private static void TestHiDpiMouseScalingAndRayCorners()
     {
         NativeMemoryTracker.ResetStatsForTest();
-        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 512 * 1024, 512 * 1024, 64 * 1024);
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 512 * 1024, 512 * 1024, 64 * 1024);
         var world = EngineWorld.Create(ref alloc.Persistent, 32, 32);
 
         try

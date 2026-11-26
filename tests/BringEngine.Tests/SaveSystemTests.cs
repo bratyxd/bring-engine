@@ -756,6 +756,7 @@ public static unsafe class SaveSystemTests
                 Assert.Equal("_CON", PlatformPaths.SanitizeFileName("CON", "save.bsav"), "CON prefixed");
                 Assert.Equal("_NUL.bsav", PlatformPaths.SanitizeFileName("NUL.bsav", "save.bsav"), "NUL.bsav prefixed");
                 Assert.Equal("_COM1.log", PlatformPaths.SanitizeFileName("COM1.log", "save.bsav"), "COM1.log prefixed");
+                Assert.True(Encoding.UTF8.GetByteCount(PlatformPaths.SanitizeFileName(new string('存', 90), "save.bsav")) <= 224, "CJK slot name leaves Linux NAME_MAX headroom for .tmp/.bak");
 
                 string[] specialSlots = { "save .", "CON", "NUL.bsav", "COM1.log", new string('存', 90) };
                 for (int i = 0; i < specialSlots.Length; i++)

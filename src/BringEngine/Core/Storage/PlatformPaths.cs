@@ -13,6 +13,14 @@ namespace BringEngine.Core.Storage;
 /// </summary>
 public static class PlatformPaths
 {
+    /// <summary>
+    /// Maximum UTF-8 byte length for a sanitized filename or directory segment.
+    /// Leaves 31 bytes of headroom below Linux's 255-byte NAME_MAX for suffixes such as
+    /// <c>.bak</c> (+4B), <c>.trim.tmp</c> (+9B), and <c>.&lt;int64_seq&gt;.tmp</c> (max +24B),
+    /// while staying within <see cref="FixedString256.MaxBytes"/> (252B) for async/sync parity.
+    /// </summary>
+    internal const int MaxSegmentUtf8Bytes = 224;
+
     public static string ResolveAppDataDirectory(ReadOnlySpan<char> appName)
     {
         string safeApp = SanitizeSegment(appName, "BringEngine");
@@ -144,15 +152,16 @@ public static class PlatformPaths
                     outLen = copyLen;
                 }
 
-                // Cap UTF-8 encoded length to <= FixedString256.MaxBytes (252) at whole rune boundaries
-                // so async FixedString256.From and sync SanitizeFileName are 100% byte-identical for all Unicode inputs.
+                // Cap UTF-8 encoded length to <= MaxSegmentUtf8Bytes (224B) at whole rune boundaries
+                // so filenames leave headroom below Linux 255B NAME_MAX for .bak/.<seq>.tmp suffixes
+                // AND async FixedString256.From and sync SanitizeFileName stay 100% byte-identical.
                 int utf8Bytes = 0;
                 int runeSafeLen = 0;
                 while (runeSafeLen < outLen)
                 {
                     char ch = work[runeSafeLen];
                     int charBytes = ch <= 0x7F ? 1 : (ch <= 0x7FF ? 2 : 3);
-                    if (utf8Bytes + charBytes > FixedString256.MaxBytes)
+                    if (utf8Bytes + charBytes > MaxSegmentUtf8Bytes)
                         break;
                     utf8Bytes += charBytes;
                     runeSafeLen++;

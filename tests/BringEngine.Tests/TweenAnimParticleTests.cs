@@ -665,7 +665,7 @@ public static unsafe class TweenAnimParticleTests
     private static void TestTweenAuditRegressions()
     {
         NativeMemoryTracker.ResetStatsForTest();
-        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
         var world = EngineWorld.Create(ref alloc.Persistent, 128, 32);
 
         // SIM-08: Chain cycle rejection (t1 -> t2 -> t1) & overwrite orphan release (t1 -> t2 then t1 -> t3)

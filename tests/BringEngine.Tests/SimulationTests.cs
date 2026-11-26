@@ -1141,8 +1141,8 @@ public static unsafe class SimulationTests
         // SIM-18 (part A): RegisterScene OOM preserves DefinitionCount
         var tinyArena = LinearArena.Create(64);
         int defCountBefore = scenes.DefinitionCount;
-        Span<BundleId> bigDeps = stackalloc BundleId[16];
-        for (int i = 0; i < 16; i++) bigDeps[i] = b1;
+        Span<BundleId> bigDeps = stackalloc BundleId[17];
+        for (int i = 0; i < 17; i++) bigDeps[i] = b1;
         bool regOomThrew = false;
         try { SceneSystem.RegisterScene(ref scenes, ref tinyArena, "S_TinyFail", bigDeps, 1024, &OnLoadOk); }
         catch (OutOfMemoryException) { regOomThrew = true; }
