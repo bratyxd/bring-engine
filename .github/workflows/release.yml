@@ -9,7 +9,63 @@ permissions:
   contents: write
 
 jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      prev_tag: ${{ steps.classify.outputs.prev_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect if release has code changes since previous tag
+        id: classify
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          is_non_code_file() {
+            case "$1" in
+              *.md|*.MD|docs/*|.github/*|.gitignore|LICENSE) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          DOCS_ONLY="false"
+          PREV_TAG=""
+
+          if [ "$REF_TYPE" = "tag" ]; then
+            PREV_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${REF_NAME}~1" 2>/dev/null || true)
+            if [ -n "$PREV_TAG" ]; then
+              mapfile -t CHANGED < <(git -c core.quotepath=false diff --name-only "${PREV_TAG}..HEAD")
+              echo "Changed files since ${PREV_TAG}:"
+              if [ "${#CHANGED[@]}" -gt 0 ]; then
+                printf '  %s\n' "${CHANGED[@]}"
+                HAS_CODE="false"
+                for f in "${CHANGED[@]}"; do
+                  if ! is_non_code_file "$f"; then
+                    HAS_CODE="true"
+                    break
+                  fi
+                done
+                if [ "$HAS_CODE" = "false" ]; then
+                  DOCS_ONLY="true"
+                fi
+              else
+                DOCS_ONLY="true"
+              fi
+            fi
+          fi
+
+          echo "docs_only=${DOCS_ONLY}" | tee -a "$GITHUB_OUTPUT"
+          echo "prev_tag=${PREV_TAG}" | tee -a "$GITHUB_OUTPUT"
+
   test-windows:
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.docs_only != 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +93,8 @@ jobs:
           & $exe --verify-render --out build/verify-release-win
 
   test-linux:
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.docs_only != 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -59,6 +117,8 @@ jobs:
           xvfb-run -a "$EXE" --verify-render --out build/verify-release-linux
 
   test-macos:
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.docs_only != 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,7 +133,8 @@ jobs:
           ./src/ShowcaseGame/bin/Release/net10.0/osx-arm64/publish/ShowcaseGame --headless --ticks 600
 
   package-and-verify-sdk:
-    needs: [test-windows, test-linux, test-macos]
+    needs: [detect-changes, test-windows, test-linux, test-macos]
+    if: needs.detect-changes.outputs.docs_only != 'true'
     runs-on: windows-latest
     env:
       SDK_NAME: bring-sdk-${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
@@ -124,9 +185,37 @@ jobs:
           name: bring-sdk
           path: dist/*.zip
 
+  package-sdk-docs-only:
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.docs_only == 'true'
+    runs-on: ubuntu-latest
+    env:
+      SDK_NAME: bring-sdk-${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble Bring Engine SDK archive (docs-only, tests skipped)
+        run: |
+          set -euo pipefail
+          ROOT="dist/${SDK_NAME}"
+          rm -rf dist
+          mkdir -p "${ROOT}/docs" "${ROOT}/src" "${ROOT}/tools"
+          cp AGENTS.md README.md LICENSE Directory.Build.props "${ROOT}/"
+          cp -R docs/agents "${ROOT}/docs/agents"
+          rsync -a --exclude='bin/' --exclude='obj/' src/BringEngine/ "${ROOT}/src/BringEngine/"
+          rsync -a --exclude='bin/' --exclude='obj/' src/ShowcaseGame/ "${ROOT}/src/ShowcaseGame/"
+          rsync -a --exclude='bin/' --exclude='obj/' tools/BringPacker/ "${ROOT}/tools/BringPacker/"
+          (cd dist && zip -qr "${SDK_NAME}.zip" "${SDK_NAME}")
+          unzip -l "dist/${SDK_NAME}.zip" | grep -q "${SDK_NAME}/AGENTS.md"
+          unzip -l "dist/${SDK_NAME}.zip" | grep -q "${SDK_NAME}/src/BringEngine/BringEngine.csproj"
+          ls -lh "dist/${SDK_NAME}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bring-sdk
+          path: dist/*.zip
+
   publish:
-    if: github.ref_type == 'tag'
-    needs: [package-and-verify-sdk]
+    if: always() && !cancelled() && github.ref_type == 'tag' && (needs.package-and-verify-sdk.result == 'success' || needs.package-sdk-docs-only.result == 'success')
+    needs: [detect-changes, package-and-verify-sdk, package-sdk-docs-only]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -136,12 +225,21 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          DOCS_ONLY: ${{ needs.detect-changes.outputs.docs_only }}
+          PREV_TAG: ${{ needs.detect-changes.outputs.prev_tag }}
         run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ "$DOCS_ONLY" = "true" ] && [ -n "$PREV_TAG" ]; then
+            EXTRA_ARGS+=(--notes "Documentation-only release (no code changes since ${PREV_TAG}; test suite skipped)." --notes-start-tag "${PREV_TAG}")
+          fi
+
           for attempt in 1 2 3 4; do
             echo "Publishing release ${{ github.ref_name }} (attempt $attempt)..."
             if gh release create "${{ github.ref_name }}" dist/*.zip \
               --repo "${{ github.repository }}" \
               --title "Bring Engine ${{ github.ref_name }}" \
+              "${EXTRA_ARGS[@]}" \
               --generate-notes; then
               exit 0
             fi

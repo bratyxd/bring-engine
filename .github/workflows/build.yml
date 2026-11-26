@@ -2,15 +2,136 @@ name: build
 
 on:
   push:
+    tags-ignore:
+      - 'v*'
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run_tests: ${{ steps.classify.outputs.run_tests }}
+      docs_only_release: ${{ steps.classify.outputs.docs_only_release }}
+      latest_tag: ${{ steps.classify.outputs.latest_tag }}
+      next_tag: ${{ steps.classify.outputs.next_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Classify changes (code vs docs-only)
+        id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          is_doc_file() {
+            case "$1" in
+              *.md|*.MD|docs/*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          is_non_code_file() {
+            case "$1" in
+              *.md|*.MD|docs/*|.github/*|.gitignore|LICENSE) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          RUN_TESTS="true"
+          DOCS_ONLY_RELEASE="false"
+          LATEST_TAG=""
+          NEXT_TAG=""
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RUN_TESTS="true"
+          else
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              BASE="$PR_BASE_SHA"
+            else
+              BASE="$BEFORE_SHA"
+            fi
+
+            if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+              if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+                BASE="HEAD~1"
+              else
+                BASE=""
+              fi
+            fi
+
+            if [ -n "$BASE" ]; then
+              mapfile -t CHANGED < <(git -c core.quotepath=false diff --name-only "${BASE}..HEAD")
+              echo "Changed files in event (${BASE}..HEAD):"
+              if [ "${#CHANGED[@]}" -gt 0 ]; then
+                printf '  %s\n' "${CHANGED[@]}"
+                ALL_DOCS="true"
+                for f in "${CHANGED[@]}"; do
+                  if ! is_doc_file "$f"; then
+                    ALL_DOCS="false"
+                    break
+                  fi
+                done
+                if [ "$ALL_DOCS" = "true" ]; then
+                  RUN_TESTS="false"
+                fi
+              fi
+            fi
+          fi
+
+          # When pushing docs/README-only updates to main and zero code has changed
+          # since the latest vX.Y.Z tag, skip tests and auto-bump a patch release.
+          if [ "$EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ] && [ "$RUN_TESTS" = "false" ]; then
+            EXISTING_AT_HEAD=$(git tag --points-at HEAD 'v*' | head -n 1 || true)
+            LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)
+
+            if [ -z "$EXISTING_AT_HEAD" ] && [ -n "$LATEST_TAG" ]; then
+              mapfile -t SINCE_TAG < <(git -c core.quotepath=false diff --name-only "${LATEST_TAG}..HEAD")
+              echo "Changed files since ${LATEST_TAG}:"
+              if [ "${#SINCE_TAG[@]}" -gt 0 ]; then
+                printf '  %s\n' "${SINCE_TAG[@]}"
+                HAS_DOC="false"
+                HAS_CODE="false"
+                for f in "${SINCE_TAG[@]}"; do
+                  if is_doc_file "$f"; then
+                    HAS_DOC="true"
+                  fi
+                  if ! is_non_code_file "$f"; then
+                    HAS_CODE="true"
+                    break
+                  fi
+                done
+
+                if [ "$HAS_DOC" = "true" ] && [ "$HAS_CODE" = "false" ]; then
+                  IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST_TAG#v}"
+                  NEXT_TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+                  DOCS_ONLY_RELEASE="true"
+                fi
+              fi
+            fi
+          fi
+
+          echo "run_tests=${RUN_TESTS}" | tee -a "$GITHUB_OUTPUT"
+          echo "docs_only_release=${DOCS_ONLY_RELEASE}" | tee -a "$GITHUB_OUTPUT"
+          echo "latest_tag=${LATEST_TAG}" | tee -a "$GITHUB_OUTPUT"
+          echo "next_tag=${NEXT_TAG}" | tee -a "$GITHUB_OUTPUT"
+
   windows-x64:
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.run_tests == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +168,8 @@ jobs:
           if-no-files-found: ignore
 
   linux-x64:
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.run_tests == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +209,8 @@ jobs:
           if-no-files-found: ignore
 
   macos-arm64:
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.run_tests == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -104,3 +229,60 @@ jobs:
         run: |
           dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r osx-arm64
           ./src/ShowcaseGame/bin/Release/net10.0/osx-arm64/publish/ShowcaseGame --headless --ticks 600
+
+  docs-only-release:
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.docs_only_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      LATEST_TAG: ${{ needs.detect-changes.outputs.latest_tag }}
+      NEXT_TAG: ${{ needs.detect-changes.outputs.next_tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assemble Bring Engine SDK archive (docs-only, tests skipped)
+        run: |
+          set -euo pipefail
+          SDK_NAME="bring-sdk-${NEXT_TAG}"
+          ROOT="dist/${SDK_NAME}"
+          rm -rf dist
+          mkdir -p "${ROOT}/docs" "${ROOT}/src" "${ROOT}/tools"
+          cp AGENTS.md README.md LICENSE Directory.Build.props "${ROOT}/"
+          cp -R docs/agents "${ROOT}/docs/agents"
+          rsync -a --exclude='bin/' --exclude='obj/' src/BringEngine/ "${ROOT}/src/BringEngine/"
+          rsync -a --exclude='bin/' --exclude='obj/' src/ShowcaseGame/ "${ROOT}/src/ShowcaseGame/"
+          rsync -a --exclude='bin/' --exclude='obj/' tools/BringPacker/ "${ROOT}/tools/BringPacker/"
+          (cd dist && zip -qr "${SDK_NAME}.zip" "${SDK_NAME}")
+          unzip -l "dist/${SDK_NAME}.zip" | grep -q "${SDK_NAME}/AGENTS.md"
+          unzip -l "dist/${SDK_NAME}.zip" | grep -q "${SDK_NAME}/src/BringEngine/BringEngine.csproj"
+          ls -lh "dist/${SDK_NAME}.zip"
+      - name: Bump tag and publish docs-only GitHub Release
+        run: |
+          set -euo pipefail
+          if git rev-parse "refs/tags/${NEXT_TAG}" >/dev/null 2>&1; then
+            echo "Tag ${NEXT_TAG} already exists; skipping."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${NEXT_TAG}" -m "Bring Engine ${NEXT_TAG} (docs-only release)"
+          git push origin "${NEXT_TAG}"
+
+          for attempt in 1 2 3 4; do
+            echo "Publishing docs-only release ${NEXT_TAG} (attempt ${attempt})..."
+            if gh release create "${NEXT_TAG}" "dist/bring-sdk-${NEXT_TAG}.zip" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "Bring Engine ${NEXT_TAG}" \
+              --notes "Documentation-only release (no code changes since ${LATEST_TAG}; test suite skipped)." \
+              --notes-start-tag "${LATEST_TAG}" \
+              --generate-notes; then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
