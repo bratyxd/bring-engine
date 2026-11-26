@@ -37,6 +37,12 @@ public static unsafe class AssetBundleSceneGltfTests
         Assert.Run("SdfFontLoader_BakesValidAtlasAndKerning", &TestSdfFont);
         Assert.Run("BundleAndSceneManager_SingleAdditiveRefCountAndMemoryReclaim", &TestBundlesAndScenes);
         Assert.Run("BundleAndScene_RollbackMissingManifestNameCollisionAndAdditiveGltfSurvival", &TestBundleAndSceneRobustness);
+        Assert.Run("GltfLoader_DuplicateArrayKeys_JointsBounds_MalformedPrimsAndRollback", &TestGltfAuditRegressions);
+        Assert.Run("GltfLoader_MultiSkinChannelIsolationAndSharedPrimitiveRemap", &TestGltfMultiSkinIsolation);
+        Assert.Run("GlbBuilder_ValidationAndAnimMinMax_BomGltfAndManifest", &TestGlbBuilderAndBomRegressions);
+        Assert.Run("SdfFontLoader_TtcCollection_AtlasOverflowAndCorruptRollback", &TestSdfFontAuditRegressions);
+        Assert.Run("BundleSystem_GenerationCheck_OomAndScratchRollback_CapacityAndPathValidation", &TestBundleAuditRegressions);
+        Assert.Run("AssetSystem_RegisterTexture_SizeOverflow_LeavesRegistryUnchanged", &TestRegisterTextureSizeOverflow);
     }
 
     private static void TestGltfRoundTrip()
@@ -785,5 +791,648 @@ public static unsafe class AssetBundleSceneGltfTests
         try { act(); }
         catch (TException) { threw = true; }
         Assert.True(threw, msg);
+    }
+
+    private static void LoadScratchBumpingThrowingBundle(ref BundleLoadContext ctx)
+    {
+        ctx.ScratchArena->Alloc<byte>(4096, 64);
+        throw new InvalidOperationException("Simulated loader throw after scratching");
+    }
+
+    private static void TestGltfAuditRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(8 * 1024 * 1024, 512 * 1024, 2 * 1024 * 1024, 256 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 256, 64);
+        var bundleArena = LinearArena.Create(2 * 1024 * 1024);
+        var bundleId = BundleId.Create(10, 1);
+
+        try
+        {
+            // REV-ASSETS-01: Duplicate JSON array keys ("children", "joints", "samplers", "channels") -> safe bounded read, Scratch restored
+            byte[] dupBin = new byte[64];
+            BitConverter.TryWriteBytes(dupBin.AsSpan(0, 4), 0f);
+            BitConverter.TryWriteBytes(dupBin.AsSpan(4, 4), 1f);
+            string dupB64 = Convert.ToBase64String(dupBin);
+            string dupJson = "{"
+                + "\"asset\":{\"version\":\"2.0\"},"
+                + "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," + dupB64 + "\",\"byteLength\":64}],"
+                + "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":64}],"
+                + "\"accessors\":["
+                + "{\"bufferView\":0,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},"
+                + "{\"bufferView\":0,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}"
+                + "],"
+                + "\"nodes\":[{\"name\":\"Root\",\"children\":[1,2],\"children\":[1]},{\"name\":\"J0\"},{\"name\":\"J1\"}],"
+                + "\"skins\":[{\"joints\":[1,2],\"joints\":[1]}],"
+                + "\"animations\":[{\"name\":\"DupAnim\","
+                + "\"samplers\":[{\"input\":0,\"output\":1},{\"input\":0,\"output\":1}],\"samplers\":[{\"input\":0,\"output\":1}],"
+                + "\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"translation\"}},{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"translation\"}}],"
+                + "\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"translation\"}}]}]"
+                + "}";
+            nuint scratchBefore = alloc.Scratch.Offset;
+            GltfHandle dupH = GltfLoader.LoadFromMemory(Encoding.UTF8.GetBytes(dupJson), null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("dup_keys"));
+            Assert.Equal(scratchBefore, alloc.Scratch.Offset, "REV-ASSETS-01: Scratch.Offset restored after duplicate array keys");
+            var dupModel = AssetSystem.TryGetGltf(in world.Assets, dupH);
+            Assert.True(dupModel != null && dupModel->SkinCount == 1 && dupModel->AnimationCount == 1, "REV-ASSETS-01: Duplicate array keys parsed boundedly without OOB");
+            SkeletonData* dupSkel = AnimationSystem.TryGetSkeleton(in world.Animations, dupModel->Skins[0]);
+            Assert.True(dupSkel != null && dupSkel->JointCount == 1, "REV-ASSETS-01: Last duplicate joints array used cleanly");
+            AnimClipData* dupClip = AnimationSystem.TryGetClip(in world.Animations, dupModel->Animations[0]);
+            Assert.True(dupClip != null && dupClip->SamplerCount == 1 && dupClip->ChannelCount == 1, "REV-ASSETS-01: Last duplicate samplers/channels arrays used cleanly");
+
+            // REV-ASSETS-03: Out-of-range JOINTS_0 (200 on 2-joint skin) & >256-joint skin & >255 unskinned JOINTS_0
+            byte[] skinBin = new byte[128];
+            // 3 vec3 positions (36 bytes at 0), 3 vec4 ushort joints (24 bytes at 36), 3 vec4 float weights (48 bytes at 60)
+            BitConverter.TryWriteBytes(skinBin.AsSpan(36, 2), (ushort)200); // joint index 200 >= 2!
+            BitConverter.TryWriteBytes(skinBin.AsSpan(60, 4), 1f);
+            BitConverter.TryWriteBytes(skinBin.AsSpan(76, 4), 1f);
+            BitConverter.TryWriteBytes(skinBin.AsSpan(92, 4), 1f);
+            string skinB64 = Convert.ToBase64String(skinBin);
+
+            string oobJointGltf = "{"
+                + "\"asset\":{\"version\":\"2.0\"},"
+                + "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," + skinB64 + "\",\"byteLength\":128}],"
+                + "\"bufferViews\":["
+                + "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36},"
+                + "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":24},"
+                + "{\"buffer\":0,\"byteOffset\":60,\"byteLength\":48}"
+                + "],"
+                + "\"accessors\":["
+                + "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+                + "{\"bufferView\":1,\"componentType\":5123,\"count\":3,\"type\":\"VEC4\"},"
+                + "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"}"
+                + "],"
+                + "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"JOINTS_0\":1,\"WEIGHTS_0\":2}}]}],"
+                + "\"nodes\":[{\"name\":\"M\",\"mesh\":0,\"skin\":0},{\"name\":\"J0\"},{\"name\":\"J1\"}],"
+                + "\"skins\":[{\"joints\":[1,2]}]"
+                + "}";
+            scratchBefore = alloc.Scratch.Offset;
+            AssertThrows<InvalidDataException>(() =>
+                GltfLoader.LoadFromMemory(Encoding.UTF8.GetBytes(oobJointGltf), null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("oob_joint")),
+                "REV-ASSETS-03: JOINTS_0=200 on 2-joint skin throws InvalidDataException");
+            Assert.Equal(scratchBefore, alloc.Scratch.Offset, "REV-ASSETS-03: Scratch rolled back on JOINTS_0 OOB");
+
+            // >256-joint skin
+            var sbJoints = new StringBuilder();
+            for (int j = 0; j < 257; j++) { if (j > 0) sbJoints.Append(','); sbJoints.Append('0'); }
+            string tooManyJointsGltf = "{\"asset\":{\"version\":\"2.0\"},\"nodes\":[{\"name\":\"N0\"}],\"skins\":[{\"joints\":[" + sbJoints + "]}]}";
+            AssertThrows<InvalidDataException>(() =>
+                GltfLoader.LoadFromMemory(Encoding.UTF8.GetBytes(tooManyJointsGltf), null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("skin_257")),
+                "REV-ASSETS-03: >256-joint skin throws InvalidDataException");
+            Assert.Equal(scratchBefore, alloc.Scratch.Offset, "REV-ASSETS-03: Scratch rolled back on >256-joint skin");
+
+            // >255 unskinned JOINTS_0 (ushort 300)
+            BitConverter.TryWriteBytes(skinBin.AsSpan(36, 2), (ushort)300);
+            string unskinned300Gltf = "{"
+                + "\"asset\":{\"version\":\"2.0\"},"
+                + "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," + Convert.ToBase64String(skinBin) + "\",\"byteLength\":128}],"
+                + "\"bufferViews\":["
+                + "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36},"
+                + "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":24},"
+                + "{\"buffer\":0,\"byteOffset\":60,\"byteLength\":48}"
+                + "],"
+                + "\"accessors\":["
+                + "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+                + "{\"bufferView\":1,\"componentType\":5123,\"count\":3,\"type\":\"VEC4\"},"
+                + "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"}"
+                + "],"
+                + "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"JOINTS_0\":1,\"WEIGHTS_0\":2}}]}]"
+                + "}";
+            AssertThrows<InvalidDataException>(() =>
+                GltfLoader.LoadFromMemory(Encoding.UTF8.GetBytes(unskinned300Gltf), null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("joint_300")),
+                "REV-ASSETS-03: Unskinned JOINTS_0 > 255 throws InvalidDataException");
+
+            // REV-ASSETS-11: Missing POSITION, 0-count indices, unknown accessor.type, sparse accessor
+            string missingPosGltf = "{\"asset\":{\"version\":\"2.0\"},\"meshes\":[{\"primitives\":[{\"attributes\":{}}]}]}";
+            AssertThrows<InvalidDataException>(() =>
+                GltfLoader.LoadFromMemory(Encoding.UTF8.GetBytes(missingPosGltf), null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("no_pos")),
+                "REV-ASSETS-11: Primitive missing POSITION throws InvalidDataException");
+
+            string zeroIndicesGltf = "{"
+                + "\"asset\":{\"version\":\"2.0\"},"
+                + "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," + dupB64 + "\",\"byteLength\":64}],"
+                + "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":64}],"
+                + "\"accessors\":["
+                + "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+                + "{\"bufferView\":0,\"componentType\":5123,\"count\":0,\"type\":\"SCALAR\"}"
+                + "],"
+                + "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":1}]}]"
+                + "}";
+            AssertThrows<InvalidDataException>(() =>
+                GltfLoader.LoadFromMemory(Encoding.UTF8.GetBytes(zeroIndicesGltf), null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("zero_idx")),
+                "REV-ASSETS-11: 0-count indices accessor throws InvalidDataException");
+
+            string badTypeGltf = "{\"asset\":{\"version\":\"2.0\"},\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":1,\"type\":\"BOGUS\"}]}";
+            AssertThrows<InvalidDataException>(() =>
+                GltfLoader.LoadFromMemory(Encoding.UTF8.GetBytes(badTypeGltf), null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("bad_type")),
+                "REV-ASSETS-11: Unknown accessor.type throws InvalidDataException");
+
+            string sparseGltf = "{\"asset\":{\"version\":\"2.0\"},\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":1,\"type\":\"VEC3\",\"sparse\":{\"count\":1}}]}";
+            AssertThrows<InvalidDataException>(() =>
+                GltfLoader.LoadFromMemory(Encoding.UTF8.GetBytes(sparseGltf), null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("sparse_acc")),
+                "REV-ASSETS-11: Sparse accessor throws InvalidDataException");
+
+            // REV-ASSETS-10: Partial-load rollback (valid embedded PNG texture + valid material + valid mesh + corrupt animation)
+            AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
+            AnimationSystem.UnregisterByBundle(ref world.Animations, bundleId);
+            bundleArena.Reset();
+            Assert.Equal(0, world.Assets.LiveTextureCount, "Clean slate: 0 textures before REV-ASSETS-10");
+            Assert.Equal(0, world.Assets.LiveMeshCount, "Clean slate: 0 meshes before REV-ASSETS-10");
+            Assert.Equal(0, world.Assets.LiveMaterialCount, "Clean slate: 0 materials before REV-ASSETS-10");
+
+            string pngB64 = Convert.ToBase64String(MakeTestPngBytes(16, 16));
+            nuint bundleBefore = bundleArena.Offset;
+            string partialFailGltf = "{"
+                + "\"asset\":{\"version\":\"2.0\"},"
+                + "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," + dupB64 + "\",\"byteLength\":64}],"
+                + "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":64}],"
+                + "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}],"
+                + "\"images\":[{\"uri\":\"data:image/png;base64," + pngB64 + "\"}],"
+                + "\"textures\":[{\"source\":0}],"
+                + "\"materials\":[{\"name\":\"PartialMat\",\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0}}}],"
+                + "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"material\":0}]}],"
+                + "\"nodes\":[{\"name\":\"N\",\"mesh\":0}],"
+                + "\"animations\":[{\"samplers\":[{\"input\":99,\"output\":0}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":0,\"path\":\"translation\"}}]}]"
+                + "}";
+            AssertThrows<InvalidDataException>(() =>
+                GltfLoader.LoadFromMemory(Encoding.UTF8.GetBytes(partialFailGltf), null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("partial_fail")),
+                "REV-ASSETS-10: Corrupt animation after valid texture+mesh throws InvalidDataException");
+            Assert.Equal(bundleBefore, bundleArena.Offset, "REV-ASSETS-10: bundleArena.Offset rolled back on partial load failure");
+            Assert.Equal(0, world.Assets.LiveTextureCount, "REV-ASSETS-10: LiveTextureCount == 0 after rollback");
+            Assert.Equal(0, world.Assets.LiveMeshCount, "REV-ASSETS-10: LiveMeshCount == 0 after rollback");
+            Assert.Equal(0, world.Assets.LiveMaterialCount, "REV-ASSETS-10: LiveMaterialCount == 0 after rollback");
+            Assert.Equal(0, world.Assets.LiveGltfCount, "REV-ASSETS-10: LiveGltfCount == 0 after rollback");
+        }
+        finally
+        {
+            AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
+            AnimationSystem.UnregisterByBundle(ref world.Animations, bundleId);
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after glTF audit regression tests");
+    }
+
+    private static void TestGltfMultiSkinIsolation()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 512 * 1024, 2 * 1024 * 1024, 256 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 256, 64);
+        var bundleArena = LinearArena.Create(2 * 1024 * 1024);
+        var bundleId = BundleId.Create(11, 1);
+
+        try
+        {
+            // Build a 2-skin glTF where both MeshNode0 (skin 0: joints [2,3]) and MeshNode1 (skin 1: joints [5,4] out-of-order!)
+            // share primitive 0, and Animation 0 moves skin 0 root joint +2 X and skin 1 root joint -4 Y!
+            using var binMs = new MemoryStream();
+            using var bw = new BinaryWriter(binMs);
+
+            int offPos = (int)binMs.Position;
+            float[] pos = { 0, 0, 0, 1, 0, 0, 0, 1, 0 };
+            foreach (float f in pos) bw.Write(f);
+            int lenPos = pos.Length * 4;
+
+            int offJ = (int)binMs.Position;
+            byte[] jnts = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // vertex references raw joint 0
+            bw.Write(jnts);
+            int lenJ = jnts.Length;
+
+            int offW = (int)binMs.Position;
+            float[] wts = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+            foreach (float f in wts) bw.Write(f);
+            int lenW = wts.Length * 4;
+
+            int offIbm = (int)binMs.Position;
+            for (int m = 0; m < 2; m++)
+                for (int r = 0; r < 4; r++)
+                    for (int c = 0; c < 4; c++)
+                        bw.Write(r == c ? 1f : 0f);
+            int lenIbm = 32 * 4;
+
+            int offTime = (int)binMs.Position;
+            bw.Write(0f); bw.Write(0.5f); bw.Write(1f);
+            int lenTime = 12;
+
+            int offT0 = (int)binMs.Position; // Skin 0 root -> +2 X at t=0.5s
+            float[] t0 = { 0, 0, 0, 2, 0, 0, 0, 0, 0 };
+            foreach (float f in t0) bw.Write(f);
+            int lenT0 = t0.Length * 4;
+
+            int offT1 = (int)binMs.Position; // Skin 1 root -> -4 Y at t=0.5s
+            float[] t1 = { 0, 0, 0, 0, -4, 0, 0, 0, 0 };
+            foreach (float f in t1) bw.Write(f);
+            int lenT1 = t1.Length * 4;
+
+            byte[] binBytes = binMs.ToArray();
+            string b64 = Convert.ToBase64String(binBytes);
+
+            string json = "{"
+                + "\"asset\":{\"version\":\"2.0\"},"
+                + "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," + b64 + "\",\"byteLength\":" + binBytes.Length + "}],"
+                + "\"bufferViews\":["
+                + $"{{\"buffer\":0,\"byteOffset\":{offPos},\"byteLength\":{lenPos}}},"
+                + $"{{\"buffer\":0,\"byteOffset\":{offJ},\"byteLength\":{lenJ}}},"
+                + $"{{\"buffer\":0,\"byteOffset\":{offW},\"byteLength\":{lenW}}},"
+                + $"{{\"buffer\":0,\"byteOffset\":{offIbm},\"byteLength\":{lenIbm}}},"
+                + $"{{\"buffer\":0,\"byteOffset\":{offTime},\"byteLength\":{lenTime}}},"
+                + $"{{\"buffer\":0,\"byteOffset\":{offT0},\"byteLength\":{lenT0}}},"
+                + $"{{\"buffer\":0,\"byteOffset\":{offT1},\"byteLength\":{lenT1}}}"
+                + "],"
+                + "\"accessors\":["
+                + "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+                + "{\"bufferView\":1,\"componentType\":5121,\"count\":3,\"type\":\"VEC4\"},"
+                + "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"},"
+                + "{\"bufferView\":3,\"componentType\":5126,\"count\":2,\"type\":\"MAT4\"},"
+                + "{\"bufferView\":4,\"componentType\":5126,\"count\":3,\"type\":\"SCALAR\"},"
+                + "{\"bufferView\":5,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+                + "{\"bufferView\":6,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}"
+                + "],"
+                + "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"JOINTS_0\":1,\"WEIGHTS_0\":2}}]}],"
+                + "\"nodes\":["
+                + "{\"name\":\"Mesh0\",\"mesh\":0,\"skin\":0},"
+                + "{\"name\":\"Mesh1\",\"mesh\":0,\"skin\":1},"
+                + "{\"name\":\"S0_Root\",\"children\":[3]},"
+                + "{\"name\":\"S0_Child\"},"
+                + "{\"name\":\"S1_Root\",\"children\":[5]},"
+                + "{\"name\":\"S1_Child\"}"
+                + "],"
+                + "\"skins\":["
+                + "{\"inverseBindMatrices\":3,\"joints\":[2,3]},"
+                + "{\"inverseBindMatrices\":3,\"joints\":[5,4]}"
+                + "],"
+                + "\"animations\":[{\"name\":\"DualSkinAnim\","
+                + "\"samplers\":[{\"input\":4,\"output\":5,\"interpolation\":\"LINEAR\"},{\"input\":4,\"output\":6,\"interpolation\":\"LINEAR\"}],"
+                + "\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"translation\"}},{\"sampler\":1,\"target\":{\"node\":4,\"path\":\"translation\"}}]"
+                + "}]"
+                + "}";
+
+            GltfHandle gh = GltfLoader.LoadFromMemory(Encoding.UTF8.GetBytes(json), null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("dual_skin"));
+            var model = AssetSystem.TryGetGltf(in world.Assets, gh);
+            Assert.True(model != null && model->SkinCount == 2, "REV-ASSETS-07: 2-skin model loaded");
+
+            // Shared primitive built distinctly per (prim, skin) so skin 0 maps joint 0->0 and skin 1 (out-of-order [5,4]) maps joint 0->1
+            MeshHandle m0H = model->Primitives[model->Nodes[0].PrimitiveStart].Mesh;
+            MeshHandle m1H = model->Primitives[model->Nodes[1].PrimitiveStart].Mesh;
+            Assert.True(m0H != m1H, "REV-ASSETS-07: Shared primitive built per-skin with distinct MeshHandles");
+            MeshAssetData* m0 = AssetSystem.TryGetMesh(in world.Assets, m0H);
+            MeshAssetData* m1 = AssetSystem.TryGetMesh(in world.Assets, m1H);
+            Assert.Equal((byte)0, (byte)(m0->Vertices[0].JointIndices & 0xFFu), "REV-ASSETS-07: Skin 0 joint 0 stays 0");
+            Assert.Equal((byte)1, (byte)(m1->Vertices[0].JointIndices & 0xFFu), "REV-ASSETS-07: Skin 1 joint 0 remapped to 1");
+
+            // Instantiate and step to t=0.5s -> verify each AnimPlayer's FrameJointPalette reflects ONLY its own skin's channels
+            var sceneId = SceneId.Create(1, 1);
+            GltfLoader.Instantiate(ref world, ref alloc.Scratch, gh, Vec3.Zero, Quat.Identity, Vec3.One, sceneId);
+            Assert.Equal(2, world.Animations.PlayerCount, "REV-ASSETS-07: 2 AnimPlayers created (one per skin)");
+
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 0.5f);
+            Assert.Equal(4, world.Animations.FrameJointPalette.Length, "REV-ASSETS-07: 4 total joints in FrameJointPalette");
+
+            // Skin 0 player (joints 0..1): +2 X, 0 Y
+            Mat4 s0Root = world.Animations.FrameJointPalette[world.Animations.Players[0].FrameJointOffset];
+            Assert.Near(2f, s0Root.C3.X, 1e-3f, "REV-ASSETS-07: Skin 0 root moved +2 X");
+            Assert.Near(0f, s0Root.C3.Y, 1e-3f, "REV-ASSETS-07: Skin 0 root NOT polluted by Skin 1 Y channel");
+
+            // Skin 1 player (joints 0..1): 0 X, -4 Y
+            Mat4 s1Root = world.Animations.FrameJointPalette[world.Animations.Players[1].FrameJointOffset];
+            Assert.Near(0f, s1Root.C3.X, 1e-3f, "REV-ASSETS-07: Skin 1 root NOT polluted by Skin 0 X channel");
+            Assert.Near(-4f, s1Root.C3.Y, 1e-3f, "REV-ASSETS-07: Skin 1 root moved -4 Y");
+
+            EngineWorldSystem.DestroySceneObjects(ref world, sceneId, ref alloc.Scratch);
+        }
+        finally
+        {
+            AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
+            AnimationSystem.UnregisterByBundle(ref world.Animations, bundleId);
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after multi-skin isolation tests");
+    }
+
+    private static void TestGlbBuilderAndBomRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tmpDir = Path.Combine(Path.GetTempPath(), $"bring_bom_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tmpDir);
+
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 512 * 1024, 1 * 1024 * 1024, 128 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 128, 32);
+        var bundles = BundleManager.Create(ref alloc.Persistent, 8);
+        var bundleArena = LinearArena.Create(1 * 1024 * 1024);
+        var bundleId = BundleId.Create(12, 1);
+
+        try
+        {
+            // REV-ASSETS-17: GlbBuilder validation (empty mesh, mismatched lengths, non-finite float) & anim min/max
+            var emptySpec = new GlbBuilder.MeshSpec { Positions = Array.Empty<Vec3>(), Normals = Array.Empty<Vec3>(), Uvs = Array.Empty<Vec2>(), Indices = Array.Empty<uint>() };
+            AssertThrows<ArgumentException>(() => GlbBuilder.BuildGlb(in emptySpec), "REV-ASSETS-17: Empty Positions/Indices rejected");
+
+            var nanSpec = GlbBuilder.CreateBoxSpec(Vec3.One, new ColorF(float.NaN, 1f, 1f, 1f));
+            AssertThrows<ArgumentOutOfRangeException>(() => GlbBuilder.BuildGlb(in nanSpec), "REV-ASSETS-17: Non-finite float rejected");
+
+            var heroSpec = GlbBuilder.CreateHeroMechSpec(ColorF.Blue, ColorF.Cyan);
+            byte[] animGlb = GlbBuilder.BuildGlb(in heroSpec, includeDemoAnimation: true);
+            uint jsonChunkLen = BitConverter.ToUInt32(animGlb, 12);
+            string glbJsonStr = Encoding.UTF8.GetString(animGlb, 20, (int)jsonChunkLen);
+            Assert.True(glbJsonStr.Contains("\"min\":[0],\"max\":[1]", StringComparison.Ordinal), "REV-ASSETS-17: GlbBuilder emits min:[0], max:[1] on animation time accessor");
+
+            // REV-ASSETS-16: UTF-8 BOM-prefixed .gltf loads cleanly
+            byte[] bomPrefix = new byte[] { 0xEF, 0xBB, 0xBF };
+            byte[] gltfBody = Encoding.UTF8.GetBytes("{\"asset\":{\"version\":\"2.0\"},\"nodes\":[{\"name\":\"BomNode\"}]}");
+            byte[] bomGltf = new byte[bomPrefix.Length + gltfBody.Length];
+            Buffer.BlockCopy(bomPrefix, 0, bomGltf, 0, bomPrefix.Length);
+            Buffer.BlockCopy(gltfBody, 0, bomGltf, bomPrefix.Length, gltfBody.Length);
+            GltfHandle bomH = GltfLoader.LoadFromMemory(bomGltf, null, ref bundleArena, ref alloc.Scratch, ref world.Assets, ref world.Animations, bundleId, StringId.Hash("bom_gltf"));
+            Assert.True(AssetSystem.TryGetGltf(in world.Assets, bomH) != null, "REV-ASSETS-16: BOM-prefixed .gltf loads cleanly");
+
+            // REV-ASSETS-16: UTF-8 BOM-prefixed manifest loads cleanly & unknown manifest type throws InvalidDataException
+            File.WriteAllBytes(Path.Combine(tmpDir, "bom_tex.png"), MakeTestPngBytes(8, 8));
+            string bomManPath = Path.Combine(tmpDir, "bom_manifest.json");
+            File.WriteAllText(bomManPath, "{\"assets\":[{\"type\":\"texture\",\"name\":\"bom_tex\",\"path\":\"bom_tex.png\"}]}", new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            BundleId bBom = BundleSystem.RegisterManifest(ref bundles, "bom_man", 256 * 1024, bomManPath);
+            BundleSystem.Acquire(ref bundles, bBom, ref world, ref alloc.Scratch);
+            Assert.True(AssetSystem.FindTexture(in world.Assets, StringId.Hash("bom_tex")).IsValid, "REV-ASSETS-16: BOM-prefixed manifest loads cleanly");
+            BundleSystem.Release(ref bundles, bBom, ref world);
+
+            string badTypeManPath = Path.Combine(tmpDir, "bad_type_manifest.json");
+            File.WriteAllText(badTypeManPath, "{\"assets\":[{\"type\":\"unknown_kind\",\"name\":\"bad\",\"path\":\"bom_tex.png\"}]}", new UTF8Encoding(false));
+            BundleId bBadType = BundleSystem.RegisterManifest(ref bundles, "bad_type_man", 256 * 1024, badTypeManPath);
+            AssertThrows<InvalidDataException>(() => BundleSystem.Acquire(ref bundles, bBadType, ref world, ref alloc.Scratch), "REV-ASSETS-16: Unknown manifest type throws InvalidDataException");
+            Assert.Equal(0, BundleSystem.GetRefCount(in bundles, bBadType), "REV-ASSETS-16: Unknown manifest type rolls back RefCount");
+        }
+        finally
+        {
+            BundleSystem.UnloadAll(ref bundles, ref world);
+            AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
+            AnimationSystem.UnregisterByBundle(ref world.Animations, bundleId);
+            bundleArena.Dispose();
+            alloc.Dispose();
+            if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true);
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after GlbBuilder & BOM tests");
+    }
+
+    private static void TestSdfFontAuditRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 256 * 1024, 512 * 1024, 128 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 128, 32);
+        var bundleArena = LinearArena.Create(2 * 1024 * 1024);
+        var bundleId = BundleId.Create(13, 1);
+
+        try
+        {
+            // REV-ASSETS-02: Unchecked atlasSize * atlasSize overflow -> ArgumentOutOfRangeException, 0 arena bytes allocated
+            nuint offsetBefore = bundleArena.Offset;
+            AssertThrows<ArgumentOutOfRangeException>(() =>
+                SdfFontLoader.BakeSdfFromSystemOrFile(null, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("big1"), 32f, atlasSize: 65537, sdfPadding: 4),
+                "REV-ASSETS-02: atlasSize=65537 throws ArgumentOutOfRangeException");
+            Assert.Equal(offsetBefore, bundleArena.Offset, "REV-ASSETS-02: 0 bundleArena bytes allocated on 65537");
+            AssertThrows<ArgumentOutOfRangeException>(() =>
+                SdfFontLoader.BakeSdfFromSystemOrFile(null, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("big2"), 32f, atlasSize: 65536, sdfPadding: 4),
+                "REV-ASSETS-02: atlasSize=65536 throws ArgumentOutOfRangeException");
+            Assert.Equal(offsetBefore, bundleArena.Offset, "REV-ASSETS-02: 0 bundleArena bytes allocated on 65536");
+
+            // REV-ASSETS-15: Corrupt TTF throws InvalidOperationException and restores bundleArena.Offset
+            byte[] corruptTtf = new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+            AssertThrows<InvalidOperationException>(() =>
+                SdfFontLoader.BakeSdfFromMemory(corruptTtf, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("corrupt_ttf"), 32f, 256, 4),
+                "REV-ASSETS-15: Corrupt TTF throws InvalidOperationException");
+            Assert.Equal(offsetBefore, bundleArena.Offset, "REV-ASSETS-15: bundleArena.Offset unchanged after corrupt TTF");
+            Assert.Equal(0, world.Assets.LiveTextureCount, "REV-ASSETS-15: 0 textures registered on corrupt TTF");
+            Assert.Equal(0, world.Assets.LiveFontCount, "REV-ASSETS-15: 0 fonts registered on corrupt TTF");
+
+            // REV-ASSETS-08: Valid minimal TTF wrapped in ttcf v1.0 TrueType Collection header succeeds cleanly!
+            byte[] minimalTtf = BuildMinimalTtfBytes();
+            byte[] ttcBytes = WrapTtfAsTtcV1(minimalTtf);
+            FontHandle ttcFontH = SdfFontLoader.BakeSdfFromMemory(ttcBytes, ref bundleArena, ref world.Assets, bundleId, StringId.Hash("ttc_font"), 32f, 256, 4);
+            FontAssetData* ttcFont = AssetSystem.TryGetFont(in world.Assets, ttcFontH);
+            Assert.True(ttcFont != null, "REV-ASSETS-08: ttcf v1.0 collection font baked cleanly");
+            ref GlyphMetrics gA = ref ttcFont->AsciiGlyphs['A' - SdfFontLoader.FirstAscii];
+            Assert.Equal((byte)1, gA.HasBitmap, "REV-ASSETS-08: ttcf font rendered glyph 'A' SDF bitmap");
+            Assert.True(gA.Advance > 5f, "REV-ASSETS-08: ttcf font glyph 'A' advance valid");
+        }
+        finally
+        {
+            AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after SDF font audit regression tests");
+    }
+
+    private static void TestBundleAuditRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 256 * 1024, 512 * 1024, 128 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 128, 32);
+        var bundles = BundleManager.Create(ref alloc.Persistent, maxBundles: 1);
+
+        try
+        {
+            // REV-ASSETS-13: Overlong path (> 252 UTF-8 bytes) throws ArgumentException before consuming slot
+            string path300 = new string('a', 300) + ".bpack";
+            AssertThrows<ArgumentException>(() =>
+                BundleSystem.RegisterPack(ref bundles, "overlong_pack", 64 * 1024, path300),
+                "REV-ASSETS-13: 300-char PackPath throws ArgumentException");
+            AssertThrows<ArgumentException>(() =>
+                BundleSystem.RegisterManifest(ref bundles, "overlong_man", 64 * 1024, path300),
+                "REV-ASSETS-13: 300-char ManifestPath throws ArgumentException");
+            Assert.Equal(0, bundles.Count, "REV-ASSETS-13: Rejected overlong path did not consume bundle slot");
+
+            // REV-ASSETS-13: Full-capacity idempotent re-register does NOT throw and does NOT overwrite PackPath
+            BundleId h = BundleSystem.RegisterPack(ref bundles, "only_bundle", 64 * 1024, "original.bpack");
+            BundleId hDup = BundleSystem.RegisterPack(ref bundles, "only_bundle", 64 * 1024, "overwritten.bpack");
+            Assert.Equal(h.Raw, hDup.Raw, "REV-ASSETS-13: Full-capacity duplicate RegisterPack returns existing handle");
+            Assert.Equal("original.bpack", bundles.Bundles[h.Index].PackPath.ToString(), "REV-ASSETS-13: Existing PackPath not overwritten on duplicate register");
+
+            // REV-ASSETS-05: Mismatched generation ignored by IsLoaded, GetRefCount, Acquire, Release
+            BundleId staleGen = BundleId.Create(h.Index, h.Generation + 1);
+            Assert.True(!BundleSystem.IsLoaded(in bundles, staleGen), "REV-ASSETS-05: IsLoaded ignores mismatched generation");
+            Assert.Equal(0, BundleSystem.GetRefCount(in bundles, staleGen), "REV-ASSETS-05: GetRefCount ignores mismatched generation");
+            BundleSystem.Acquire(ref bundles, staleGen, ref world, ref alloc.Scratch);
+            Assert.Equal(0, bundles.LoadedBundleCount, "REV-ASSETS-05: Acquire ignores mismatched generation");
+            Assert.Equal(0, BundleSystem.GetRefCount(in bundles, h), "REV-ASSETS-05: Acquire with stale gen did not bump RefCount");
+            BundleSystem.Release(ref bundles, staleGen, ref world);
+            Assert.Equal(0, BundleSystem.GetRefCount(in bundles, h), "REV-ASSETS-05: Release ignores mismatched generation");
+
+            // REV-ASSETS-06: Arena OOM -> RefCount == 0; throwing LoaderFunc -> ScratchArena restored & RefCount == 0
+            var bundles2 = BundleManager.Create(ref alloc.Persistent, maxBundles: 4);
+            BundleId bOom = BundleSystem.Register(ref bundles2, "oom_bundle", nuint.MaxValue, null);
+            AssertThrows<OutOfMemoryException>(() =>
+                BundleSystem.Acquire(ref bundles2, bOom, ref world, ref alloc.Scratch),
+                "REV-ASSETS-06: nuint.MaxValue arena throws OutOfMemoryException");
+            Assert.Equal(0, BundleSystem.GetRefCount(in bundles2, bOom), "REV-ASSETS-06: RefCount == 0 after arena OOM");
+            Assert.True(!BundleSystem.IsLoaded(in bundles2, bOom), "REV-ASSETS-06: IsLoaded == false after arena OOM");
+
+            BundleId bScratchThrow = BundleSystem.Register(ref bundles2, "scratch_throw", 64 * 1024, &LoadScratchBumpingThrowingBundle);
+            nuint scratchBefore = alloc.Scratch.Offset;
+            AssertThrows<InvalidOperationException>(() =>
+                BundleSystem.Acquire(ref bundles2, bScratchThrow, ref world, ref alloc.Scratch),
+                "REV-ASSETS-06: Throwing LoaderFunc propagates");
+            Assert.Equal(scratchBefore, alloc.Scratch.Offset, "REV-ASSETS-06: ScratchArena rolled back after throwing LoaderFunc");
+            Assert.Equal(0, BundleSystem.GetRefCount(in bundles2, bScratchThrow), "REV-ASSETS-06: RefCount == 0 after throwing LoaderFunc");
+            BundleSystem.UnloadAll(ref bundles2, ref world);
+        }
+        finally
+        {
+            BundleSystem.UnloadAll(ref bundles, ref world);
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after bundle audit regression tests");
+    }
+
+    private static void TestRegisterTextureSizeOverflow()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 256 * 1024, 256 * 1024, 128 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 64, 16);
+        try
+        {
+            // REV-ASSETS-09: 65536x65536 Rgba8 with DataBytes == 0 -> OverflowException, LiveTextureCount == 0
+            AssertThrows<OverflowException>(() =>
+                AssetSystem.RegisterTexture(ref world.Assets, new TextureAssetData
+                {
+                    OwnerBundle = BundleId.Create(1, 1),
+                    Name = StringId.Hash("overflow_tex"),
+                    Width = 65536,
+                    Height = 65536,
+                    Format = TexturePixelFormat.Rgba8,
+                    Channels = 4,
+                    DataBytes = 0,
+                }),
+                "REV-ASSETS-09: 65536x65536 Rgba8 RegisterTexture throws OverflowException");
+            Assert.Equal(0, world.Assets.LiveTextureCount, "REV-ASSETS-09: LiveTextureCount remains 0 after OverflowException");
+        }
+        finally
+        {
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after RegisterTexture overflow test");
+    }
+
+    private static byte[] BuildMinimalTtfBytes()
+    {
+        // Minimal valid TrueType font containing 7 required tables: cmap, glyf, head, hhea, hmtx, loca, maxp
+        // Glyph 0 = .notdef (empty), Glyph 1 = 'A' (simple 500x700 box contour)
+        static void WriteBE16(byte[] b, int o, ushort v) { b[o] = (byte)(v >> 8); b[o + 1] = (byte)v; }
+        static void WriteBE32(byte[] b, int o, uint v) { b[o] = (byte)(v >> 24); b[o + 1] = (byte)(v >> 16); b[o + 2] = (byte)(v >> 8); b[o + 3] = (byte)v; }
+
+        byte[] head = new byte[54];
+        WriteBE32(head, 0, 0x00010000u);
+        WriteBE32(head, 12, 0x5F0F3CF5u); // magicNumber
+        WriteBE16(head, 18, 1000);        // unitsPerEm
+        WriteBE16(head, 50, 1);           // indexToLocFormat = 1 (32-bit offsets)
+
+        byte[] hhea = new byte[36];
+        WriteBE32(hhea, 0, 0x00010000u);
+        WriteBE16(hhea, 4, 800);                     // ascent
+        WriteBE16(hhea, 6, unchecked((ushort)-200)); // descent
+        WriteBE16(hhea, 34, 2);                      // numberOfHMetrics
+
+        byte[] maxp = new byte[6];
+        WriteBE32(maxp, 0, 0x00005000u);
+        WriteBE16(maxp, 4, 2); // numGlyphs = 2
+
+        byte[] hmtx = new byte[8];
+        WriteBE16(hmtx, 0, 500); WriteBE16(hmtx, 2, 0);
+        WriteBE16(hmtx, 4, 600); WriteBE16(hmtx, 6, 50);
+
+        // cmap: header(4) + encodingRecord(8) + Format 4 subtable(32) = 44 bytes
+        byte[] cmap = new byte[44];
+        WriteBE16(cmap, 0, 0); WriteBE16(cmap, 2, 1);        // version=0, numTables=1
+        WriteBE16(cmap, 4, 3); WriteBE16(cmap, 6, 1);        // platformID=3 (Win), encodingID=1 (Unicode BMP)
+        WriteBE32(cmap, 8, 12);                              // subtable offset
+        WriteBE16(cmap, 12, 4); WriteBE16(cmap, 14, 32);     // format=4, length=32
+        WriteBE16(cmap, 18, 4); WriteBE16(cmap, 20, 4);      // segCountX2=4, searchRange=4
+        WriteBE16(cmap, 22, 1); WriteBE16(cmap, 24, 0);      // entrySelector=1, rangeShift=0
+        WriteBE16(cmap, 26, 65); WriteBE16(cmap, 28, 0xFFFF);// endCount: 'A', sentinel
+        WriteBE16(cmap, 30, 0);                              // reservedPad
+        WriteBE16(cmap, 32, 65); WriteBE16(cmap, 34, 0xFFFF);// startCount: 'A', sentinel
+        WriteBE16(cmap, 36, unchecked((ushort)-64));         // idDelta[0]: 65 - 64 = 1 (glyph 1)
+        WriteBE16(cmap, 38, 1);                              // idDelta[1]: 0xFFFF + 1 = 0
+        WriteBE16(cmap, 40, 0); WriteBE16(cmap, 42, 0);      // idRangeOffset
+
+        // glyf: glyph 1 clockwise outer square contour (50,0)->(50,700)->(550,700)->(550,0)
+        byte[] glyf = new byte[36];
+        WriteBE16(glyf, 0, 1);   // numberOfContours = 1
+        WriteBE16(glyf, 2, 50);  // xMin
+        WriteBE16(glyf, 4, 0);   // yMin
+        WriteBE16(glyf, 6, 550); // xMax
+        WriteBE16(glyf, 8, 700); // yMax
+        WriteBE16(glyf, 10, 3);  // endPtsOfContours[0] = 3 (4 points)
+        WriteBE16(glyf, 12, 0);  // instructionLength = 0
+        glyf[14] = 1; glyf[15] = 1; glyf[16] = 1; glyf[17] = 1; // flags: ON_CURVE, 16-bit deltas
+        WriteBE16(glyf, 18, 50);
+        WriteBE16(glyf, 20, 0);
+        WriteBE16(glyf, 22, 500);
+        WriteBE16(glyf, 24, 0);
+        WriteBE16(glyf, 26, 0);
+        WriteBE16(glyf, 28, 700);
+        WriteBE16(glyf, 30, 0);
+        WriteBE16(glyf, 32, unchecked((ushort)-700));
+
+        byte[] loca = new byte[12]; // 3 uint32 offsets: glyph0=[0..0], glyph1=[0..36]
+        WriteBE32(loca, 0, 0);
+        WriteBE32(loca, 4, 0);
+        WriteBE32(loca, 8, (uint)glyf.Length);
+
+        (string tag, byte[] data)[] tables =
+        {
+            ("cmap", cmap), ("glyf", glyf), ("head", head),
+            ("hhea", hhea), ("hmtx", hmtx), ("loca", loca), ("maxp", maxp),
+        };
+
+        int dirLen = 12 + tables.Length * 16;
+        int totalLen = dirLen;
+        for (int i = 0; i < tables.Length; i++)
+            totalLen += (tables[i].data.Length + 3) & ~3;
+
+        byte[] ttf = new byte[totalLen];
+        WriteBE32(ttf, 0, 0x00010000u);
+        WriteBE16(ttf, 4, (ushort)tables.Length);
+        WriteBE16(ttf, 6, 64);
+        WriteBE16(ttf, 8, 2);
+        WriteBE16(ttf, 10, (ushort)(tables.Length * 16 - 64));
+
+        int curOff = dirLen;
+        for (int i = 0; i < tables.Length; i++)
+        {
+            int rec = 12 + i * 16;
+            Encoding.ASCII.GetBytes(tables[i].tag, 0, 4, ttf, rec);
+            WriteBE32(ttf, rec + 4, 0); // checkSum
+            WriteBE32(ttf, rec + 8, (uint)curOff);
+            WriteBE32(ttf, rec + 12, (uint)tables[i].data.Length);
+            Buffer.BlockCopy(tables[i].data, 0, ttf, curOff, tables[i].data.Length);
+            curOff += (tables[i].data.Length + 3) & ~3;
+        }
+        return ttf;
+    }
+
+    private static byte[] WrapTtfAsTtcV1(byte[] ttf)
+    {
+        // Prepend 16-byte TTC v1.0 header ("ttcf", version 1.0, numFonts=1, offsetTable[0]=16)
+        // and shift every SFNT table record's absolute file offset by +16.
+        const int hdr = 16;
+        byte[] ttc = new byte[hdr + ttf.Length];
+        ttc[0] = (byte)'t'; ttc[1] = (byte)'t'; ttc[2] = (byte)'c'; ttc[3] = (byte)'f';
+        ttc[4] = 0; ttc[5] = 1; ttc[6] = 0; ttc[7] = 0; // v1.0
+        ttc[11] = 1;                                     // numFonts = 1
+        ttc[15] = hdr;                                   // offsetTable[0] = 16
+        Buffer.BlockCopy(ttf, 0, ttc, hdr, ttf.Length);
+
+        int numTables = (ttf[4] << 8) | ttf[5];
+        for (int i = 0; i < numTables; i++)
+        {
+            int offPos = hdr + 12 + i * 16 + 8;
+            uint oldOff = ((uint)ttc[offPos] << 24) | ((uint)ttc[offPos + 1] << 16) | ((uint)ttc[offPos + 2] << 8) | ttc[offPos + 3];
+            uint newOff = oldOff + hdr;
+            ttc[offPos + 0] = (byte)(newOff >> 24);
+            ttc[offPos + 1] = (byte)(newOff >> 16);
+            ttc[offPos + 2] = (byte)(newOff >> 8);
+            ttc[offPos + 3] = (byte)newOff;
+        }
+        return ttc;
     }
 }

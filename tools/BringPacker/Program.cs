@@ -95,6 +95,12 @@ public static unsafe class Program
             }
         }
 
+        if (showHelp)
+        {
+            PrintUsage();
+            return 0;
+        }
+
         if (!string.IsNullOrEmpty(verifyDir))
         {
             if (!Directory.Exists(verifyDir))
@@ -113,15 +119,10 @@ public static unsafe class Program
             return 1;
         }
 
-        if (showHelp || string.IsNullOrEmpty(inputDir) || string.IsNullOrEmpty(outputPack))
+        if (string.IsNullOrEmpty(inputDir) || string.IsNullOrEmpty(outputPack))
         {
-            Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - BringPacker (Unity-style Atlas + BC1/BC3 + LZ4/Brotli Asset Bundler)");
-            Console.WriteLine("Usage:");
-            Console.WriteLine("  BringPacker --input <raw_dir> --output <out.bpack> [--compression brotli|lz4|none]");
-            Console.WriteLine("              [--atlas-compression auto|bc1|bc3|none] [--gltf-compression auto|bc1|bc3|none]");
-            Console.WriteLine("              [--max-atlas 2048] [--padding 2]");
-            Console.WriteLine("  BringPacker --verify-no-loose-textures <dist_dir>");
-            return showHelp ? 0 : 2;
+            PrintUsage();
+            return 2;
         }
 
         var arena = LinearArena.Create(2 * 1024 * 1024, StringId.Hash("BringPacker").Value);
@@ -147,6 +148,22 @@ public static unsafe class Program
         }
     }
 
+    private static void PrintUsage()
+    {
+        Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - BringPacker (Unity-style Atlas + BC1/BC3 + LZ4/Brotli Asset Bundler)");
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  BringPacker --input <raw_dir> --output <out.bpack> [--compression brotli|lz4|none]");
+        Console.WriteLine("              [--atlas-compression auto|bc1|bc3|none] [--gltf-compression auto|bc1|bc3|none]");
+        Console.WriteLine("              [--max-atlas 2048] [--padding 2]");
+        Console.WriteLine("  BringPacker --verify-no-loose-textures <dist_dir>");
+    }
+
+    private static bool IsKnownFlag(string arg) => arg is
+        "--help" or "-h" or "--input" or "-i" or "--output" or "-o" or
+        "--verify-no-loose-textures" or "--compression" or
+        "--atlas-compression" or "--gltf-compression" or
+        "--max-atlas" or "--padding";
+
     private static bool TryConsumeValue(string[] args, ref int i, string flag, out string? value)
     {
         if (i + 1 >= args.Length)
@@ -155,7 +172,15 @@ public static unsafe class Program
             value = null;
             return false;
         }
-        value = args[++i];
+        string next = args[i + 1];
+        if (next.StartsWith("--", StringComparison.Ordinal) || IsKnownFlag(next))
+        {
+            Console.Error.WriteLine($"[BringPacker] ERROR: Missing value for '{flag}' (got flag '{next}').");
+            value = null;
+            return false;
+        }
+        i++;
+        value = next;
         return true;
     }
 

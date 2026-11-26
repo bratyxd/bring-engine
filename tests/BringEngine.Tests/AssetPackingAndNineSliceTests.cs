@@ -39,6 +39,7 @@ public static unsafe class AssetPackingAndNineSliceTests
         Assert.Run("AtlasPacker_DefaultAtlasingBleedPaddingNineSliceMetadataAndUnload", &TestAtlasPacker);
         Assert.Run("AssetPack_BuildDirectoryBrotliAndLz4_LoadViaBundleSystemAndZeroLooseTextures", &TestAssetPackEndToEnd);
         Assert.Run("AssetPack_MultiPageTtfLooseGltfBglb_VerifyMissingDir_AndBringPackerCli", &TestMultiPageTtfLooseGltfAndCli);
+        Assert.Run("PackingAndAtlas_AuditRegressions_OpaqueBc1_Overflow_UnrefBin_EmptyBrotli_Extensions", &TestPackingAndAtlasAuditRegressions);
         Assert.Run("NineSlice_BatchRenderer_SingleDrawCallCornerSizingClampAndZeroGc", &TestNineSliceHeadlessBatching);
         if (!headlessOnly)
             Assert.Run("Gpu_CompressedBc1Bc3AtlasAndNineSliceUi_SingleDrawCallAndPngCapture", &TestGpuCompressedAtlasAndNineSlice);
@@ -616,7 +617,7 @@ public static unsafe class AssetPackingAndNineSliceTests
         finally
         {
             AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
-            GpuSystem.Dispose(ref *gpu);
+            GpuSystem.Dispose(ref *gpu, ref world.Assets);
             PlatformSystem.Shutdown(ref window);
             bundleArena.Dispose();
             alloc.Dispose();
@@ -1068,6 +1069,137 @@ public static unsafe class AssetPackingAndNineSliceTests
         }
         Task.WaitAll(outTask, errTask);
         return proc.ExitCode;
+    }
+
+    private static void TestPackingAndAtlasAuditRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tmpRoot = Path.Combine(Path.GetTempPath(), $"bring_pack_audit_{Guid.NewGuid():N}");
+        string rawDir = Path.Combine(tmpRoot, "raw");
+        string outDir = Path.Combine(tmpRoot, "out");
+        string looseDir = Path.Combine(tmpRoot, "loose_check");
+        Directory.CreateDirectory(rawDir);
+        Directory.CreateDirectory(outDir);
+        Directory.CreateDirectory(looseDir);
+
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 512 * 1024, 1 * 1024 * 1024, 128 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 128, 32);
+        var bundleArena = LinearArena.Create(2 * 1024 * 1024);
+        var bundleId = BundleId.Create(9, 1);
+
+        try
+        {
+            // REV-ASSETS-04: Opaque non-PoT sprites (16x16, 10x10, 24x18) with AtlasBuildOptions.Default() -> Bc1Rgba with exact BC1 byte count
+            byte[] op1 = MakeSolidRgba(16, 16, 220, 120, 60, 255);
+            byte[] op2 = MakeSolidRgba(10, 10, 40, 200, 180, 255);
+            byte[] op3 = MakeSolidRgba(24, 18, 90, 90, 240, 255);
+            fixed (byte* p1 = op1)
+            fixed (byte* p2 = op2)
+            fixed (byte* p3 = op3)
+            {
+                Span<AtlasSourceImage> opaqueSrcs = stackalloc AtlasSourceImage[3];
+                opaqueSrcs[0] = new AtlasSourceImage { Name = StringId.Hash("op1"), RgbaPixels = p1, Width = 16, Height = 16 };
+                opaqueSrcs[1] = new AtlasSourceImage { Name = StringId.Hash("op2"), RgbaPixels = p2, Width = 10, Height = 10 };
+                opaqueSrcs[2] = new AtlasSourceImage { Name = StringId.Hash("op3"), RgbaPixels = p3, Width = 24, Height = 18 };
+
+                var defOpts = AtlasBuildOptions.Default();
+                AtlasPacker.BuildPages(opaqueSrcs, in defOpts, out PackedAtlasPage[] pages, out _);
+                Assert.Equal(1, pages.Length, "REV-ASSETS-04: 3 opaque non-PoT sprites pack into 1 page");
+                Assert.Equal((byte)TexturePixelFormat.Bc1Rgba, (byte)pages[0].Format, "REV-ASSETS-04: Auto selects BC1 (not BC3) for opaque sprites despite canvas slack");
+                int expectedBc1Bytes = TextureCompressionSystem.CalcByteSize(TexturePixelFormat.Bc1Rgba, pages[0].Width, pages[0].Height);
+                Assert.Equal(expectedBc1Bytes, pages[0].CompressedData.Length, "REV-ASSETS-04: Exact BC1 byte count");
+
+                // Also verify decoded alpha is 255 everywhere (slack alpha pre-filled so no 3-color punchthrough triggered)
+                byte[] dec = new byte[pages[0].Width * pages[0].Height * 4];
+                fixed (byte* cPtr = pages[0].CompressedData)
+                fixed (byte* dPtr = dec)
+                    TextureCompressionSystem.DecodeBc1ToRgba(cPtr, pages[0].Width, pages[0].Height, dPtr);
+                bool allAlpha255 = true;
+                for (int i = 3; i < dec.Length; i += 4)
+                    if (dec[i] != 255) { allAlpha255 = false; break; }
+                Assert.True(allAlpha255, "REV-ASSETS-04: BC1 decoded page has alpha==255 everywhere (no punchthrough slack)");
+
+                // REV-ASSETS-18: Overflow padding & MaxPageSize throw cleanly
+                var overflowPadOpts = AtlasBuildOptions.Default();
+                overflowPadOpts.Padding = int.MaxValue / 2;
+                bool threwPad = false;
+                try { AtlasPacker.BuildPages(opaqueSrcs, in overflowPadOpts, out _, out _); }
+                catch (ArgumentOutOfRangeException) { threwPad = true; }
+                Assert.True(threwPad, "REV-ASSETS-18: Overflow padding throws ArgumentOutOfRangeException");
+
+                var overflowPageOpts = AtlasBuildOptions.Default();
+                overflowPageOpts.MaxPageSize = int.MaxValue;
+                bool threwMaxPage = false;
+                try { AtlasPacker.BuildPages(opaqueSrcs, in overflowPageOpts, out _, out _); }
+                catch (ArgumentOutOfRangeException) { threwMaxPage = true; }
+                Assert.True(threwMaxPage, "REV-ASSETS-18: Overflow MaxPageSize throws ArgumentOutOfRangeException");
+            }
+
+            // REV-ASSETS-12: TextureCompressionSystem (int.MaxValue, 4) rejected cleanly without negative block count
+            byte[] tiny = new byte[16];
+            fixed (byte* tPtr = tiny)
+            {
+                byte* localT = tPtr;
+                AssertThrows<OverflowException>(() => TextureCompressionSystem.CalcByteSize(TexturePixelFormat.Bc1Rgba, int.MaxValue, 4), "REV-ASSETS-12: CalcByteSize rejects (int.MaxValue, 4)");
+                AssertThrows<OverflowException>(() => TextureCompressionSystem.EncodeBc1(localT, int.MaxValue, 4, localT), "REV-ASSETS-12: EncodeBc1 rejects (int.MaxValue, 4)");
+                AssertThrows<OverflowException>(() => TextureCompressionSystem.EncodeBc3(localT, int.MaxValue, 4, localT), "REV-ASSETS-12: EncodeBc3 rejects (int.MaxValue, 4)");
+                AssertThrows<OverflowException>(() => TextureCompressionSystem.DecodeBc1ToRgba(localT, int.MaxValue, 4, localT), "REV-ASSETS-12: DecodeBc1 rejects (int.MaxValue, 4)");
+                AssertThrows<OverflowException>(() => TextureCompressionSystem.DecodeBc3ToRgba(localT, int.MaxValue, 4, localT), "REV-ASSETS-12: DecodeBc3 rejects (int.MaxValue, 4)");
+            }
+
+            // REV-ASSETS-14: Empty Brotli round-trips 0 bytes
+            byte[] emptyBrotli = PackCompressionSystem.Compress(ReadOnlySpan<byte>.Empty, PackCompressionMode.Brotli);
+            Assert.Equal(0, emptyBrotli.Length, "REV-ASSETS-14: Empty Brotli compress returns 0 bytes");
+            int emptyDecomp = PackCompressionSystem.Decompress(emptyBrotli, PackCompressionMode.Brotli, Span<byte>.Empty);
+            Assert.Equal(0, emptyDecomp, "REV-ASSETS-14: Empty Brotli decompress returns 0 bytes");
+
+            // REV-ASSETS-14 & REV-ASSETS-18: Unreferenced level.bin packed as RawBlob, referenced glTF .bin skipped, and HasPivot=0 when omitted in pack.json
+            byte[] levelBinData = new byte[] { 0x4C, 0x56, 0x4C, 0x31, 1, 2, 3, 4 };
+            File.WriteAllBytes(Path.Combine(rawDir, "level.bin"), levelBinData);
+            File.WriteAllBytes(Path.Combine(rawDir, "panel_nopiv.png"), MakeTestPngBytes(16, 16, opaque: true));
+            File.WriteAllText(Path.Combine(rawDir, "pack.json"), "{\"sprites\":[{\"path\":\"panel_nopiv.png\",\"name\":\"panel_nopiv\",\"slice\":[2,2,2,2]}]}", new UTF8Encoding(false));
+
+            string packPath = Path.Combine(outDir, "audit.bpack");
+            AssetPackBuildSummary sum = AssetPackBuilder.BuildPackFromDirectory(rawDir, packPath, PackCompressionMode.Brotli);
+            Assert.Equal(1, sum.RawBlobCount, "REV-ASSETS-14: Unreferenced level.bin packed as RawBlob");
+
+            ArenaMarker mark = alloc.Scratch.SaveMarker();
+            Assert.True(AssetPackLoader.TryReadRawBlob(packPath, StringId.Hash("level.bin"), ref alloc.Scratch, out NativeSlice<byte> binSlice), "REV-ASSETS-14: Unreferenced level.bin readable via TryReadRawBlob");
+            Assert.True(new ReadOnlySpan<byte>(binSlice.Ptr, binSlice.Length).SequenceEqual(levelBinData), "REV-ASSETS-14: level.bin payload bit-exact");
+            alloc.Scratch.Rollback(mark);
+
+            AssetPackLoader.LoadIntoBundle(packPath, ref bundleArena, ref alloc.Scratch, ref world, bundleId);
+            SpriteRegionData* noPivReg = AssetSystem.TryGetSpriteRegion(in world.Assets, StringId.Hash("panel_nopiv"));
+            Assert.True(noPivReg != null, "REV-ASSETS-18: Sprite with slice-only metadata loaded");
+            Assert.Near(0.5f, noPivReg->Pivot.X, 1e-4f, "REV-ASSETS-18: Omitted pivot defaults to 0.5 X");
+            Assert.Near(0.5f, noPivReg->Pivot.Y, 1e-4f, "REV-ASSETS-18: Omitted pivot defaults to 0.5 Y");
+
+            // XMOD-14: VerifyNoLooseTextures rejects .WEBP, .GIF, .PSD, .HDR, .PNG
+            string[] looseExts = { "a.WEBP", "b.GIF", "c.PSD", "d.HDR", "e.PNG" };
+            for (int i = 0; i < looseExts.Length; i++)
+            {
+                string sub = Path.Combine(looseDir, $"case_{i}");
+                Directory.CreateDirectory(sub);
+                File.WriteAllBytes(Path.Combine(sub, looseExts[i]), new byte[] { 1, 2, 3, 4 });
+                Assert.True(!AssetPackBuilder.VerifyNoLooseTextures(sub, out string[] off) && off.Length == 1, $"XMOD-14: VerifyNoLooseTextures rejects {looseExts[i]}");
+            }
+
+            // XMOD-14: BringPacker CLI --help precedence over --verify-no-loose-textures & flag-as-value rejection
+            string? packerDll = FindBringPackerDll();
+            if (packerDll != null)
+            {
+                Assert.Equal(0, RunBringPackerCli(packerDll, $"--verify-no-loose-textures \"{looseDir}\" --help"), "XMOD-14: --help takes precedence over --verify-no-loose-textures (exit 0)");
+                Assert.Equal(2, RunBringPackerCli(packerDll, "--input --output foo.bpack"), "XMOD-14: --input followed by --output rejected as missing value (exit 2)");
+            }
+        }
+        finally
+        {
+            AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
+            bundleArena.Dispose();
+            alloc.Dispose();
+            if (Directory.Exists(tmpRoot)) Directory.Delete(tmpRoot, recursive: true);
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after packing & atlas audit regression tests");
     }
 
     private static void AssertThrows<TException>(Action act, string msg) where TException : Exception

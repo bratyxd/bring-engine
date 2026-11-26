@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using BringEngine.Assets.Compression;
 using BringEngine.Assets.Fonts;
@@ -104,12 +105,12 @@ public static unsafe class BundleSystem
         delegate*<ref BundleLoadContext, void> loaderFunc,
         void* userData = null)
     {
-        if (mgr.Count >= mgr.Capacity)
-            throw new OutOfMemoryException("BundleManager capacity exceeded.");
-
         StringId id = StringId.Hash(name);
         if (mgr.NameToSlot.TryGet(id.Value, out int existing))
             return mgr.Bundles[existing].Handle;
+
+        if (mgr.Count >= mgr.Capacity)
+            throw new OutOfMemoryException("BundleManager capacity exceeded.");
 
         int slot = mgr.Count++;
         var handle = BundleId.Create((uint)slot, 1);
@@ -126,14 +127,24 @@ public static unsafe class BundleSystem
         return handle;
     }
 
+    private static void ValidateBundlePathLength(ReadOnlySpan<char> path, string paramName)
+    {
+        if (!path.IsEmpty && Encoding.UTF8.GetByteCount(path) > FixedString256.MaxBytes)
+            throw new ArgumentException($"Bundle path exceeds FixedString256 limit ({FixedString256.MaxBytes} UTF-8 bytes).", paramName);
+    }
+
     public static BundleId RegisterManifest(
         ref BundleManager mgr,
         ReadOnlySpan<char> name,
         nuint arenaCapacityBytes,
         ReadOnlySpan<char> manifestJsonPath)
     {
+        ValidateBundlePathLength(manifestJsonPath, nameof(manifestJsonPath));
+        StringId id = StringId.Hash(name);
+        bool alreadyRegistered = mgr.NameToSlot.TryGet(id.Value, out _);
         var handle = Register(ref mgr, name, arenaCapacityBytes, null);
-        mgr.Bundles[handle.Index].ManifestPath = FixedString256.From(manifestJsonPath);
+        if (!alreadyRegistered)
+            mgr.Bundles[handle.Index].ManifestPath = FixedString256.From(manifestJsonPath);
         return handle;
     }
 
@@ -149,8 +160,12 @@ public static unsafe class BundleSystem
         delegate*<ref BundleLoadContext, void> postLoadHook = null,
         void* userData = null)
     {
+        ValidateBundlePathLength(bpackPath, nameof(bpackPath));
+        StringId id = StringId.Hash(name);
+        bool alreadyRegistered = mgr.NameToSlot.TryGet(id.Value, out _);
         var handle = Register(ref mgr, name, arenaCapacityBytes, postLoadHook, userData);
-        mgr.Bundles[handle.Index].PackPath = FixedString256.From(bpackPath);
+        if (!alreadyRegistered)
+            mgr.Bundles[handle.Index].PackPath = FixedString256.From(bpackPath);
         return handle;
     }
 
@@ -158,10 +173,10 @@ public static unsafe class BundleSystem
         => mgr.NameToSlot.TryGet(name.Value, out int slot) ? mgr.Bundles[slot].Handle : BundleId.Invalid;
 
     public static bool IsLoaded(in BundleManager mgr, BundleId id)
-        => id.IsValid && id.Index < (uint)mgr.Count && mgr.Bundles[id.Index].Loaded != 0;
+        => id.IsValid && id.Index < (uint)mgr.Count && mgr.Bundles[id.Index].Handle == id && mgr.Bundles[id.Index].Loaded != 0;
 
     public static int GetRefCount(in BundleManager mgr, BundleId id)
-        => (id.IsValid && id.Index < (uint)mgr.Count) ? mgr.Bundles[id.Index].RefCount : 0;
+        => (id.IsValid && id.Index < (uint)mgr.Count && mgr.Bundles[id.Index].Handle == id) ? mgr.Bundles[id.Index].RefCount : 0;
 
     /// <summary>
     /// Increments bundle RefCount; allocates bundle LinearArena and loads assets if transitioning 0 -> 1.
@@ -176,23 +191,25 @@ public static unsafe class BundleSystem
     {
         if (!id.IsValid || id.Index >= (uint)mgr.Count) return;
         ref AssetBundleData b = ref mgr.Bundles[id.Index];
+        if (b.Handle != id) return;
         b.RefCount++;
         if (b.Loaded != 0) return;
 
         LogState* activeLog = log != null ? log : mgr.Log;
         long startTicks = Stopwatch.GetTimestamp();
-
-        b.Arena = LinearArena.Create(b.ArenaCapacityBytes, b.Name.Value);
-        b.Loaded = 1;
+        ArenaMarker scratchMark = scratchArena.SaveMarker();
 
         try
         {
+            b.Arena = LinearArena.Create(b.ArenaCapacityBytes, b.Name.Value);
+            b.Loaded = 1;
+
             if (b.PackPath.Length > 0)
             {
                 string packPath = b.PackPath.ToString();
                 if (!File.Exists(packPath))
                     throw new FileNotFoundException($"Bundle '{b.NameText}' .bpack file not found: '{packPath}'.", packPath);
-                AssetPackLoader.LoadIntoBundle(packPath, ref b.Arena, ref scratchArena, ref world, id);
+                AssetPackLoader.LoadIntoBundle(packPath, ref b.Arena, ref scratchArena, ref world, b.Handle);
             }
 
             if (b.ManifestPath.Length > 0)
@@ -200,7 +217,7 @@ public static unsafe class BundleSystem
                 string path = b.ManifestPath.ToString();
                 if (!File.Exists(path))
                     throw new FileNotFoundException($"Bundle '{b.NameText}' manifest file not found: '{path}'.", path);
-                LoadFromManifestJson(path, id, ref b.Arena, ref scratchArena, ref world, activeLog);
+                LoadFromManifestJson(path, b.Handle, ref b.Arena, ref scratchArena, ref world, activeLog);
             }
 
             if (b.LoaderFunc != null)
@@ -211,7 +228,7 @@ public static unsafe class BundleSystem
                 {
                     var ctx = new BundleLoadContext
                     {
-                        Bundle = id,
+                        Bundle = b.Handle,
                         BundleArena = bArenaPtr,
                         ScratchArena = sArenaPtr,
                         World = wPtr,
@@ -223,20 +240,25 @@ public static unsafe class BundleSystem
         }
         catch (Exception ex)
         {
-            AssetSystem.UnloadByBundle(ref world.Assets, id);
-            AnimationSystem.UnregisterByBundle(ref world.Animations, id);
-            b.Arena.Dispose();
+            AssetSystem.UnloadByBundle(ref world.Assets, b.Handle);
+            AnimationSystem.UnregisterByBundle(ref world.Animations, b.Handle);
+            if (b.Arena.IsValid)
+                b.Arena.Dispose();
             b.Loaded = 0;
             b.RefCount--;
             if (activeLog != null)
                 LogSystem.Error(activeLog, $"Bundle '{b.NameText}' acquire failed ({ex.GetType().Name}); rolled back");
             throw;
         }
+        finally
+        {
+            scratchArena.Rollback(scratchMark);
+        }
 
         if (activeLog != null)
         {
             double elapsedMs = (Stopwatch.GetTimestamp() - startTicks) * 1000.0 / Stopwatch.Frequency;
-            LogSystem.Info(activeLog, $"Bundle '{b.NameText}' loaded (handle={id}, used={b.Arena.Offset}/{b.Arena.Capacity}B, {elapsedMs:F2}ms)");
+            LogSystem.Info(activeLog, $"Bundle '{b.NameText}' loaded (handle={b.Handle}, used={b.Arena.Offset}/{b.Arena.Capacity}B, {elapsedMs:F2}ms)");
         }
     }
 
@@ -247,6 +269,7 @@ public static unsafe class BundleSystem
     {
         if (!id.IsValid || id.Index >= (uint)mgr.Count) return;
         ref AssetBundleData b = ref mgr.Bundles[id.Index];
+        if (b.Handle != id) return;
         if (b.RefCount <= 0) return;
         b.RefCount--;
         if (b.RefCount > 0 || b.Loaded == 0) return;
@@ -254,13 +277,13 @@ public static unsafe class BundleSystem
         LogState* activeLog = log != null ? log : mgr.Log;
         nuint reclaimedBytes = b.Arena.Capacity;
 
-        AssetSystem.UnloadByBundle(ref world.Assets, id);
-        AnimationSystem.UnregisterByBundle(ref world.Animations, id);
+        AssetSystem.UnloadByBundle(ref world.Assets, b.Handle);
+        AnimationSystem.UnregisterByBundle(ref world.Animations, b.Handle);
         b.Arena.Dispose();
         b.Loaded = 0;
 
         if (activeLog != null)
-            LogSystem.Info(activeLog, $"Bundle '{b.NameText}' unloaded (handle={id}, reclaimed={reclaimedBytes}B)");
+            LogSystem.Info(activeLog, $"Bundle '{b.NameText}' unloaded (handle={b.Handle}, reclaimed={reclaimedBytes}B)");
     }
 
     public static void UnloadAll(ref BundleManager mgr, ref EngineWorld world, LogState* log = null)
@@ -296,8 +319,11 @@ public static unsafe class BundleSystem
         LogState* log)
     {
         byte[] jsonBytes = File.ReadAllBytes(manifestPath);
+        ReadOnlySpan<byte> jsonSpan = jsonBytes;
+        if (jsonSpan.Length >= 3 && jsonSpan[0] == 0xEF && jsonSpan[1] == 0xBB && jsonSpan[2] == 0xBF)
+            jsonSpan = jsonSpan.Slice(3);
         string baseDir = Path.GetDirectoryName(manifestPath) ?? ".";
-        var r = new Utf8JsonReader(jsonBytes, isFinalBlock: true, state: default);
+        var r = new Utf8JsonReader(jsonSpan, isFinalBlock: true, state: default);
 
         if (!r.Read() || r.TokenType != JsonTokenType.StartObject)
             throw new InvalidDataException($"Bundle manifest '{manifestPath}' root must be a JSON object.");
@@ -365,6 +391,10 @@ public static unsafe class BundleSystem
                     else if (type == "font")
                     {
                         SdfFontLoader.BakeSdfFromSystemOrFile(string.IsNullOrEmpty(full) ? null : full, ref bundleArena, ref world.Assets, bundle, nameId, fontSize, log: log);
+                    }
+                    else
+                    {
+                        throw new InvalidDataException($"Unrecognized asset type '{type}' in bundle manifest '{manifestPath}'.");
                     }
                 }
             }

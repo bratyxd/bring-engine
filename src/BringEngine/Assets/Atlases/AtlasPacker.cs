@@ -98,7 +98,11 @@ public static unsafe class AtlasPacker
             return;
         }
 
+        if (options.MaxPageSize > 16384)
+            throw new ArgumentOutOfRangeException(nameof(options), options.MaxPageSize, "Atlas MaxPageSize must be <= 16384.");
         int maxPage = options.MaxPageSize > 0 ? AlignUp4(options.MaxPageSize) : 2048;
+        if (options.Padding > maxPage / 2)
+            throw new ArgumentOutOfRangeException(nameof(options), options.Padding, $"Atlas Padding ({options.Padding}) exceeds half of MaxPageSize ({maxPage}).");
         int pad = options.Padding >= 0 ? options.Padding : 2;
 
         for (int i = 0; i < sources.Length; i++)
@@ -158,11 +162,14 @@ public static unsafe class AtlasPacker
             int si = order[oi];
             int sw = sources[si].Width;
             int sh = sources[si].Height;
-            int pw = AlignUp4(sw + pad * 2);
-            int ph = AlignUp4(sh + pad * 2);
+            long pwL = (((long)sw + (long)pad * 2L) + 3L) & ~3L;
+            long phL = (((long)sh + (long)pad * 2L) + 3L) & ~3L;
 
-            if (pw > maxPage || ph > maxPage)
+            if (pwL > maxPage || phL > maxPage)
                 throw new InvalidOperationException($"Sprite ({sw}x{sh} + padding {pad}) exceeds MaxPageSize ({maxPage}).");
+
+            int pw = (int)pwL;
+            int ph = (int)phL;
 
             if (curX + pw > maxPage)
             {
@@ -209,7 +216,42 @@ public static unsafe class AtlasPacker
             long rgbaBytes = (long)w * h * 4L;
             if (rgbaBytes > int.MaxValue)
                 throw new OverflowException("Atlas page pixel buffer exceeds 2GB.");
+
+            // Determine page compression format from the actual source sprites on page p (NOT zero-alpha canvas slack!)
+            TexturePixelFormat fmt;
+            if (options.Compression == TextureCompressionPolicy.Auto)
+            {
+                bool pageHasAlpha = false;
+                for (int oi = 0; oi < placements.Length; oi++)
+                {
+                    if (placements[oi].PageIndex != p) continue;
+                    ref readonly AtlasSourceImage src = ref sources[placements[oi].SourceIndex];
+                    if (TextureCompressionSystem.HasTransparency(src.RgbaPixels, src.Width, src.Height))
+                    {
+                        pageHasAlpha = true;
+                        break;
+                    }
+                }
+                fmt = pageHasAlpha ? TexturePixelFormat.Bc3Rgba : TexturePixelFormat.Bc1Rgba;
+            }
+            else
+            {
+                fmt = options.Compression switch
+                {
+                    TextureCompressionPolicy.None => TexturePixelFormat.Rgba8,
+                    TextureCompressionPolicy.Bc1 => TexturePixelFormat.Bc1Rgba,
+                    TextureCompressionPolicy.Bc3 => TexturePixelFormat.Bc3Rgba,
+                    _ => TexturePixelFormat.Bc1Rgba,
+                };
+            }
+
             byte[] rgba = new byte[(int)rgbaBytes];
+            if (fmt == TexturePixelFormat.Bc1Rgba)
+            {
+                // Fill unused canvas slack with alpha=255 before blitting so edge slack never triggers 3-color BC1 punchthrough
+                for (int i = 3; i < rgba.Length; i += 4)
+                    rgba[i] = 255;
+            }
 
             fixed (byte* dstPtr = rgba)
             {
@@ -235,7 +277,6 @@ public static unsafe class AtlasPacker
                     };
                 }
 
-                TexturePixelFormat fmt = TextureCompressionSystem.ResolveFormat(options.Compression, dstPtr, w, h);
                 int byteCount = TextureCompressionSystem.CalcByteSize(fmt, w, h);
                 byte[] compBytes = new byte[byteCount];
                 fixed (byte* outPtr = compBytes)
@@ -338,8 +379,8 @@ public static unsafe class AtlasPacker
             for (int dx = xMin; dx <= xMax; dx++)
             {
                 int sx = Math.Clamp(dx - ox, 0, sw - 1);
-                int si = (sy * sw + sx) * 4;
-                int di = (dy * dw + dx) * 4;
+                nint si = ((nint)sy * sw + sx) * 4;
+                nint di = ((nint)dy * dw + dx) * 4;
                 dst[di + 0] = src[si + 0];
                 dst[di + 1] = src[si + 1];
                 dst[di + 2] = src[si + 2];
@@ -355,7 +396,7 @@ public static unsafe class AtlasPacker
         return a.Name.Value.CompareTo(b.Name.Value);
     }
 
-    private static int AlignUp4(int v) => (v + 3) & ~3;
+    private static int AlignUp4(int v) => checked(v + 3) & ~3;
 
     private static int NextPoT4Aligned(int value, int max)
     {

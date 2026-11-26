@@ -199,8 +199,8 @@ public static unsafe class AssetPackBuilder
         string[] allFiles = Directory.GetFiles(fullRoot, "*", SearchOption.AllDirectories);
         Array.Sort(allFiles, StringComparer.OrdinalIgnoreCase);
 
-        // Identify textures referenced externally by loose .gltf files so they get inlined into the GLB, not duplicated in 2D atlas
-        var gltfExternalTextures = CollectGltfReferencedImagePaths(allFiles);
+        // Identify textures & .bin buffers referenced externally by loose .gltf files so they get inlined into the GLB, not duplicated
+        CollectGltfReferencedExternalPaths(allFiles, out string[] gltfExternalTextures, out string[] gltfExternalBuffers);
 
         var entries = new PreparedEntry[Math.Max(16, allFiles.Length + 8)];
         int entryCount = 0;
@@ -269,7 +269,7 @@ public static unsafe class AssetPackBuilder
                         Height = dec.Height,
                         SliceBorders = hasMeta ? sm.SliceBorders : Vec4.Zero,
                         Pivot = hasMeta ? sm.Pivot : new Vec2(0.5f, 0.5f),
-                        HasPivot = (byte)(hasMeta ? 1 : 0),
+                        HasPivot = (byte)(hasMeta && sm.HasPivot ? 1 : 0),
                     };
                     atlasSourceCount++;
                 }
@@ -316,7 +316,7 @@ public static unsafe class AssetPackBuilder
                 });
                 summary.FontCount++;
             }
-            else if (ext == ".bin")
+            else if (ext == ".bin" && IsInArray(gltfExternalBuffers, Path.GetFullPath(file)))
             {
                 // External glTF .bin already inlined into self-contained GLB
                 continue;
@@ -432,7 +432,11 @@ public static unsafe class AssetPackBuilder
             || ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase)
             || ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)
             || ext.Equals(".bmp", StringComparison.OrdinalIgnoreCase)
-            || ext.Equals(".tga", StringComparison.OrdinalIgnoreCase);
+            || ext.Equals(".tga", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".webp", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".gif", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".psd", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".hdr", StringComparison.OrdinalIgnoreCase);
     }
 
     private static byte[] SerializeAtlasPagePayload(in PackedAtlasPage page, PackedAtlasRegion[] allRegions, int pageIdx)
@@ -561,43 +565,68 @@ public static unsafe class AssetPackBuilder
         fs.Write(hdrBytes, 0, hdrBytes.Length);
     }
 
-    private static string[] CollectGltfReferencedImagePaths(string[] allFiles)
+    private static void CollectGltfReferencedExternalPaths(string[] allFiles, out string[] imagePaths, out string[] bufferPaths)
     {
-        string[] found = Array.Empty<string>();
-        int count = 0;
+        string[] foundImgs = Array.Empty<string>();
+        int imgCount = 0;
+        string[] foundBufs = Array.Empty<string>();
+        int bufCount = 0;
+
+        static void AppendPath(ref string[] arr, ref int count, string path)
+        {
+            if (count >= arr.Length)
+            {
+                var next = new string[Math.Max(8, arr.Length * 2)];
+                Array.Copy(arr, next, count);
+                arr = next;
+            }
+            arr[count++] = path;
+        }
+
         for (int i = 0; i < allFiles.Length; i++)
         {
             if (!allFiles[i].EndsWith(".gltf", StringComparison.OrdinalIgnoreCase)) continue;
             string dir = Path.GetDirectoryName(allFiles[i]) ?? ".";
             using var doc = JsonDocument.Parse(StripUtf8Bom(File.ReadAllBytes(allFiles[i])));
             if (doc.RootElement.ValueKind != JsonValueKind.Object) continue;
-            if (!doc.RootElement.TryGetProperty("images", out var imgs) || imgs.ValueKind != JsonValueKind.Array) continue;
-            foreach (JsonElement img in imgs.EnumerateArray())
+            if (doc.RootElement.TryGetProperty("images", out var imgs) && imgs.ValueKind == JsonValueKind.Array)
             {
-                if (img.ValueKind != JsonValueKind.Object || !img.TryGetProperty("uri", out var uriEl) || uriEl.ValueKind != JsonValueKind.String) continue;
-                string uri = uriEl.GetString() ?? "";
-                if (uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(uri)) continue;
-                if (!PackCompressionSystem.TryResolveSafeRelativePath(dir, uri, out string full))
-                    throw new InvalidDataException($"Unsafe external glTF image URI rejected: '{uri}'.");
-                if (count >= found.Length)
+                foreach (JsonElement img in imgs.EnumerateArray())
                 {
-                    var next = new string[Math.Max(8, found.Length * 2)];
-                    Array.Copy(found, next, count);
-                    found = next;
+                    if (img.ValueKind != JsonValueKind.Object || !img.TryGetProperty("uri", out var uriEl) || uriEl.ValueKind != JsonValueKind.String) continue;
+                    string uri = uriEl.GetString() ?? "";
+                    if (uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(uri)) continue;
+                    if (!PackCompressionSystem.TryResolveSafeRelativePath(dir, uri, out string full))
+                        throw new InvalidDataException($"Unsafe external glTF image URI rejected: '{uri}'.");
+                    AppendPath(ref foundImgs, ref imgCount, full);
                 }
-                found[count++] = full;
+            }
+            if (doc.RootElement.TryGetProperty("buffers", out var bufs) && bufs.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement buf in bufs.EnumerateArray())
+                {
+                    if (buf.ValueKind != JsonValueKind.Object || !buf.TryGetProperty("uri", out var uriEl) || uriEl.ValueKind != JsonValueKind.String) continue;
+                    string uri = uriEl.GetString() ?? "";
+                    if (uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(uri)) continue;
+                    if (!PackCompressionSystem.TryResolveSafeRelativePath(dir, uri, out string full))
+                        throw new InvalidDataException($"Unsafe external glTF buffer URI rejected: '{uri}'.");
+                    AppendPath(ref foundBufs, ref bufCount, full);
+                }
             }
         }
-        if (count == found.Length) return found;
-        var trimmed = new string[count];
-        Array.Copy(found, trimmed, count);
-        return trimmed;
+
+        if (imgCount == foundImgs.Length) imagePaths = foundImgs;
+        else { imagePaths = new string[imgCount]; Array.Copy(foundImgs, imagePaths, imgCount); }
+
+        if (bufCount == foundBufs.Length) bufferPaths = foundBufs;
+        else { bufferPaths = new string[bufCount]; Array.Copy(foundBufs, bufferPaths, bufCount); }
     }
 
     private static bool IsInArray(string[] arr, string target)
     {
+        StringComparison cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         for (int i = 0; i < arr.Length; i++)
-            if (arr[i].Equals(target, StringComparison.OrdinalIgnoreCase)) return true;
+            if (arr[i].Equals(target, cmp)) return true;
         return false;
     }
 
@@ -1039,7 +1068,7 @@ public static unsafe class AssetPackLoader
         PackedFontPayloadHeader fh = MemoryMarshal.Read<PackedFontPayloadHeader>(payload);
         if (fh.TtfBytes <= 0 || (long)hdrSize + fh.TtfBytes > payload.Length)
             throw new InvalidDataException("Invalid or truncated font TTF bytes.");
-        if (!float.IsFinite(fh.PixelSize) || fh.PixelSize <= 0f || fh.AtlasSize < 16 || fh.SdfPadding <= 0)
+        if (!float.IsFinite(fh.PixelSize) || fh.PixelSize <= 0f || fh.AtlasSize < 16 || fh.AtlasSize > 16384 || fh.SdfPadding <= 0)
             throw new InvalidDataException($"Invalid font bake parameters (pixelSize={fh.PixelSize}, atlasSize={fh.AtlasSize}, sdfPadding={fh.SdfPadding}).");
 
         byte[] ttf = payload.Slice(hdrSize, fh.TtfBytes).ToArray();

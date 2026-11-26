@@ -96,9 +96,23 @@ public static unsafe class TextureCompressionSystem
         long count = (long)width * height;
         for (long i = 0; i < count; i++)
         {
-            if (rgba[i * 4 + 3] < 255) return true;
+            if (rgba[(nint)i * 4 + 3] < 255) return true;
         }
         return false;
+    }
+
+    private static void ValidateBlockDimensions(int width, int height, int bytesPerBlock, out int blocksX, out int blocksY)
+    {
+        if (width <= 0 || height <= 0)
+            throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+        long bx = (width + 3L) >> 2;
+        long by = (height + 3L) >> 2;
+        long totalBlockBytes = bx * by * bytesPerBlock;
+        long totalRgbaBytes = (long)width * height * 4L;
+        if (bx > int.MaxValue || by > int.MaxValue || totalBlockBytes > int.MaxValue || totalRgbaBytes > int.MaxValue)
+            throw new OverflowException($"Texture dimensions ({width}x{height}) exceed 2GB buffer limit.");
+        blocksX = (int)bx;
+        blocksY = (int)by;
     }
 
     public static TexturePixelFormat ResolveFormat(TextureCompressionPolicy policy, byte* rgba, int width, int height)
@@ -143,7 +157,7 @@ public static unsafe class TextureCompressionSystem
             {
                 int px0 = bx << 2;
                 ExtractBlock4x4(src, w, h, px0, py0, block);
-                byte* outBlock = dst + (by * bxCount + bx) * stride;
+                byte* outBlock = dst + ((nint)by * bxCount + bx) * stride;
                 if (isBc3)
                     EncodeBc3Block(block, outBlock);
                 else
@@ -156,10 +170,8 @@ public static unsafe class TextureCompressionSystem
     {
         if (rgba == null) throw new ArgumentNullException(nameof(rgba));
         if (dstBlocks == null) throw new ArgumentNullException(nameof(dstBlocks));
-        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+        ValidateBlockDimensions(width, height, 8, out int bx, out int by);
 
-        int bx = (width + 3) >> 2;
-        int by = (height + 3) >> 2;
         var ctx = new BcEncodeJobCtx { SrcRgba = rgba, DstBlocks = dstBlocks, Width = width, Height = height, BlocksX = bx, IsBc3 = 0 };
         JobSystem.ParallelFor(jobs, by, batchSize: 16, &ctx, &EncodeRowRange, minParallelCount: 64);
     }
@@ -168,10 +180,8 @@ public static unsafe class TextureCompressionSystem
     {
         if (rgba == null) throw new ArgumentNullException(nameof(rgba));
         if (dstBlocks == null) throw new ArgumentNullException(nameof(dstBlocks));
-        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
+        ValidateBlockDimensions(width, height, 16, out int bx, out int by);
 
-        int bx = (width + 3) >> 2;
-        int by = (height + 3) >> 2;
         var ctx = new BcEncodeJobCtx { SrcRgba = rgba, DstBlocks = dstBlocks, Width = width, Height = height, BlocksX = bx, IsBc3 = 1 };
         JobSystem.ParallelFor(jobs, by, batchSize: 16, &ctx, &EncodeRowRange, minParallelCount: 64);
     }
@@ -221,7 +231,7 @@ public static unsafe class TextureCompressionSystem
         TexturePixelFormat fmt = ResolveFormat(policy, rgba, width, height);
         int dataBytes = CalcByteSize(fmt, width, height);
         int headerSize = sizeof(BrtxHeader);
-        byte[] result = new byte[headerSize + dataBytes];
+        byte[] result = new byte[checked(headerSize + dataBytes)];
 
         var hdr = new BrtxHeader
         {
@@ -253,17 +263,14 @@ public static unsafe class TextureCompressionSystem
     {
         if (srcBlocks == null) throw new ArgumentNullException(nameof(srcBlocks));
         if (dstRgba == null) throw new ArgumentNullException(nameof(dstRgba));
-        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
-
-        int bxCount = (width + 3) >> 2;
-        int byCount = (height + 3) >> 2;
+        ValidateBlockDimensions(width, height, 8, out int bxCount, out int byCount);
         byte* blockOut = stackalloc byte[64];
 
         for (int by = 0; by < byCount; by++)
         {
             for (int bx = 0; bx < bxCount; bx++)
             {
-                DecodeBc1Block(srcBlocks + (by * bxCount + bx) * 8, blockOut, hasExplicitAlpha: false);
+                DecodeBc1Block(srcBlocks + ((nint)by * bxCount + bx) * 8, blockOut, hasExplicitAlpha: false);
                 BlitBlock4x4(blockOut, dstRgba, width, height, bx << 2, by << 2);
             }
         }
@@ -273,17 +280,14 @@ public static unsafe class TextureCompressionSystem
     {
         if (srcBlocks == null) throw new ArgumentNullException(nameof(srcBlocks));
         if (dstRgba == null) throw new ArgumentNullException(nameof(dstRgba));
-        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Texture dimensions must be > 0.");
-
-        int bxCount = (width + 3) >> 2;
-        int byCount = (height + 3) >> 2;
+        ValidateBlockDimensions(width, height, 16, out int bxCount, out int byCount);
         byte* blockOut = stackalloc byte[64];
 
         for (int by = 0; by < byCount; by++)
         {
             for (int bx = 0; bx < bxCount; bx++)
             {
-                byte* blk = srcBlocks + (by * bxCount + bx) * 16;
+                byte* blk = srcBlocks + ((nint)by * bxCount + bx) * 16;
                 DecodeBc1Block(blk + 8, blockOut, hasExplicitAlpha: true);
                 DecodeBc3AlphaBlock(blk, blockOut);
                 BlitBlock4x4(blockOut, dstRgba, width, height, bx << 2, by << 2);
@@ -302,7 +306,7 @@ public static unsafe class TextureCompressionSystem
             {
                 int sx = px0 + x;
                 if (sx >= w) sx = w - 1;
-                int si = (sy * w + sx) * 4;
+                nint si = ((nint)sy * w + sx) * 4;
                 int di = (y * 4 + x) * 4;
                 dst[di + 0] = src[si + 0];
                 dst[di + 1] = src[si + 1];
@@ -324,7 +328,7 @@ public static unsafe class TextureCompressionSystem
                 int dx = px0 + x;
                 if (dx >= w) continue;
                 int si = (y * 4 + x) * 4;
-                int di = (dy * w + dx) * 4;
+                nint di = ((nint)dy * w + dx) * 4;
                 dst[di + 0] = block[si + 0];
                 dst[di + 1] = block[si + 1];
                 dst[di + 2] = block[si + 2];

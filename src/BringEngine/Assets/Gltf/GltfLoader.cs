@@ -66,6 +66,7 @@ public static unsafe class GltfLoader
     private struct RawAnimSampler { public int InputAcc; public int OutputAcc; public AnimInterpolation Interp; }
     private struct RawAnimChannel { public int SamplerIdx; public int TargetNode; public AnimTargetPath Path; public byte HasPath; }
     private struct RawAnim { public FixedString64 Name; public int SamplerStart, SamplerCount, ChannelStart, ChannelCount; }
+    private struct BuiltPrimKey { public int PrimIndex; public int SkinIndex; public GltfPrimitiveRef Ref; }
 
     public static GltfHandle LoadFromFile(
         string filePath,
@@ -171,7 +172,17 @@ public static unsafe class GltfLoader
             jsonSpan = fileBytes;
         }
 
+        if (jsonSpan.Length >= 3 && jsonSpan[0] == 0xEF && jsonSpan[1] == 0xBB && jsonSpan[2] == 0xBF)
+            jsonSpan = jsonSpan.Slice(3);
+
         ArenaMarker scratchMark = scratchArena.SaveMarker();
+        ArenaMarker bundleMark = bundleArena.SaveMarker();
+        NativeList<TextureHandle> regTextures = default;
+        NativeList<MaterialHandle> regMaterials = default;
+        NativeList<MeshHandle> regMeshes = default;
+        NativeList<SkeletonHandle> regSkins = default;
+        NativeList<AnimClipHandle> regAnims = default;
+
         try
         {
             // Scratch parse tables (fixed high ceilings, zero heap)
@@ -211,6 +222,8 @@ public static unsafe class GltfLoader
             for (int n = 0; n < nodes.Count; n++)
             {
                 ref RawNode rn = ref nodes[n];
+                if (rn.ChildCount < 0 || rn.ChildStart < 0 || (long)rn.ChildStart + rn.ChildCount > nodeChildren.Count)
+                    throw new InvalidDataException($"Corrupt node {n} children range.");
                 for (int c = 0; c < rn.ChildCount; c++)
                 {
                     int childIdx = nodeChildren[rn.ChildStart + c];
@@ -218,6 +231,11 @@ public static unsafe class GltfLoader
                         nodes[childIdx].ParentIndex = n;
                 }
             }
+
+            if (textures.Count > 0) regTextures = NativeList<TextureHandle>.CreateInArena(ref scratchArena, textures.Count);
+            regMaterials = NativeList<MaterialHandle>.CreateInArena(ref scratchArena, materials.Count + 1);
+            if (skins.Count > 0) regSkins = NativeList<SkeletonHandle>.CreateInArena(ref scratchArena, skins.Count);
+            if (anims.Count > 0) regAnims = NativeList<AnimClipHandle>.CreateInArena(ref scratchArena, anims.Count);
 
             // 1. Decode textures into bundleArena
             TextureHandle* loadedTextures = textures.Count > 0 ? scratchArena.Alloc<TextureHandle>(textures.Count) : null;
@@ -257,6 +275,9 @@ public static unsafe class GltfLoader
                         throw new FileNotFoundException($"External glTF image file not found: '{fullPath}'.", fullPath);
                     loadedTextures[t] = TextureLoader.LoadFromFile(fullPath, ref bundleArena, ref assets, bundle, texName);
                 }
+
+                if (loadedTextures[t].IsValid)
+                    regTextures.Add(loadedTextures[t]);
             }
 
             // 2. Register PBR Materials
@@ -279,11 +300,13 @@ public static unsafe class GltfLoader
                     AlphaCutoff = rm.AlphaCutoff,
                     DoubleSided = rm.DoubleSided,
                 });
+                regMaterials.Add(loadedMats[m]);
             }
 
             // 2.5 Topologically sort skin joints (parent-before-child) before building skinned meshes
             int* nodeToJoint = nodes.Count > 0 ? scratchArena.AllocUninitialized<int>(nodes.Count) : null;
-            for (int n = 0; n < nodes.Count; n++) nodeToJoint[n] = -1;
+            int* nodeToSkin = nodes.Count > 0 ? scratchArena.AllocUninitialized<int>(nodes.Count) : null;
+            for (int n = 0; n < nodes.Count; n++) { nodeToJoint[n] = -1; nodeToSkin[n] = -1; }
 
             int* skinOldToNew = skinJoints.Count > 0 ? scratchArena.AllocUninitialized<int>(skinJoints.Count) : null;
             int* skinNewToOld = skinJoints.Count > 0 ? scratchArena.AllocUninitialized<int>(skinJoints.Count) : null;
@@ -293,8 +316,10 @@ public static unsafe class GltfLoader
             {
                 ref RawSkin rs = ref skins[s];
                 int jc = rs.JointCount;
-                if (jc < 0 || rs.JointStart < 0 || rs.JointStart + jc > skinJoints.Count)
+                if (jc < 0 || rs.JointStart < 0 || (long)rs.JointStart + jc > skinJoints.Count)
                     throw new InvalidDataException($"Corrupt skin {s} joint range.");
+                if (jc > 256)
+                    throw new InvalidDataException($"glTF skin {s} joint count {jc} exceeds maximum supported 256.");
                 if (jc == 0) continue;
 
                 int* oldParent = scratchArena.AllocUninitialized<int>(jc);
@@ -347,34 +372,32 @@ public static unsafe class GltfLoader
                     parentNew[newJ] = oldParent[oldJ] >= 0 ? oldToNew[oldParent[oldJ]] : -1;
                     int nodeIdx = skinJoints[rs.JointStart + oldJ];
                     nodeToJoint[nodeIdx] = newJ;
+                    nodeToSkin[nodeIdx] = s;
                 }
             }
 
-            int* primToSkin = prims.Count > 0 ? scratchArena.AllocUninitialized<int>(prims.Count) : null;
-            for (int p = 0; p < prims.Count; p++) primToSkin[p] = -1;
+            // Validate mesh primitive ranges, primitive POSITION presence, and node skin indices
+            for (int m = 0; m < meshes.Count; m++)
+            {
+                ref RawMesh rm = ref meshes[m];
+                if (rm.PrimCount < 0 || rm.PrimStart < 0 || (long)rm.PrimStart + rm.PrimCount > prims.Count)
+                    throw new InvalidDataException($"Corrupt mesh {m} primitive range.");
+            }
+            for (int p = 0; p < prims.Count; p++)
+            {
+                if (prims[p].PosAcc < 0 || prims[p].PosAcc >= accessors.Count)
+                    throw new InvalidDataException($"glTF primitive {p} missing or out-of-range POSITION accessor ({prims[p].PosAcc}).");
+            }
             for (int n = 0; n < nodes.Count; n++)
             {
-                if (nodes[n].SkinIndex >= 0)
-                {
-                    if (nodes[n].SkinIndex >= skins.Count)
-                        throw new InvalidDataException($"Node {n} references invalid skin index {nodes[n].SkinIndex}.");
-                    if (nodes[n].MeshIndex >= 0 && nodes[n].MeshIndex < meshes.Count)
-                    {
-                        ref RawMesh rm = ref meshes[nodes[n].MeshIndex];
-                        for (int k = 0; k < rm.PrimCount; k++)
-                        {
-                            int pi = rm.PrimStart + k;
-                            if ((uint)pi < (uint)prims.Count)
-                                primToSkin[pi] = nodes[n].SkinIndex;
-                        }
-                    }
-                }
+                if (nodes[n].SkinIndex >= skins.Count)
+                    throw new InvalidDataException($"Node {n} references invalid skin index {nodes[n].SkinIndex}.");
             }
 
             // Default fallback material if a primitive has material = -1
             MaterialHandle defaultMat = MaterialHandle.Invalid;
 
-            // 3. Build Meshes & Primitives directly in bundleArena
+            // 3 & 4. Build Meshes & Primitives per (prim, skin) directly in bundleArena and emit node/prim tables
             int totalPrims = 0;
             for (int n = 0; n < nodes.Count; n++)
                 if (nodes[n].MeshIndex >= 0 && nodes[n].MeshIndex < meshes.Count)
@@ -387,60 +410,14 @@ public static unsafe class GltfLoader
                 for (int m = 0; m < meshes.Count; m++) totalPrims += meshes[m].PrimCount;
             }
 
-            // Build each glTF primitive mesh once
-            GltfPrimitiveRef* builtPrimTable = prims.Count > 0 ? scratchArena.Alloc<GltfPrimitiveRef>(prims.Count) : null;
+            int maxUniquePrims = Math.Max(1, totalPrims + prims.Count);
+            regMeshes = NativeList<MeshHandle>.CreateInArena(ref scratchArena, maxUniquePrims);
+            var builtPrims = NativeList<BuiltPrimKey>.CreateInArena(ref scratchArena, maxUniquePrims);
+            byte* primBuilt = prims.Count > 0 ? scratchArena.Alloc<byte>(prims.Count) : null;
+
             Bounds3 overallBounds = Bounds3.Empty;
             bool hasBounds = false;
 
-            for (int p = 0; p < prims.Count; p++)
-            {
-                ref RawPrim rp = ref prims[p];
-                if (rp.PosAcc < 0 || rp.PosAcc >= accessors.Count) continue;
-
-                int skinIdx = primToSkin != null ? primToSkin[p] : -1;
-                int* jointRemap = (skinIdx >= 0 && skins[skinIdx].JointCount > 0)
-                    ? skinOldToNew + skins[skinIdx].JointStart : null;
-                int jointRemapCount = skinIdx >= 0 ? skins[skinIdx].JointCount : 0;
-
-                MeshHandle meshHandle = BuildMeshFromPrimitive(
-                    in rp, in buffers, in views, in accessors,
-                    jointRemap, jointRemapCount,
-                    ref bundleArena, ref assets, bundle,
-                    StringId.Hash($"{assetName.Value}_prim_{p}"),
-                    out Bounds3 primBounds);
-
-                MaterialHandle matHandle;
-                if (rp.MaterialIdx >= 0 && rp.MaterialIdx < materials.Count)
-                {
-                    matHandle = loadedMats[rp.MaterialIdx];
-                }
-                else
-                {
-                    if (!defaultMat.IsValid)
-                    {
-                        defaultMat = AssetSystem.RegisterMaterial(ref assets, new MaterialAssetData
-                        {
-                            OwnerBundle = bundle,
-                            Name = StringId.Hash($"{assetName.Value}_default_mat"),
-                            BaseColorFactor = ColorF.White,
-                            MetallicFactor = 0.1f,
-                            RoughnessFactor = 0.65f,
-                            AlphaCutoff = 0.5f,
-                        });
-                    }
-                    matHandle = defaultMat;
-                }
-
-                builtPrimTable[p] = new GltfPrimitiveRef { Mesh = meshHandle, Material = matHandle };
-                if (!hasBounds) { overallBounds = primBounds; hasBounds = true; }
-                else
-                {
-                    overallBounds.Encapsulate(primBounds.Min);
-                    overallBounds.Encapsulate(primBounds.Max);
-                }
-            }
-
-            // 4. Build final node + primitive reference arrays in bundleArena
             int outNodeCount = synthesizedRootNode ? meshes.Count : nodes.Count;
             GltfNodeData* outNodes = outNodeCount > 0 ? bundleArena.Alloc<GltfNodeData>(outNodeCount, 64) : null;
             GltfPrimitiveRef* outPrims = totalPrims > 0 ? bundleArena.Alloc<GltfPrimitiveRef>(totalPrims, 16) : null;
@@ -452,7 +429,15 @@ public static unsafe class GltfLoader
                 {
                     int start = primWrite;
                     for (int k = 0; k < meshes[m].PrimCount; k++)
-                        outPrims[primWrite++] = builtPrimTable[meshes[m].PrimStart + k];
+                    {
+                        outPrims[primWrite++] = GetOrBuildPrimitive(
+                            meshes[m].PrimStart + k, -1,
+                            in prims, in buffers, in views, in accessors, in skins, skinOldToNew,
+                            loadedMats, materials.Count, ref defaultMat,
+                            ref builtPrims, primBuilt, ref regMeshes, ref regMaterials,
+                            ref overallBounds, ref hasBounds,
+                            ref bundleArena, ref assets, bundle, assetName);
+                    }
                     outNodes[m] = new GltfNodeData
                     {
                         Name = FixedString64.From($"Mesh_{m}"),
@@ -478,7 +463,15 @@ public static unsafe class GltfLoader
                         ref RawMesh rm = ref meshes[rn.MeshIndex];
                         pCount = rm.PrimCount;
                         for (int k = 0; k < rm.PrimCount; k++)
-                            outPrims[primWrite++] = builtPrimTable[rm.PrimStart + k];
+                        {
+                            outPrims[primWrite++] = GetOrBuildPrimitive(
+                                rm.PrimStart + k, rn.SkinIndex,
+                                in prims, in buffers, in views, in accessors, in skins, skinOldToNew,
+                                loadedMats, materials.Count, ref defaultMat,
+                                ref builtPrims, primBuilt, ref regMeshes, ref regMaterials,
+                                ref overallBounds, ref hasBounds,
+                                ref bundleArena, ref assets, bundle, assetName);
+                        }
                     }
 
                     Vec3 pos = rn.Translation;
@@ -498,6 +491,21 @@ public static unsafe class GltfLoader
                         PrimitiveCount = pCount,
                         SkinIndex = rn.SkinIndex,
                     };
+                }
+
+                // Validate/build any unreferenced primitives as well
+                for (int p = 0; p < prims.Count; p++)
+                {
+                    if (primBuilt[p] == 0)
+                    {
+                        GetOrBuildPrimitive(
+                            p, -1,
+                            in prims, in buffers, in views, in accessors, in skins, skinOldToNew,
+                            loadedMats, materials.Count, ref defaultMat,
+                            ref builtPrims, primBuilt, ref regMeshes, ref regMaterials,
+                            ref overallBounds, ref hasBounds,
+                            ref bundleArena, ref assets, bundle, assetName);
+                    }
                 }
             }
 
@@ -543,7 +551,9 @@ public static unsafe class GltfLoader
                     BindPositions = bindPos,
                     BindRotations = bindRot,
                     BindScales = bindScl,
+                    SkinIndexPlusOne = (short)(s + 1),
                 });
+                regSkins.Add(outSkins[s]);
             }
 
             // 6. Build Animations -> AnimClipData in bundleArena
@@ -551,6 +561,11 @@ public static unsafe class GltfLoader
             for (int a = 0; a < anims.Count; a++)
             {
                 ref RawAnim ra = ref anims[a];
+                if (ra.SamplerCount < 0 || ra.SamplerStart < 0 || (long)ra.SamplerStart + ra.SamplerCount > animSamplers.Count)
+                    throw new InvalidDataException($"Corrupt animation {a} sampler range.");
+                if (ra.ChannelCount < 0 || ra.ChannelStart < 0 || (long)ra.ChannelStart + ra.ChannelCount > animChannels.Count)
+                    throw new InvalidDataException($"Corrupt animation {a} channel range.");
+
                 AnimSamplerData* sArr = ra.SamplerCount > 0 ? bundleArena.Alloc<AnimSamplerData>(ra.SamplerCount, 16) : null;
                 AnimChannelData* cArr = ra.ChannelCount > 0 ? bundleArena.Alloc<AnimChannelData>(ra.ChannelCount, 16) : null;
 
@@ -608,13 +623,20 @@ public static unsafe class GltfLoader
                             throw new InvalidDataException($"Animation {a} channel {ci} path {rac.Path} expects {reqComps} components, sampler has {sArr[rac.SamplerIdx].ComponentsPerValue}.");
                     }
 
-                    int targetJoint = (rac.HasPath != 0 && nodeToJoint != null && (uint)rac.TargetNode < (uint)nodes.Count)
-                        ? nodeToJoint[rac.TargetNode] : -1;
+                    int targetJoint = -1;
+                    short targetSkinPlusOne = 0;
+                    if (rac.HasPath != 0 && nodeToJoint != null && (uint)rac.TargetNode < (uint)nodes.Count)
+                    {
+                        targetJoint = nodeToJoint[rac.TargetNode];
+                        if (targetJoint >= 0 && nodeToSkin != null && nodeToSkin[rac.TargetNode] >= 0)
+                            targetSkinPlusOne = (short)(nodeToSkin[rac.TargetNode] + 1);
+                    }
                     cArr[ci] = new AnimChannelData
                     {
                         SamplerIndex = rac.SamplerIdx,
                         TargetJointIndex = targetJoint,
                         Path = rac.Path,
+                        TargetSkinPlusOne = targetSkinPlusOne,
                     };
                 }
 
@@ -628,6 +650,7 @@ public static unsafe class GltfLoader
                     Channels = cArr,
                     ChannelCount = ra.ChannelCount,
                 });
+                regAnims.Add(outAnims[a]);
             }
 
             if (!hasBounds) overallBounds = Bounds3.FromCenterExtents(Vec3.Zero, Vec3.One * 0.5f);
@@ -647,10 +670,107 @@ public static unsafe class GltfLoader
                 OverallBounds = overallBounds,
             });
         }
+        catch
+        {
+            for (int i = 0; i < regAnims.Count; i++)
+                AnimationSystem.UnregisterClip(ref animations, regAnims[i]);
+            for (int i = 0; i < regSkins.Count; i++)
+                AnimationSystem.UnregisterSkeleton(ref animations, regSkins[i]);
+            for (int i = 0; i < regMeshes.Count; i++)
+                AssetSystem.UnregisterMesh(ref assets, regMeshes[i]);
+            for (int i = 0; i < regMaterials.Count; i++)
+                AssetSystem.UnregisterMaterial(ref assets, regMaterials[i]);
+            for (int i = 0; i < regTextures.Count; i++)
+                AssetSystem.UnregisterTexture(ref assets, regTextures[i]);
+            bundleArena.Rollback(bundleMark);
+            throw;
+        }
         finally
         {
             scratchArena.Rollback(scratchMark);
         }
+    }
+
+    private static GltfPrimitiveRef GetOrBuildPrimitive(
+        int primIdx,
+        int skinIdx,
+        in NativeList<RawPrim> prims,
+        in NativeList<RawBuffer> buffers,
+        in NativeList<RawBufferView> views,
+        in NativeList<RawAccessor> accessors,
+        in NativeList<RawSkin> skins,
+        int* skinOldToNew,
+        MaterialHandle* loadedMats,
+        int matCount,
+        ref MaterialHandle defaultMat,
+        ref NativeList<BuiltPrimKey> builtPrims,
+        byte* primBuilt,
+        ref NativeList<MeshHandle> regMeshes,
+        ref NativeList<MaterialHandle> regMaterials,
+        ref Bounds3 overallBounds,
+        ref bool hasBounds,
+        ref LinearArena bundleArena,
+        ref AssetRegistry assets,
+        BundleId bundle,
+        StringId assetName)
+    {
+        ref RawPrim rp = ref prims[primIdx];
+        bool hasSkinAttrs = rp.JointsAcc >= 0 && rp.WeightsAcc >= 0;
+        int effectiveSkin = (hasSkinAttrs && skinIdx >= 0) ? skinIdx : -1;
+
+        for (int i = 0; i < builtPrims.Count; i++)
+        {
+            if (builtPrims[i].PrimIndex == primIdx && builtPrims[i].SkinIndex == effectiveSkin)
+                return builtPrims[i].Ref;
+        }
+
+        int* jointRemap = (effectiveSkin >= 0 && skins[effectiveSkin].JointCount > 0)
+            ? skinOldToNew + skins[effectiveSkin].JointStart : null;
+        int skinJointCount = effectiveSkin >= 0 ? skins[effectiveSkin].JointCount : -1;
+
+        StringId meshName = (primBuilt != null && primBuilt[primIdx] == 0)
+            ? StringId.Hash($"{assetName.Value}_prim_{primIdx}")
+            : StringId.Hash($"{assetName.Value}_prim_{primIdx}_s{effectiveSkin}");
+
+        MeshHandle meshHandle = BuildMeshFromPrimitive(
+            in rp, in buffers, in views, in accessors,
+            jointRemap, skinJointCount,
+            ref bundleArena, ref assets, bundle, meshName, out Bounds3 primBounds);
+        regMeshes.Add(meshHandle);
+        if (primBuilt != null) primBuilt[primIdx] = 1;
+
+        MaterialHandle matHandle;
+        if (rp.MaterialIdx >= 0 && rp.MaterialIdx < matCount)
+        {
+            matHandle = loadedMats[rp.MaterialIdx];
+        }
+        else
+        {
+            if (!defaultMat.IsValid)
+            {
+                defaultMat = AssetSystem.RegisterMaterial(ref assets, new MaterialAssetData
+                {
+                    OwnerBundle = bundle,
+                    Name = StringId.Hash($"{assetName.Value}_default_mat"),
+                    BaseColorFactor = ColorF.White,
+                    MetallicFactor = 0.1f,
+                    RoughnessFactor = 0.65f,
+                    AlphaCutoff = 0.5f,
+                });
+                regMaterials.Add(defaultMat);
+            }
+            matHandle = defaultMat;
+        }
+
+        var pref = new GltfPrimitiveRef { Mesh = meshHandle, Material = matHandle };
+        builtPrims.Add(new BuiltPrimKey { PrimIndex = primIdx, SkinIndex = effectiveSkin, Ref = pref });
+        if (!hasBounds) { overallBounds = primBounds; hasBounds = true; }
+        else
+        {
+            overallBounds.Encapsulate(primBounds.Min);
+            overallBounds.Encapsulate(primBounds.Max);
+        }
+        return pref;
     }
 
     private static MeshHandle BuildMeshFromPrimitive(
@@ -659,7 +779,7 @@ public static unsafe class GltfLoader
         in NativeList<RawBufferView> views,
         in NativeList<RawAccessor> accessors,
         int* jointRemap,
-        int jointRemapCount,
+        int skinJointCount,
         ref LinearArena bundleArena,
         ref AssetRegistry assets,
         BundleId bundle,
@@ -714,6 +834,8 @@ public static unsafe class GltfLoader
         if (rp.IndicesAcc >= 0)
         {
             ValidateAccessor(in buffers, in views, in accessors, rp.IndicesAcc, expectedComponents: 1);
+            if (accessors[rp.IndicesAcc].Count <= 0)
+                throw new InvalidDataException("glTF primitive indices accessor must have count > 0.");
             int ict = accessors[rp.IndicesAcc].ComponentType;
             if (ict != 5121 && ict != 5123 && ict != 5125)
                 throw new InvalidDataException($"glTF indices unsupported componentType {ict}.");
@@ -759,12 +881,23 @@ public static unsafe class GltfLoader
                 uint j1 = ReadAccessorComponentUInt(in buffers, in views, in accessors, rp.JointsAcc, v, 1);
                 uint j2 = ReadAccessorComponentUInt(in buffers, in views, in accessors, rp.JointsAcc, v, 2);
                 uint j3 = ReadAccessorComponentUInt(in buffers, in views, in accessors, rp.JointsAcc, v, 3);
-                if (jointRemap != null)
+                if (skinJointCount >= 0)
                 {
-                    if (j0 < (uint)jointRemapCount) j0 = (uint)jointRemap[j0];
-                    if (j1 < (uint)jointRemapCount) j1 = (uint)jointRemap[j1];
-                    if (j2 < (uint)jointRemapCount) j2 = (uint)jointRemap[j2];
-                    if (j3 < (uint)jointRemapCount) j3 = (uint)jointRemap[j3];
+                    if (j0 >= (uint)skinJointCount || j1 >= (uint)skinJointCount ||
+                        j2 >= (uint)skinJointCount || j3 >= (uint)skinJointCount)
+                        throw new InvalidDataException($"glTF primitive JOINTS_0 index out of skin joint range [0..{skinJointCount}) at vertex {v}.");
+                    if (jointRemap != null)
+                    {
+                        j0 = (uint)jointRemap[j0];
+                        j1 = (uint)jointRemap[j1];
+                        j2 = (uint)jointRemap[j2];
+                        j3 = (uint)jointRemap[j3];
+                    }
+                }
+                else
+                {
+                    if (j0 > 255u || j1 > 255u || j2 > 255u || j3 > 255u)
+                        throw new InvalidDataException($"glTF primitive JOINTS_0 index exceeds uint8 range [0..255] at vertex {v}.");
                 }
                 jointsPacked = Vertex3D.PackJoints((byte)j0, (byte)j1, (byte)j2, (byte)j3);
 
@@ -1168,7 +1301,7 @@ public static unsafe class GltfLoader
         {
             if (r.TokenType != JsonTokenType.StartObject)
                 throw new InvalidDataException("Expected object in glTF accessors array.");
-            RawAccessor a = new RawAccessor { BufferView = -1, TypeComponents = 1 };
+            RawAccessor a = new RawAccessor { BufferView = -1, TypeComponents = 0 };
             while (r.Read() && r.TokenType != JsonTokenType.EndObject)
             {
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
@@ -1177,6 +1310,8 @@ public static unsafe class GltfLoader
                 else if (r.ValueTextEquals("componentType"u8)) a.ComponentType = ReadInt32Checked(ref r, "accessor.componentType");
                 else if (r.ValueTextEquals("count"u8)) a.Count = ReadInt32Checked(ref r, "accessor.count");
                 else if (r.ValueTextEquals("normalized"u8)) a.Normalized = (byte)(ReadBoolChecked(ref r, "accessor.normalized") ? 1 : 0);
+                else if (r.ValueTextEquals("sparse"u8))
+                    throw new InvalidDataException("glTF sparse accessors are not supported.");
                 else if (r.ValueTextEquals("type"u8))
                 {
                     if (!r.Read() || r.TokenType != JsonTokenType.String)
@@ -1185,7 +1320,10 @@ public static unsafe class GltfLoader
                     else if (r.ValueTextEquals("VEC2"u8)) a.TypeComponents = 2;
                     else if (r.ValueTextEquals("VEC3"u8)) a.TypeComponents = 3;
                     else if (r.ValueTextEquals("VEC4"u8)) a.TypeComponents = 4;
+                    else if (r.ValueTextEquals("MAT2"u8)) a.TypeComponents = 4;
+                    else if (r.ValueTextEquals("MAT3"u8)) a.TypeComponents = 9;
                     else if (r.ValueTextEquals("MAT4"u8)) a.TypeComponents = 16;
+                    else throw new InvalidDataException($"Unsupported glTF accessor.type '{r.GetString()}'.");
                 }
                 else { r.Read(); r.Skip(); }
             }
@@ -1342,6 +1480,8 @@ public static unsafe class GltfLoader
                 if (r.TokenType != JsonTokenType.PropertyName) continue;
                 if (r.ValueTextEquals("primitives"u8))
                 {
+                    mesh.PrimStart = prims.Count;
+                    mesh.PrimCount = 0;
                     ExpectToken(ref r, JsonTokenType.StartArray, "mesh.primitives");
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {
@@ -1422,6 +1562,7 @@ public static unsafe class GltfLoader
                 else if (r.ValueTextEquals("children"u8))
                 {
                     n.ChildStart = children.Count;
+                    n.ChildCount = 0;
                     ExpectToken(ref r, JsonTokenType.StartArray, "node.children");
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {
@@ -1452,6 +1593,7 @@ public static unsafe class GltfLoader
                 else if (r.ValueTextEquals("joints"u8))
                 {
                     s.JointStart = joints.Count;
+                    s.JointCount = 0;
                     ExpectToken(ref r, JsonTokenType.StartArray, "skin.joints");
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {
@@ -1487,6 +1629,7 @@ public static unsafe class GltfLoader
                 else if (r.ValueTextEquals("samplers"u8))
                 {
                     a.SamplerStart = samplers.Count;
+                    a.SamplerCount = 0;
                     ExpectToken(ref r, JsonTokenType.StartArray, "animation.samplers");
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {
@@ -1514,6 +1657,7 @@ public static unsafe class GltfLoader
                 else if (r.ValueTextEquals("channels"u8))
                 {
                     a.ChannelStart = channels.Count;
+                    a.ChannelCount = 0;
                     ExpectToken(ref r, JsonTokenType.StartArray, "animation.channels");
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {

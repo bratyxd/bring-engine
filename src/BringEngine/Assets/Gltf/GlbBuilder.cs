@@ -33,6 +33,31 @@ public static unsafe class GlbBuilder
     /// </summary>
     public static byte[] BuildGlb(in MeshSpec mesh, bool includeDemoAnimation = false)
     {
+        if (mesh.Positions == null || mesh.Positions.Length == 0)
+            throw new ArgumentException("GlbBuilder MeshSpec.Positions must be non-null and non-empty.", nameof(mesh));
+        if (mesh.Normals == null || mesh.Normals.Length != mesh.Positions.Length)
+            throw new ArgumentException("GlbBuilder MeshSpec.Normals must be non-null and match Positions length.", nameof(mesh));
+        if (mesh.Uvs == null || mesh.Uvs.Length != mesh.Positions.Length)
+            throw new ArgumentException("GlbBuilder MeshSpec.Uvs must be non-null and match Positions length.", nameof(mesh));
+        if (mesh.Indices == null || mesh.Indices.Length == 0)
+            throw new ArgumentException("GlbBuilder MeshSpec.Indices must be non-null and non-empty.", nameof(mesh));
+        if (mesh.Colors != null && mesh.Colors.Length != mesh.Positions.Length)
+            throw new ArgumentException("GlbBuilder MeshSpec.Colors length must match Positions length.", nameof(mesh));
+        if ((mesh.Joints4 != null) != (mesh.Weights4 != null))
+            throw new ArgumentException("GlbBuilder MeshSpec.Joints4 and Weights4 must both be set or both null.", nameof(mesh));
+        if (mesh.Joints4 != null)
+        {
+            if (mesh.Joints4.Length != mesh.Positions.Length * 4)
+                throw new ArgumentException("GlbBuilder MeshSpec.Joints4 length must be Positions.Length * 4.", nameof(mesh));
+            if (mesh.Weights4!.Length != mesh.Positions.Length)
+                throw new ArgumentException("GlbBuilder MeshSpec.Weights4 length must match Positions length.", nameof(mesh));
+        }
+        for (int i = 0; i < mesh.Indices.Length; i++)
+        {
+            if (mesh.Indices[i] >= (uint)mesh.Positions.Length)
+                throw new ArgumentOutOfRangeException(nameof(mesh), $"GlbBuilder index {mesh.Indices[i]} out of range [0..{mesh.Positions.Length}).");
+        }
+
         using var bin = new MemoryStream();
         using var bw = new BinaryWriter(bin);
 
@@ -155,7 +180,7 @@ public static unsafe class GlbBuilder
             {
                 var bvT = WriteFloats(new[] { 0f, 0.5f, 1.0f });
                 animTimeAcc = nextAcc;
-                AddBvAcc(bvT.off, bvT.len, 5126, 3, "SCALAR");
+                AddBvAcc(bvT.off, bvT.len, 5126, 3, "SCALAR", ",\"min\":[0],\"max\":[1]");
 
                 var bvP = WriteVec3s(new[] { new Vec3(0, 0f, 0), new Vec3(0, 0.22f, 0), new Vec3(0, 0f, 0) });
                 animPosAcc = nextAcc;
@@ -227,7 +252,12 @@ public static unsafe class GlbBuilder
         return outMs.ToArray();
     }
 
-    private static string Fmt(float v) => v.ToString("0.#####", System.Globalization.CultureInfo.InvariantCulture);
+    private static string Fmt(float v)
+    {
+        if (!float.IsFinite(v))
+            throw new ArgumentOutOfRangeException(nameof(v), v, "GlbBuilder cannot serialize non-finite float to glTF JSON.");
+        return v.ToString("0.#####", System.Globalization.CultureInfo.InvariantCulture);
+    }
 
     /// <summary>
     /// Generates a beveled glowing crystal/octahedron MeshSpec (optional 2-joint skinning for animation!).

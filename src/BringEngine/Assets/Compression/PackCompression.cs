@@ -99,6 +99,7 @@ public static unsafe class PackCompressionSystem
                 return src.Length;
 
             case PackCompressionMode.Brotli:
+                if (src.IsEmpty && dst.IsEmpty) return 0;
                 if (!BrotliDecoder.TryDecompress(src, dst, out int written))
                     throw new InvalidDataException("Brotli decompression failed.");
                 return written;

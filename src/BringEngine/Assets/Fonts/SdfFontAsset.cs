@@ -35,11 +35,25 @@ public static unsafe class SdfFontLoader
         if (!string.IsNullOrEmpty(preferredTtfPath) && !File.Exists(preferredTtfPath) && log != null)
             LogSystem.Warn(log, $"Preferred TTF font '{preferredTtfPath}' not found; falling back to system/procedural font.");
 
-        string? resolved = ResolveTtfPath(preferredTtfPath);
+        bool usedPreferred = !string.IsNullOrEmpty(preferredTtfPath) && File.Exists(preferredTtfPath);
+        string? resolved = usedPreferred ? preferredTtfPath : ResolveTtfPath(null);
         if (resolved != null && File.Exists(resolved))
         {
-            byte[] ttfBytes = File.ReadAllBytes(resolved);
-            return BakeSdfFromMemory(ttfBytes, ref bundleArena, ref assets, bundle, name, pixelSize, atlasSize, sdfPadding, log);
+            if (usedPreferred)
+            {
+                byte[] ttfBytes = File.ReadAllBytes(resolved);
+                return BakeSdfFromMemory(ttfBytes, ref bundleArena, ref assets, bundle, name, pixelSize, atlasSize, sdfPadding, log);
+            }
+            try
+            {
+                byte[] ttfBytes = File.ReadAllBytes(resolved);
+                return BakeSdfFromMemory(ttfBytes, ref bundleArena, ref assets, bundle, name, pixelSize, atlasSize, sdfPadding, log);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or IOException)
+            {
+                if (log != null)
+                    LogSystem.Warn(log, $"System fallback TTF font '{resolved}' failed to load ({ex.Message}); falling back to procedural SDF font.");
+            }
         }
 
         return BakeProceduralFallbackSdf(ref bundleArena, ref assets, bundle, name, pixelSize, atlasSize, sdfPadding);
@@ -49,8 +63,8 @@ public static unsafe class SdfFontLoader
     {
         if (!float.IsFinite(pixelSize) || pixelSize <= 0f)
             throw new ArgumentOutOfRangeException(nameof(pixelSize), pixelSize, "Font pixelSize must be finite and > 0.");
-        if (atlasSize < 16)
-            throw new ArgumentOutOfRangeException(nameof(atlasSize), atlasSize, "Font atlasSize must be >= 16.");
+        if (atlasSize < 16 || atlasSize > 16384)
+            throw new ArgumentOutOfRangeException(nameof(atlasSize), atlasSize, "Font atlasSize must be in [16, 16384].");
         if (sdfPadding <= 0)
             throw new ArgumentOutOfRangeException(nameof(sdfPadding), sdfPadding, "Font sdfPadding must be > 0.");
     }
@@ -99,121 +113,140 @@ public static unsafe class SdfFontLoader
         const byte onEdgeValue = 128;
         float pixelDistScale = onEdgeValue / (float)sdfPadding;
 
-        byte* atlasPixels = bundleArena.Alloc<byte>(checked(atlasSize * atlasSize), 64);
-        GlyphMetrics* glyphs = bundleArena.Alloc<GlyphMetrics>(AsciiCount, 64);
-        float* kernTable = bundleArena.Alloc<float>(AsciiCount * AsciiCount, 64);
-
         var fontInfo = new StbTrueType.stbtt_fontinfo();
         fixed (byte* ttfPtr = ttfData)
         {
-            if (StbTrueType.stbtt_InitFont(fontInfo, ttfPtr, 0) == 0)
+            int fontOffset = StbTrueType.stbtt_GetFontOffsetForIndex(ttfPtr, 0);
+            if (fontOffset < 0 || StbTrueType.stbtt_InitFont(fontInfo, ttfPtr, fontOffset) == 0)
                 throw new InvalidOperationException("Failed to initialize TrueType font.");
 
-            float scale = StbTrueType.stbtt_ScaleForPixelHeight(fontInfo, pixelSize);
-            int ascentI = 0, descentI = 0, lineGapI = 0;
-            StbTrueType.stbtt_GetFontVMetrics(fontInfo, &ascentI, &descentI, &lineGapI);
-
-            int penX = 2, penY = 2, shelfHeight = 0;
-            int overflowedGlyphs = 0;
-            float invAtlas = 1f / atlasSize;
-
-            for (int idx = 0; idx < AsciiCount; idx++)
+            ArenaMarker bundleMark = bundleArena.SaveMarker();
+            TextureHandle atlasTex = TextureHandle.Invalid;
+            try
             {
-                int cp = FirstAscii + idx;
-                int advI = 0, lsbI = 0;
-                StbTrueType.stbtt_GetCodepointHMetrics(fontInfo, cp, &advI, &lsbI);
+                byte* atlasPixels = bundleArena.Alloc<byte>(checked(atlasSize * atlasSize), 64);
+                GlyphMetrics* glyphs = bundleArena.Alloc<GlyphMetrics>(AsciiCount, 64);
+                float* kernTable = bundleArena.Alloc<float>(AsciiCount * AsciiCount, 64);
 
-                int gw = 0, gh = 0, xoff = 0, yoff = 0;
-                byte* sdf = StbTrueType.stbtt_GetCodepointSDF(
-                    fontInfo, scale, cp, sdfPadding, onEdgeValue, pixelDistScale,
-                    &gw, &gh, &xoff, &yoff);
+                float scale = StbTrueType.stbtt_ScaleForPixelHeight(fontInfo, pixelSize);
+                int ascentI = 0, descentI = 0, lineGapI = 0;
+                StbTrueType.stbtt_GetFontVMetrics(fontInfo, &ascentI, &descentI, &lineGapI);
 
-                ref GlyphMetrics gm = ref glyphs[idx];
-                gm.Codepoint = cp;
-                gm.Advance = advI * scale;
+                int penX = 2, penY = 2, shelfHeight = 0;
+                int overflowedGlyphs = 0;
+                float invAtlas = 1f / atlasSize;
 
-                if (sdf != null && gw > 0 && gh > 0)
+                for (int idx = 0; idx < AsciiCount; idx++)
                 {
-                    if (penX + gw + 2 >= atlasSize)
-                    {
-                        penX = 2;
-                        penY += shelfHeight + 2;
-                        shelfHeight = 0;
-                    }
+                    int cp = FirstAscii + idx;
+                    int advI = 0, lsbI = 0;
+                    StbTrueType.stbtt_GetCodepointHMetrics(fontInfo, cp, &advI, &lsbI);
 
-                    if (penY + gh + 2 < atlasSize && penX + gw + 2 < atlasSize)
+                    int gw = 0, gh = 0, xoff = 0, yoff = 0;
+                    byte* sdf = StbTrueType.stbtt_GetCodepointSDF(
+                        fontInfo, scale, cp, sdfPadding, onEdgeValue, pixelDistScale,
+                        &gw, &gh, &xoff, &yoff);
+
+                    try
                     {
-                        for (int row = 0; row < gh; row++)
+                        ref GlyphMetrics gm = ref glyphs[idx];
+                        gm.Codepoint = cp;
+                        gm.Advance = advI * scale;
+
+                        if (sdf != null && gw > 0 && gh > 0)
                         {
-                            byte* srcRow = sdf + row * gw;
-                            byte* dstRow = atlasPixels + (penY + row) * atlasSize + penX;
-                            Buffer.MemoryCopy(srcRow, dstRow, gw, gw);
+                            if (penX + gw + 2 >= atlasSize)
+                            {
+                                penX = 2;
+                                penY += shelfHeight + 2;
+                                shelfHeight = 0;
+                            }
+
+                            if (penY + gh + 2 < atlasSize && penX + gw + 2 < atlasSize)
+                            {
+                                for (int row = 0; row < gh; row++)
+                                {
+                                    byte* srcRow = sdf + (nint)row * gw;
+                                    byte* dstRow = atlasPixels + (nint)(penY + row) * atlasSize + penX;
+                                    Buffer.MemoryCopy(srcRow, dstRow, gw, gw);
+                                }
+
+                                gm.BearingX = xoff;
+                                gm.BearingY = -yoff; // Y-up offset from baseline to top of glyph quad
+                                gm.Width = gw;
+                                gm.Height = gh;
+                                gm.UvRect = new Vec4(penX * invAtlas, penY * invAtlas, gw * invAtlas, gh * invAtlas);
+                                gm.HasBitmap = 1;
+
+                                penX += gw + 2;
+                                if (gh > shelfHeight) shelfHeight = gh;
+                            }
+                            else
+                            {
+                                overflowedGlyphs++;
+                            }
                         }
-
-                        gm.BearingX = xoff;
-                        gm.BearingY = -yoff; // Y-up offset from baseline to top of glyph quad
-                        gm.Width = gw;
-                        gm.Height = gh;
-                        gm.UvRect = new Vec4(penX * invAtlas, penY * invAtlas, gw * invAtlas, gh * invAtlas);
-                        gm.HasBitmap = 1;
-
-                        penX += gw + 2;
-                        if (gh > shelfHeight) shelfHeight = gh;
                     }
-                    else
+                    finally
                     {
-                        overflowedGlyphs++;
+                        if (sdf != null)
+                            StbTrueType.stbtt_FreeSDF(sdf, null);
                     }
-
-                    StbTrueType.stbtt_FreeSDF(sdf, null);
                 }
-            }
 
-            if (overflowedGlyphs > 0 && log != null)
-                LogSystem.Warn(log, $"SDF font atlas ({atlasSize}x{atlasSize}) omitted {overflowedGlyphs} glyph(s) due to atlas overflow.");
+                if (overflowedGlyphs > 0 && log != null)
+                    LogSystem.Warn(log, $"SDF font atlas ({atlasSize}x{atlasSize}) omitted {overflowedGlyphs} glyph(s) due to atlas overflow.");
 
-            // Precompute O(1) ASCII kerning table
-            for (int a = 0; a < AsciiCount; a++)
-            {
-                for (int b = 0; b < AsciiCount; b++)
+                // Precompute O(1) ASCII kerning table
+                for (int a = 0; a < AsciiCount; a++)
                 {
-                    int k = StbTrueType.stbtt_GetCodepointKernAdvance(fontInfo, FirstAscii + a, FirstAscii + b);
-                    kernTable[a * AsciiCount + b] = k * scale;
+                    for (int b = 0; b < AsciiCount; b++)
+                    {
+                        int k = StbTrueType.stbtt_GetCodepointKernAdvance(fontInfo, FirstAscii + a, FirstAscii + b);
+                        kernTable[a * AsciiCount + b] = k * scale;
+                    }
                 }
+
+                atlasTex = AssetSystem.RegisterTexture(ref assets, new TextureAssetData
+                {
+                    OwnerBundle = bundle,
+                    Name = StringId.Hash($"{name.Value}_sdf_atlas"),
+                    Pixels = atlasPixels,
+                    Width = atlasSize,
+                    Height = atlasSize,
+                    Channels = 1, // R8_UNORM SDF
+                    Srgb = 0,
+                    ClampEdge = 1,
+                });
+
+                float ascent = ascentI * scale;
+                float descent = descentI * scale;
+                float lineGap = lineGapI * scale;
+
+                return AssetSystem.RegisterFont(ref assets, new FontAssetData
+                {
+                    OwnerBundle = bundle,
+                    Name = name,
+                    AtlasTexture = atlasTex,
+                    PixelSize = pixelSize,
+                    Ascent = ascent,
+                    Descent = descent,
+                    LineGap = lineGap,
+                    LineHeight = (ascent - descent + lineGap),
+                    SdfPadding = sdfPadding,
+                    SdfOnEdgeValue = onEdgeValue,
+                    SdfPixelDistScale = pixelDistScale,
+                    AsciiGlyphs = glyphs,
+                    AsciiKerning = kernTable,
+                });
             }
-
-            TextureHandle atlasTex = AssetSystem.RegisterTexture(ref assets, new TextureAssetData
+            catch
             {
-                OwnerBundle = bundle,
-                Name = StringId.Hash($"{name.Value}_sdf_atlas"),
-                Pixels = atlasPixels,
-                Width = atlasSize,
-                Height = atlasSize,
-                Channels = 1, // R8_UNORM SDF
-                Srgb = 0,
-                ClampEdge = 1,
-            });
-
-            float ascent = ascentI * scale;
-            float descent = descentI * scale;
-            float lineGap = lineGapI * scale;
-
-            return AssetSystem.RegisterFont(ref assets, new FontAssetData
-            {
-                OwnerBundle = bundle,
-                Name = name,
-                AtlasTexture = atlasTex,
-                PixelSize = pixelSize,
-                Ascent = ascent,
-                Descent = descent,
-                LineGap = lineGap,
-                LineHeight = (ascent - descent + lineGap),
-                SdfPadding = sdfPadding,
-                SdfOnEdgeValue = onEdgeValue,
-                SdfPixelDistScale = pixelDistScale,
-                AsciiGlyphs = glyphs,
-                AsciiKerning = kernTable,
-            });
+                if (atlasTex.IsValid)
+                    AssetSystem.UnregisterTexture(ref assets, atlasTex);
+                bundleArena.Rollback(bundleMark);
+                throw;
+            }
         }
     }
 
@@ -229,71 +262,83 @@ public static unsafe class SdfFontLoader
         int atlasSize,
         int sdfPadding)
     {
-        byte* atlasPixels = bundleArena.Alloc<byte>(atlasSize * atlasSize, 64);
-        GlyphMetrics* glyphs = bundleArena.Alloc<GlyphMetrics>(AsciiCount, 64);
-        float* kernTable = bundleArena.Alloc<float>(AsciiCount * AsciiCount, 64);
-
-        int cell = atlasSize / 16;
-        float invAtlas = 1f / atlasSize;
-
-        for (int idx = 0; idx < AsciiCount; idx++)
+        ArenaMarker bundleMark = bundleArena.SaveMarker();
+        TextureHandle atlasTex = TextureHandle.Invalid;
+        try
         {
-            int cx = (idx % 16) * cell;
-            int cy = (idx / 16) * cell;
-            ref GlyphMetrics gm = ref glyphs[idx];
-            gm.Codepoint = FirstAscii + idx;
-            gm.Advance = pixelSize * 0.6f;
+            byte* atlasPixels = bundleArena.Alloc<byte>(checked(atlasSize * atlasSize), 64);
+            GlyphMetrics* glyphs = bundleArena.Alloc<GlyphMetrics>(AsciiCount, 64);
+            float* kernTable = bundleArena.Alloc<float>(AsciiCount * AsciiCount, 64);
 
-            if (idx > 0)
+            int cell = atlasSize / 16;
+            float invAtlas = 1f / atlasSize;
+
+            for (int idx = 0; idx < AsciiCount; idx++)
             {
-                gm.Width = pixelSize * 0.55f;
-                gm.Height = pixelSize * 0.75f;
-                gm.BearingX = pixelSize * 0.02f;
-                gm.BearingY = pixelSize * 0.75f;
-                gm.UvRect = new Vec4(cx * invAtlas, cy * invAtlas, cell * invAtlas, cell * invAtlas);
-                gm.HasBitmap = 1;
+                int cx = (idx % 16) * cell;
+                int cy = (idx / 16) * cell;
+                ref GlyphMetrics gm = ref glyphs[idx];
+                gm.Codepoint = FirstAscii + idx;
+                gm.Advance = pixelSize * 0.6f;
 
-                for (int y = 0; y < cell; y++)
+                if (idx > 0)
                 {
-                    float ny = ((y + 0.5f) / cell) * 2f - 1f;
-                    for (int x = 0; x < cell; x++)
+                    gm.Width = pixelSize * 0.55f;
+                    gm.Height = pixelSize * 0.75f;
+                    gm.BearingX = pixelSize * 0.02f;
+                    gm.BearingY = pixelSize * 0.75f;
+                    gm.UvRect = new Vec4(cx * invAtlas, cy * invAtlas, cell * invAtlas, cell * invAtlas);
+                    gm.HasBitmap = 1;
+
+                    for (int y = 0; y < cell; y++)
                     {
-                        float nx = ((x + 0.5f) / cell) * 2f - 1f;
-                        float box = DetMath.Max(DetMath.Abs(nx) - 0.55f, DetMath.Abs(ny) - 0.7f);
-                        float val = DetMath.Clamp01(0.502f - box * 1.5f);
-                        atlasPixels[(cy + y) * atlasSize + (cx + x)] = (byte)(val * 255f);
+                        float ny = ((y + 0.5f) / cell) * 2f - 1f;
+                        for (int x = 0; x < cell; x++)
+                        {
+                            float nx = ((x + 0.5f) / cell) * 2f - 1f;
+                            float box = DetMath.Max(DetMath.Abs(nx) - 0.55f, DetMath.Abs(ny) - 0.7f);
+                            float val = DetMath.Clamp01(0.502f - box * 1.5f);
+                            atlasPixels[(nint)(cy + y) * atlasSize + (cx + x)] = (byte)(val * 255f);
+                        }
                     }
                 }
             }
+
+            atlasTex = AssetSystem.RegisterTexture(ref assets, new TextureAssetData
+            {
+                OwnerBundle = bundle,
+                Name = StringId.Hash($"{name.Value}_fallback_sdf"),
+                Pixels = atlasPixels,
+                Width = atlasSize,
+                Height = atlasSize,
+                Channels = 1,
+                Srgb = 0,
+                ClampEdge = 1,
+            });
+
+            return AssetSystem.RegisterFont(ref assets, new FontAssetData
+            {
+                OwnerBundle = bundle,
+                Name = name,
+                AtlasTexture = atlasTex,
+                PixelSize = pixelSize,
+                Ascent = pixelSize * 0.8f,
+                Descent = -pixelSize * 0.2f,
+                LineGap = pixelSize * 0.1f,
+                LineHeight = pixelSize * 1.1f,
+                SdfPadding = sdfPadding,
+                SdfOnEdgeValue = 128,
+                SdfPixelDistScale = 128f / sdfPadding,
+                AsciiGlyphs = glyphs,
+                AsciiKerning = kernTable,
+            });
         }
-
-        TextureHandle atlasTex = AssetSystem.RegisterTexture(ref assets, new TextureAssetData
+        catch
         {
-            OwnerBundle = bundle,
-            Name = StringId.Hash($"{name.Value}_fallback_sdf"),
-            Pixels = atlasPixels,
-            Width = atlasSize,
-            Height = atlasSize,
-            Channels = 1,
-            Srgb = 0,
-            ClampEdge = 1,
-        });
-
-        return AssetSystem.RegisterFont(ref assets, new FontAssetData
-        {
-            OwnerBundle = bundle,
-            Name = name,
-            AtlasTexture = atlasTex,
-            PixelSize = pixelSize,
-            Ascent = pixelSize * 0.8f,
-            Descent = -pixelSize * 0.2f,
-            LineGap = pixelSize * 0.1f,
-            LineHeight = pixelSize * 1.1f,
-            SdfPadding = sdfPadding,
-            SdfOnEdgeValue = 128,
-            SdfPixelDistScale = 128f / sdfPadding,
-            AsciiGlyphs = glyphs,
-            AsciiKerning = kernTable,
-        });
+            if (atlasTex.IsValid)
+                AssetSystem.UnregisterTexture(ref assets, atlasTex);
+            bundleArena.Rollback(bundleMark);
+            throw;
+        }
     }
 }
