@@ -92,11 +92,15 @@ SaveOpHandle op = SaveSystem.SaveAsync(
     compression: PackCompressionMode.Lz4,
     userTag: 1UL);
 
+// Optional: cooperatively cancel an in-flight async save/load/delete op (0 GC):
+bool wasPending = SaveSystem.Cancel(saves, op); // still produces SaveResult with SaveStatus.Cancelled via PollCompleted
+
 // Logic Thread polls once per frame (0 GC bytes):
 while (SaveSystem.PollCompleted(saves, out SaveResult res))
 {
     try
     {
+        if (res.Status == SaveStatus.Cancelled) continue;
         if (res.OpKind == SaveOpKind.Load && res.IsSuccess)
         {
             if (res.LoadedFromBackup != 0)
@@ -148,5 +152,5 @@ if (reader.TryFind(StringId.Hash("weather"), out SaveChunkView weatherChunk))
 ## 5. Rules Checklist
 1. **Pick the right mode for each file**: Raw JSON for human-editable `settings.json`; `BSAV` + `JsonUtf8` for normal progression/profile saves; `BSAV` + `Chunked` for multi-MB worlds/SoA arrays.
 2. **Never do disk I/O inside `Simulation/`**: Snapshot `GameSimState` cleanly at a tick boundary and enqueue `SaveSystem.SaveAsync` from the Logic/View orchestration layer.
-3. **Always call `SaveSystem.ReleaseResult(ref res)`** and call **`SaveSystem.Stop(saves)` before `engAlloc.Dispose()`** so all in-flight saves finish cleanly and `NativeMemoryTracker.LiveBytes == 0`.
+3. **Always call `SaveSystem.ReleaseResult(ref res)`** (including after `SaveSystem.Cancel(saves, handle)` produces `SaveStatus.Cancelled`) and call **`SaveSystem.Stop(saves)` BEFORE `LogSystem.Stop(log)` and `engAlloc.Dispose()`** so all in-flight saves finish cleanly, shutdown logs flush, and `NativeMemoryTracker.LiveBytes == 0`.
 4. **Always bump `schemaVersion` (or individual chunk versions)** when changing save formats and log load/backup-recovery/failure events via `LogSystem`.

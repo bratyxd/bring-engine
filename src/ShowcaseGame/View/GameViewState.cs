@@ -41,11 +41,13 @@ public unsafe struct GameViewState
     public EntityId TitleRuneEntity;
     public SpriteHandle TitleRuneSprite;
     public SpriteAnimPlayerHandle TitleRuneAnim;
+    public TextHandle SubtitleText;
     public float TitleOrbitAngle;
 
     // Arena scene handles
     public SceneId ArenaSceneId;
     public SceneId HudSceneId;
+    public ulong LastConsumedEventSeq;
     public CameraHandle ArenaCamera;
     public EntityId PlayerEntity;
     public EntityId CoreEntity;

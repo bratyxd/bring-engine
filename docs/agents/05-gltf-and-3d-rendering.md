@@ -49,3 +49,26 @@ lighting.ShadowStrength = 0.72f;       // Shadow darkening intensity [0..1]
 lighting.ShadowBias = 0.0018f;         // Depth comparison bias
 lighting.ShadowNormalBias = 0.04f;     // World-space normal offset to eliminate slope acne
 ```
+
+## GPU Context Lifecycle & Deferred Resource Cleanup (`GpuSystem`)
+Always allocate `GpuContext` in `EngineAllocators.Persistent` (pinned native pointer) and use the canonical init/flush/dispose flow:
+
+1. **Initialize with `GpuSystem.Init`**: Initializes `*gpu` in-place AND automatically binds deferred GPU mesh/texture cleanup hooks onto `world->Assets` (`BindAssetCleanupHooks`). Avoid the legacy value-returning `GpuSystem.Create` unless you manually pin the struct and call `BindAssetCleanupHooks(gpu, ref world->Assets)`.
+2. **Deferred Release Queue (`GpuSystem.FlushDeferredReleases`)**: When `AssetSystem.UnloadByBundle` unloads meshes or textures, the cleanup hooks enqueue their GPU slots into a thread-safe deferred release queue rather than calling SDL3_gpu directly off-thread. Call `GpuSystem.FlushDeferredReleases(ref *gpu)` on the Main Thread at scene transition barriers (right after `EnginePipelineSystem.FlushBeforeSceneTransition` and again after `SceneSystem.LoadScene` before `BatchRenderer.UploadPendingAssets` to reclaim slots immediately). `BatchRenderer.SubmitRenderPacket` also drains deferred releases automatically at the end of each submitted frame.
+3. **Teardown with 2-Arg `GpuSystem.Dispose(ref *gpu, ref world->Assets)`**: Clears asset cleanup hooks, resets all live asset `GpuSlot = -1` / `GpuSlotGen = 0`, waits for GPU idle, drains deferred releases, and destroys the SDL3_gpu device cleanly (preventing dangling hooks if bundles unload later).
+
+```csharp
+// Startup (Main Thread):
+GpuContext* gpu = engAlloc.Persistent.Alloc<GpuContext>(1, 64);
+GpuSystem.Init(gpu, window.Window, ref engAlloc.Persistent, ref world->Assets, debugMode: false, log: log);
+
+// Scene transition barrier (Main Thread):
+EnginePipelineSystem.FlushBeforeSceneTransition(pipeline, ref *gpu);
+GpuSystem.FlushDeferredReleases(ref *gpu);
+SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("Arena"), SceneLoadMode.Single);
+GpuSystem.FlushDeferredReleases(ref *gpu);
+BatchRenderer.UploadPendingAssets(ref *gpu, ref *world);
+
+// Shutdown (Main Thread, before PlatformSystem.Shutdown and LogSystem.Stop):
+GpuSystem.Dispose(ref *gpu, ref world->Assets);
+```

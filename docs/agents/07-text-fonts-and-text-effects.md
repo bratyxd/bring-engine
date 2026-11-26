@@ -30,10 +30,12 @@ TextHandle hudTxt = RenderComponentSystem.AddText(ref world.RenderComponents, in
 ```
 
 ## Tweening & Shadering Text
-Every field on `TextData` (`Color`, `OutlineWidth`, `GlowIntensity`, `TypewriterProgress`, `FontScale`, `CustomParams`, `SortingOrder`) is plain unmanaged data — tween them directly with `TweenSystem`:
+Use **handle-safe `TweenSystem` channels** to animate `TextData` fields safely across swap-back table compactions:
 ```csharp
-TextData* ptr = RenderComponentSystem.TryGetText(in world.RenderComponents, txt);
-TweenSystem.TweenFloatPtr(ref tweens, &ptr->TypewriterProgress, 0f, 1f, 0.8f, EaseType.Linear, scene: sceneId);
-TweenSystem.TweenFloatPtr(ref tweens, &ptr->GlowIntensity, 0.2f, 1.5f, 0.6f, EaseType.InOutSine, loopMode: TweenLoopMode.PingPong, loops: -1, scene: sceneId);
+TweenSystem.TextTypewriter(ref tweens, txt, 0f, 1f, 0.8f, EaseType.Linear, scene: sceneId);
+TweenSystem.TextGlowIntensity(ref tweens, txt, 0.2f, 1.5f, 0.6f, EaseType.InOutSine, loopMode: TweenLoopMode.PingPong, loops: -1, scene: sceneId);
+TweenSystem.TextColor(ref tweens, txt, ColorF.White, ColorF.Gold, 0.5f, EaseType.OutQuad, scene: sceneId);
 ```
+> **Warning**: Never pass raw pointers into `RenderComponentTables.Texts` (such as `&ptr->TypewriterProgress`) to `TweenSystem.TweenFloatPtr` — `RenderComponentTables.Texts` uses swap-back dense compaction whenever any text is removed, which would relocate the element and cause a raw-pointer tween to write into a different text's memory!
+
 You can also assign `ptr->CustomShader` (`ShaderVertexLayout.InstancedQuad`) to replace the built-in `sdf_text.hlsl` with a custom HLSL text shader; `TextData.CustomParams` is forwarded directly into each `GlyphGpuInstance` (`144` bytes, `PSInput.CustomParams : TEXCOORD6`).

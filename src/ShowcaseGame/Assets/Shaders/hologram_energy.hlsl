@@ -58,6 +58,12 @@ struct PSInput
     float4 CustomParams : TEXCOORD5;
 };
 
+float3 SafeNormalize(float3 v, float3 fallback)
+{
+    float lenSq = dot(v, v);
+    return lenSq > 1e-8 ? v * rsqrt(lenSq) : fallback;
+}
+
 PSInput VSMain(VSInput input)
 {
     Instance3D inst = Instances[BaseInstance + input.InstanceId];
@@ -69,23 +75,27 @@ PSInput VSMain(VSInput input)
     int jointOff = (int)inst.Extra.z;
     if (jointOff >= 0)
     {
-        uint j0 = (input.JointIndices) & 0xFFu;
-        uint j1 = (input.JointIndices >> 8) & 0xFFu;
-        uint j2 = (input.JointIndices >> 16) & 0xFFu;
-        uint j3 = (input.JointIndices >> 24) & 0xFFu;
+        float weightSum = input.JointWeights.x + input.JointWeights.y + input.JointWeights.z + input.JointWeights.w;
+        if (weightSum > 1e-5)
+        {
+            uint j0 = (input.JointIndices) & 0xFFu;
+            uint j1 = (input.JointIndices >> 8) & 0xFFu;
+            uint j2 = (input.JointIndices >> 16) & 0xFFu;
+            uint j3 = (input.JointIndices >> 24) & 0xFFu;
 
-        float4x4 skinMat =
-            JointPalette[jointOff + j0] * input.JointWeights.x +
-            JointPalette[jointOff + j1] * input.JointWeights.y +
-            JointPalette[jointOff + j2] * input.JointWeights.z +
-            JointPalette[jointOff + j3] * input.JointWeights.w;
+            float4x4 skinMat =
+                JointPalette[jointOff + j0] * input.JointWeights.x +
+                JointPalette[jointOff + j1] * input.JointWeights.y +
+                JointPalette[jointOff + j2] * input.JointWeights.z +
+                JointPalette[jointOff + j3] * input.JointWeights.w;
 
-        localPos = mul(skinMat, localPos);
-        localNorm = normalize(mul((float3x3)skinMat, localNorm));
+            localPos = mul(skinMat, localPos);
+            localNorm = SafeNormalize(mul((float3x3)skinMat, localNorm), input.Normal);
+        }
     }
 
     float4 worldPos = mul(inst.Model, localPos);
-    float3 worldNorm = normalize(mul((float3x3)inst.Model, localNorm));
+    float3 worldNorm = SafeNormalize(mul((float3x3)inst.Model, localNorm), float3(0.0, 1.0, 0.0));
 
     PSInput o;
     o.ClipPos = mul(ViewProj, worldPos);
@@ -118,8 +128,8 @@ float4 PSMain(PSInput input) : SV_Target0
 {
     float4 texSample = AlbedoTex.Sample(AlbedoSamp, input.Uv0);
     float t = PS_CameraPosTime.w;
-    float3 N = normalize(input.WorldNormal);
-    float3 V = normalize(PS_CameraPosTime.xyz - input.WorldPos);
+    float3 N = SafeNormalize(input.WorldNormal, float3(0.0, 1.0, 0.0));
+    float3 V = SafeNormalize(PS_CameraPosTime.xyz - input.WorldPos, float3(0.0, 0.0, 1.0));
 
     float pulse = max(input.CustomParams.x, 0.5);
     float scanSpeed = max(input.CustomParams.y, 2.5);

@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Text;
 using BringEngine.Assets;
 using BringEngine.Assets.Gltf;
 using BringEngine.Core.Handles;
@@ -109,9 +110,9 @@ public static unsafe class GameViewSystems
         subTd.GlowIntensity = 0.7f;
         subTd.AnimFlags = TextAnimFlags.Bounce | TextAnimFlags.Typewriter | TextAnimFlags.GlowPulse;
         subTd.AnimAmplitude = 0.05f;
-        var subH = RenderComponentSystem.AddText(ref w.RenderComponents, in subTd);
-        TextData* subPtr = RenderComponentSystem.TryGetText(in w.RenderComponents, subH);
-        TweenSystem.TweenFloatPtr(ref w.Tweens, &subPtr->TypewriterProgress, 0f, 1f, 0.9f, EaseType.OutQuad, scene: sc);
+        subTd.TypewriterProgress = 0f;
+        v->SubtitleText = RenderComponentSystem.AddText(ref w.RenderComponents, in subTd);
+        TweenSystem.TextTypewriter(ref w.Tweens, v->SubtitleText, 0f, 1f, 0.9f, EaseType.OutQuad, scene: sc);
 
         // Ambient golden embers emitter
         TextureHandle glow = AssetSystem.FindTexture(in w.Assets, StringId.Hash("radial_glow"));
@@ -175,6 +176,7 @@ public static unsafe class GameViewSystems
         SceneId sc = ctx.Scene;
         v->Mode = 1;
         v->ArenaSceneId = sc;
+        v->LastConsumedEventSeq = v->Sim->EventWriteSeq;
 
         // Clear view handle tables
         for (int i = 0; i < GameSimState.MaxEnemies; i++) { v->EnemyEntities[i] = EntityId.Invalid; v->EnemyHpBarEntities[i] = EntityId.Invalid; v->EnemyHpBars[i] = SpriteHandle.Invalid; }
@@ -470,26 +472,36 @@ public static unsafe class GameViewSystems
             }
         }
 
-        // 5. Consume Simulation Events -> Particles + Trauma Shake + Floating Animated SDF Combat Text!
-        for (int e = 0; e < sim.EventCount; e++)
+        // 5. Consume Simulation Events via monotonic ring cursor (never mutates sim, 0 GC formatting!)
+        ulong writeSeq = sim.EventWriteSeq;
+        if (v->LastConsumedEventSeq > writeSeq)
+            v->LastConsumedEventSeq = 0;
+        if (writeSeq - v->LastConsumedEventSeq > (ulong)GameSimState.EventRingCapacity)
+            v->LastConsumedEventSeq = writeSeq - (ulong)GameSimState.EventRingCapacity;
+
+        byte* textBuf = stackalloc byte[32];
+        Span<byte> utf8Buf = new Span<byte>(textBuf, 32);
+
+        while (v->LastConsumedEventSeq < writeSeq)
         {
-            SimEvent ev = sim.Events[e];
+            SimEvent ev = sim.Events[(uint)(v->LastConsumedEventSeq & GameSimState.EventRingMask)];
+            v->LastConsumedEventSeq++;
             switch (ev.Kind)
             {
                 case SimEventKind.EnemyHit:
                     EmitBurstAt(ref w.Particles, v->BurstHitEmitter, ev.Position, 16);
-                    SpawnFloatingText(v, ref w, sc, ev.Position, $"-{ev.Value}", ColorF.Gold, TextAnimFlags.Bounce | TextAnimFlags.ScalePop);
+                    SpawnFloatingText(v, ref w, sc, ev.Position, FormatPrefixedInt(utf8Buf, "-"u8, ev.Value, default), ColorF.Gold, TextAnimFlags.Bounce | TextAnimFlags.ScalePop);
                     break;
 
                 case SimEventKind.EnemyKilled:
                     EmitBurstAt(ref w.Particles, v->BurstKillEmitter, ev.Position, 45);
                     CameraSystem.AddTrauma(ref w.Cameras, v->ArenaCamera, 0.35f);
-                    SpawnFloatingText(v, ref w, sc, ev.Position + new Vec3(0, 0.5f, 0), $"+{ev.Value}!", ColorF.Cyan, TextAnimFlags.Bounce | TextAnimFlags.Rainbow | TextAnimFlags.GlowPulse);
+                    SpawnFloatingText(v, ref w, sc, ev.Position + new Vec3(0, 0.5f, 0), FormatPrefixedInt(utf8Buf, "+"u8, ev.Value, "!"u8), ColorF.Cyan, TextAnimFlags.Bounce | TextAnimFlags.Rainbow | TextAnimFlags.GlowPulse);
                     break;
 
                 case SimEventKind.CrystalCollected:
                     EmitBurstAt(ref w.Particles, v->BurstHitEmitter, ev.Position, 20);
-                    SpawnFloatingText(v, ref w, sc, ev.Position, $"+{ev.Value}", ColorF.Green, TextAnimFlags.Wave);
+                    SpawnFloatingText(v, ref w, sc, ev.Position, FormatPrefixedInt(utf8Buf, "+"u8, ev.Value, default), ColorF.Green, TextAnimFlags.Wave);
                     break;
 
                 case SimEventKind.PlayerDashed:
@@ -502,11 +514,11 @@ public static unsafe class GameViewSystems
 
                 case SimEventKind.PlayerDamaged:
                     CameraSystem.AddTrauma(ref w.Cameras, v->ArenaCamera, 0.65f);
-                    SpawnFloatingText(v, ref w, sc, ev.Position + new Vec3(0, 2f, 0), $"-{ev.Value} HP", ColorF.Red, TextAnimFlags.Shake);
+                    SpawnFloatingText(v, ref w, sc, ev.Position + new Vec3(0, 2f, 0), FormatPrefixedInt(utf8Buf, "-"u8, ev.Value, " HP"u8), ColorF.Red, TextAnimFlags.Shake);
                     break;
 
                 case SimEventKind.WaveAdvanced:
-                    SpawnFloatingText(v, ref w, sc, ev.Position, $"WAVE {ev.Value}!", ColorF.Gold, TextAnimFlags.Wave | TextAnimFlags.Rainbow | TextAnimFlags.GlowPulse);
+                    SpawnFloatingText(v, ref w, sc, ev.Position, FormatPrefixedInt(utf8Buf, "WAVE "u8, ev.Value, "!"u8), ColorF.Gold, TextAnimFlags.Wave | TextAnimFlags.Rainbow | TextAnimFlags.GlowPulse);
                     break;
             }
         }
@@ -657,8 +669,27 @@ public static unsafe class GameViewSystems
         em->PendingBurst += count;
     }
 
+    private static FixedString256 FormatPrefixedInt(
+        Span<byte> buf, ReadOnlySpan<byte> prefix, int value, ReadOnlySpan<byte> suffix)
+    {
+        int pos = 0;
+        if (prefix.Length <= buf.Length)
+        {
+            prefix.CopyTo(buf);
+            pos += prefix.Length;
+        }
+        if (Utf8Formatter.TryFormat(value, buf.Slice(pos), out int written))
+            pos += written;
+        if (!suffix.IsEmpty && pos + suffix.Length <= buf.Length)
+        {
+            suffix.CopyTo(buf.Slice(pos));
+            pos += suffix.Length;
+        }
+        return FixedString256.FromUtf8(buf.Slice(0, pos));
+    }
+
     private static void SpawnFloatingText(
-        GameViewState* v, ref EngineWorld w, SceneId sc, Vec3 pos, string text, ColorF color, TextAnimFlags anim)
+        GameViewState* v, ref EngineWorld w, SceneId sc, Vec3 pos, in FixedString256 text, ColorF color, TextAnimFlags anim)
     {
         int slot = -1;
         for (int i = 0; i < GameViewState.MaxFloatingTexts; i++)
@@ -671,7 +702,8 @@ public static unsafe class GameViewSystems
         EntityId e = EntitySystem.Spawn(ref w.Entities, sc);
         TransformSystem.Add(ref w.Transforms, e, pos);
 
-        var td = RenderComponentSystem.DefaultWorldText(e, font, text, sc);
+        var td = RenderComponentSystem.DefaultWorldText(e, font, ReadOnlySpan<char>.Empty, sc);
+        td.Content = text;
         td.FontScale = 0.014f;
         td.Color = color;
         td.SecondaryColor = ColorF.White;

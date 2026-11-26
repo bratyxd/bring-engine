@@ -34,7 +34,8 @@ public unsafe struct GameSimState
     public const int MaxEnemies = 128;
     public const int MaxProjectiles = 256;
     public const int MaxPickups = 128;
-    public const int MaxEventsPerTick = 128;
+    public const int EventRingCapacity = 256;
+    public const ulong EventRingMask = EventRingCapacity - 1;
 
     // Arena bounds (Fix32)
     public Fix32 ArenaHalfSize;
@@ -85,9 +86,9 @@ public unsafe struct GameSimState
     public byte* PickupAlive;
     public int PickupActiveCount;
 
-    // Per-tick event queue consumed by View layer (never mutates sim!)
+    // Monotonic fixed-size event ring buffer consumed by View layer via cursor (never mutates sim!)
     public SimEvent* Events;
-    public int EventCount;
+    public ulong EventWriteSeq;
 
     public DetRng Rng;
 
@@ -116,7 +117,7 @@ public unsafe struct GameSimState
             PickupValue = persistentArena.Alloc<int>(MaxPickups, 64),
             PickupAlive = persistentArena.Alloc<byte>(MaxPickups, 64),
 
-            Events = persistentArena.Alloc<SimEvent>(MaxEventsPerTick, 64),
+            Events = persistentArena.Alloc<SimEvent>(EventRingCapacity, 64),
             Rng = DetRng.Create(seed),
         };
         GameSimSystems.ResetMatch(ref st, seed);

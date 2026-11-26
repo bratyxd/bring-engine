@@ -46,20 +46,28 @@ internal unsafe struct GameLogicContext
     public byte FixedSingleStepMode; // 1 in deterministic verify-render mode (1 exact 1/60s sim tick per frame)
     public byte ProfileScopesActive;
 
-    // Input edge/delta latch across 0-tick and multi-tick fixed-step frames
+    // Input edge/delta/text/focus latch across 0-tick and multi-tick fixed-step frames
     public fixed ulong LatchedKeysPressed[8];
     public fixed ulong LatchedKeysReleased[8];
+    public fixed ulong PrevTickKeysDown[8];
     public uint LatchedMousePressed;
     public uint LatchedMouseReleased;
+    public uint PrevTickMouseDown;
     public fixed uint LatchedPadPressed[InputState.MaxGamepads];
     public fixed uint LatchedPadReleased[InputState.MaxGamepads];
+    public fixed uint PrevTickPadDown[InputState.MaxGamepads];
     public float LatchedMouseDeltaX;
     public float LatchedMouseDeltaY;
     public float LatchedMouseWheelY;
+    public fixed byte LatchedTextInputUtf8[InputState.MaxTextInputBytes];
+    public byte LatchedTextInputLength;
+    public byte PrevTickWindowUnfocused;
+    public byte LatchedFocusLost;
+    public byte LatchedFocusGained;
 }
 
 /// <summary>
-/// Bring Arena — Complete playable reference game built with Bring Engine (NativeAOT, Zero-OOP, Data + Systems).
+/// Bring Arena — Complete playable reference game built with Bring Engine (CoreCLR .NET 10, Zero-OOP, Data + Systems).
 ///
 /// Engine Defaults:
 ///   - Borderless Full Window by default (WindowMode.BorderlessFullscreen; toggle with F11 or pass --windowed)
@@ -239,6 +247,51 @@ public static unsafe class Program
         ctx->LatchedMouseDeltaX += src.MouseDeltaX;
         ctx->LatchedMouseDeltaY += src.MouseDeltaY;
         ctx->LatchedMouseWheelY += src.MouseWheelY;
+
+        if (src.TextInputLength > 0)
+        {
+            int startLen = ctx->LatchedTextInputLength;
+            int avail = InputState.MaxTextInputBytes - startLen;
+            if (avail > 0)
+            {
+                int srcLen = src.TextInputLength;
+                bool truncated = srcLen > avail;
+                int copy = truncated ? avail : srcLen;
+                for (int i = 0; i < copy; i++)
+                    ctx->LatchedTextInputUtf8[startLen + i] = src.TextInputUtf8[i];
+                int newLen = startLen + copy;
+                if (truncated)
+                    newLen = TrimToUtf8RuneBoundary(ctx->LatchedTextInputUtf8, startLen, newLen);
+                ctx->LatchedTextInputLength = (byte)newLen;
+            }
+        }
+
+        if (src.WasWindowFocusLost) ctx->LatchedFocusLost = 1;
+        if (src.WasWindowFocusGained) ctx->LatchedFocusGained = 1;
+    }
+
+    private static int TrimToUtf8RuneBoundary(byte* buf, int start, int end)
+    {
+        if (end <= start) return start;
+        int minSearch = end - 4;
+        if (minSearch < start) minSearch = start;
+        int idx = end - 1;
+        while (idx >= minSearch && (buf[idx] & 0xC0) == 0x80)
+            idx--;
+        if (idx < minSearch) return minSearch;
+
+        byte lead = buf[idx];
+        int expected;
+        if ((lead & 0x80) == 0) expected = 1;
+        else if ((lead & 0xE0) == 0xC0) expected = 2;
+        else if ((lead & 0xF0) == 0xE0) expected = 3;
+        else if ((lead & 0xF8) == 0xF0) expected = 4;
+        else return idx;
+
+        int actual = end - idx;
+        if (actual < expected) return idx;
+        if (actual > expected) return idx + expected;
+        return end;
     }
 
     private static InputState ConsumeLatchedTickInput(GameLogicContext* ctx, in InputState src)
@@ -248,25 +301,29 @@ public static unsafe class Program
         {
             ulong pressed = ctx->LatchedKeysPressed[w];
             ulong released = ctx->LatchedKeysReleased[w] & ~pressed;
-            tick.KeysPrev[w] = tick.KeysDown[w];
-            tick.KeysDown[w] = (tick.KeysDown[w] | pressed) & ~released;
-            tick.KeysPrev[w] = (tick.KeysPrev[w] & ~pressed) | released;
+            ulong down = (tick.KeysDown[w] | pressed) & ~released;
+            ulong prev = (ctx->PrevTickKeysDown[w] & ~pressed) | released;
+            tick.KeysDown[w] = down;
+            tick.KeysPrev[w] = prev;
+            ctx->PrevTickKeysDown[w] = down;
             ctx->LatchedKeysPressed[w] = 0;
-            ctx->LatchedKeysReleased[w] = 0;
+            ctx->LatchedKeysReleased[w] = (ctx->LatchedKeysReleased[w] & pressed) & ~src.KeysDown[w];
         }
 
         uint mPressed = ctx->LatchedMousePressed;
         uint mReleased = ctx->LatchedMouseReleased & ~mPressed;
-        tick.MouseButtonsPrev = tick.MouseButtonsDown;
-        tick.MouseButtonsDown = (tick.MouseButtonsDown | mPressed) & ~mReleased;
-        tick.MouseButtonsPrev = (tick.MouseButtonsPrev & ~mPressed) | mReleased;
+        uint mDown = (tick.MouseButtonsDown | mPressed) & ~mReleased;
+        uint mPrev = (ctx->PrevTickMouseDown & ~mPressed) | mReleased;
+        tick.MouseButtonsDown = mDown;
+        tick.MouseButtonsPrev = mPrev;
+        ctx->PrevTickMouseDown = mDown;
         ctx->LatchedMousePressed = 0;
-        ctx->LatchedMouseReleased = 0;
+        ctx->LatchedMouseReleased = (ctx->LatchedMouseReleased & mPressed) & ~src.MouseButtonsDown;
 
-        ConsumePadLatch(ref tick.Gamepad0, ref ctx->LatchedPadPressed[0], ref ctx->LatchedPadReleased[0]);
-        ConsumePadLatch(ref tick.Gamepad1, ref ctx->LatchedPadPressed[1], ref ctx->LatchedPadReleased[1]);
-        ConsumePadLatch(ref tick.Gamepad2, ref ctx->LatchedPadPressed[2], ref ctx->LatchedPadReleased[2]);
-        ConsumePadLatch(ref tick.Gamepad3, ref ctx->LatchedPadPressed[3], ref ctx->LatchedPadReleased[3]);
+        ConsumePadLatch(ref tick.Gamepad0, src.Gamepad0.ButtonsDown, ref ctx->LatchedPadPressed[0], ref ctx->LatchedPadReleased[0], ref ctx->PrevTickPadDown[0]);
+        ConsumePadLatch(ref tick.Gamepad1, src.Gamepad1.ButtonsDown, ref ctx->LatchedPadPressed[1], ref ctx->LatchedPadReleased[1], ref ctx->PrevTickPadDown[1]);
+        ConsumePadLatch(ref tick.Gamepad2, src.Gamepad2.ButtonsDown, ref ctx->LatchedPadPressed[2], ref ctx->LatchedPadReleased[2], ref ctx->PrevTickPadDown[2]);
+        ConsumePadLatch(ref tick.Gamepad3, src.Gamepad3.ButtonsDown, ref ctx->LatchedPadPressed[3], ref ctx->LatchedPadReleased[3], ref ctx->PrevTickPadDown[3]);
 
         tick.MouseDeltaX = ctx->LatchedMouseDeltaX;
         tick.MouseDeltaY = ctx->LatchedMouseDeltaY;
@@ -274,18 +331,58 @@ public static unsafe class Program
         ctx->LatchedMouseDeltaX = 0f;
         ctx->LatchedMouseDeltaY = 0f;
         ctx->LatchedMouseWheelY = 0f;
+
+        byte textLen = ctx->LatchedTextInputLength;
+        tick.TextInputLength = textLen;
+        for (int i = 0; i < textLen; i++)
+            tick.TextInputUtf8[i] = ctx->LatchedTextInputUtf8[i];
+        ctx->LatchedTextInputLength = 0;
+
+        if (ctx->PrevTickWindowUnfocused == 0 && ctx->LatchedFocusLost != 0)
+        {
+            tick.WindowUnfocused = 1;
+            tick.WindowUnfocusedPrev = 0;
+            ctx->LatchedFocusLost = 0;
+        }
+        else if (ctx->PrevTickWindowUnfocused != 0 && ctx->LatchedFocusGained != 0)
+        {
+            tick.WindowUnfocused = 0;
+            tick.WindowUnfocusedPrev = 1;
+            ctx->LatchedFocusGained = 0;
+        }
+        else if (ctx->LatchedFocusLost != 0)
+        {
+            tick.WindowUnfocused = 1;
+            tick.WindowUnfocusedPrev = 0;
+            ctx->LatchedFocusLost = 0;
+        }
+        else if (ctx->LatchedFocusGained != 0)
+        {
+            tick.WindowUnfocused = 0;
+            tick.WindowUnfocusedPrev = 1;
+            ctx->LatchedFocusGained = 0;
+        }
+        else
+        {
+            tick.WindowUnfocused = src.WindowUnfocused;
+            tick.WindowUnfocusedPrev = ctx->PrevTickWindowUnfocused;
+        }
+        ctx->PrevTickWindowUnfocused = tick.WindowUnfocused;
+
         return tick;
     }
 
-    private static void ConsumePadLatch(ref GamepadState pad, ref uint pressedLatch, ref uint releasedLatch)
+    private static void ConsumePadLatch(ref GamepadState pad, uint srcDown, ref uint pressedLatch, ref uint releasedLatch, ref uint prevDown)
     {
         uint pressed = pressedLatch;
         uint released = releasedLatch & ~pressed;
-        pad.ButtonsPrev = pad.ButtonsDown;
-        pad.ButtonsDown = (pad.ButtonsDown | pressed) & ~released;
-        pad.ButtonsPrev = (pad.ButtonsPrev & ~pressed) | released;
+        uint down = (pad.ButtonsDown | pressed) & ~released;
+        uint prev = (prevDown & ~pressed) | released;
+        pad.ButtonsDown = down;
+        pad.ButtonsPrev = prev;
+        prevDown = down;
         pressedLatch = 0;
-        releasedLatch = 0;
+        releasedLatch = (releasedLatch & pressed) & ~srcDown;
     }
 
     private static int RunPipelinedGame(bool verifyRender, string outDir, int targetFps, bool vsync, WindowMode windowMode)
@@ -339,8 +436,7 @@ public static unsafe class Program
 
         var window = PlatformSystem.InitWindow("Bring Engine — Bring Arena", 1280, 720, hidden: verifyRender, mode: windowMode, log: log);
         GpuContext* gpu = engAlloc.Persistent.Alloc<GpuContext>(1, 64);
-        *gpu = GpuSystem.Create(window.Window, ref engAlloc.Persistent, ref world->Assets, debugMode: false, log: log);
-        GpuSystem.BindAssetCleanupHooks(gpu, ref world->Assets);
+        GpuSystem.Init(gpu, window.Window, ref engAlloc.Persistent, ref world->Assets, debugMode: false, log: log);
         FramePacerSystem.ApplyVSync(ref *pacer, ref *gpu, vsync);
 
         try
@@ -439,9 +535,11 @@ public static unsafe class Program
 
                 // 2. Scene Transition at clean quiescent barrier -> Arena (Single) + HUD (Additive)
                 EnginePipelineSystem.FlushBeforeSceneTransition(pipeline, ref *gpu);
+                GpuSystem.FlushDeferredReleases(ref *gpu);
                 GameSimSystems.ResetMatch(ref *sim, 20260417UL);
                 SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("Arena"), SceneLoadMode.Single);
                 SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("HUD"), SceneLoadMode.Additive);
+                GpuSystem.FlushDeferredReleases(ref *gpu);
                 BatchRenderer.UploadPendingAssets(ref *gpu, ref *world);
                 Console.WriteLine($"  [Transition -> Arena+HUD] Loaded={bundles->LoadedBundleCount} (common={BundleSystem.GetRefCount(in *bundles, bCommon)}, title={BundleSystem.IsLoaded(in *bundles, bTitle)}, arena={BundleSystem.IsLoaded(in *bundles, bArena)})");
 
@@ -513,16 +611,20 @@ public static unsafe class Program
                     {
                         view->RequestStartArena = 0;
                         EnginePipelineSystem.FlushBeforeSceneTransition(pipeline, ref *gpu);
+                        GpuSystem.FlushDeferredReleases(ref *gpu);
                         GameSimSystems.ResetMatch(ref *sim, (ulong)(world->TickCount + 20260417UL));
                         SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("Arena"), SceneLoadMode.Single);
                         SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("HUD"), SceneLoadMode.Additive);
+                        GpuSystem.FlushDeferredReleases(ref *gpu);
                         BatchRenderer.UploadPendingAssets(ref *gpu, ref *world);
                     }
                     else if (view->RequestReturnTitle != 0)
                     {
                         view->RequestReturnTitle = 0;
                         EnginePipelineSystem.FlushBeforeSceneTransition(pipeline, ref *gpu);
+                        GpuSystem.FlushDeferredReleases(ref *gpu);
                         SceneSystem.LoadScene(ref *scenes, ref *world, ref engAlloc, ref *bundles, StringId.Hash("Title"), SceneLoadMode.Single);
+                        GpuSystem.FlushDeferredReleases(ref *gpu);
                         BatchRenderer.UploadPendingAssets(ref *gpu, ref *world);
                     }
 

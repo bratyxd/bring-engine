@@ -4,13 +4,16 @@
 Because everything in Bring Engine is flat unmanaged data, **one universal `TweenSystem` animates any engine or game property** with zero OOP, zero reflection, and zero GC allocations.
 
 ### Two Binding Modes
-1. **Handle-Safe Engine Channels** (survives table compactions):
+1. **Handle-Safe Engine Channels** (survives swap-back table compactions):
    - `TweenSystem.TweenTransformPos / Scale / Rot(...)`
    - `TweenSystem.TweenCameraFov(...)` (and `CameraPosition`, `CameraOrthoHeight`, `CameraOrbitYaw`, `CameraOrbitDistance`)
-2. **Direct Unmanaged Pointer Binding** (animate ANY field of ANY struct in your game's native arenas!):
+   - `TweenSystem.TextTypewriter(...)`, `TweenSystem.TextGlowIntensity(...)`, `TweenSystem.TextColor(...)` (takes `TextHandle`)
+   - `TweenSystem.SpriteColor(...)` (takes `SpriteHandle`)
+2. **Direct Unmanaged Pointer Binding** (animate ANY field of ANY **stable, non-compacted** struct in your game's native arenas!):
    - `TweenSystem.TweenFloatPtr(ref tweens, &myState->ShieldAlpha, 0f, 1f, 0.5f, EaseType.OutBack)`
    - `TweenSystem.TweenVec3Ptr`, `TweenColorPtr`, `TweenFix32Ptr`, `PtrVec2`, `PtrVec4`, `PtrQuat`, `PtrFixVec3`
    - Also supports `TweenTargetKind.CustomCallback` with unmanaged function pointers `delegate*<uint, Vec4, void>`!
+   - **Warning**: NEVER pass pointers into swap-back compacted dense tables (`RenderComponentTables.Texts`, `RenderComponentTables.Sprites`, `TransformTable`, `CameraTable`, `TweenTable`) to `Tween*Ptr` — removing any sibling entry relocates dense elements and silently corrupts another slot! Use the handle-safe channels above (or `CustomCallback`) for dense engine components, and reserve `Tween*Ptr` for stable pinned structs (e.g. `GameSimState`, `GameViewState`, or fixed-slot `AssetRegistry.Materials`).
 
 ### Sequences, Loops, Curves & Scene Groups
 ```csharp
@@ -27,4 +30,9 @@ TweenSystem.Chain(ref tweens, t1, t2); // t2 automatically waits for t1 to finis
   - Generation-safe 32-bit `AnimPlayerHandle` (`TryGetPlayer`, `RemovePlayer`, `Crossfade`).
   - Supports `Step`, `Linear`, and `CubicSpline` channels + `AnimationSystem.Crossfade(...)`.
   - `AnimationSystem.StepAll(ref anims, dt, ref frameArena, ref scratchArena)` writes the final skinning joint matrices into `anims.FrameJointPalette` inside `FrameArena` for single-copy-pass GPU upload.
-- **2D Sprite Sheet Animation**: Register a `SpriteAnimClipData` (`Columns`, `Rows`, `StartFrame`, `FrameCount`, `Fps`, `Loop`, deduplicated automatically by `Name`) and call `SpriteAnimPlayerHandle sp = AnimationSystem.AddSpritePlayer(...)`. Read `TryGetSpritePlayer(in anims, sp)->CurrentUvRect` during view sync to update your sprite's UV sub-rect.
+- **2D Sprite Sheet Animation**: Register a `SpriteAnimClipData` (`Columns`, `Rows`, `StartFrame`, `FrameCount`, `Fps`, `Loop`, deduplicated automatically by `Name`) to receive a generation-safe 32-bit `SpriteAnimClipHandle`:
+  ```csharp
+  SpriteAnimClipHandle clip = AnimationSystem.RegisterSpriteClip(ref anims, new SpriteAnimClipData { ... });
+  SpriteAnimPlayerHandle sp = AnimationSystem.AddSpritePlayer(ref anims, entity, clip, sceneId);
+  ```
+  Read `AnimationSystem.TryGetSpritePlayer(in anims, sp)->CurrentUvRect` during view sync to update your sprite's UV sub-rect.

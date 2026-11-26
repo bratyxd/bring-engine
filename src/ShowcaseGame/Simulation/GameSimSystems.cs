@@ -30,7 +30,7 @@ public static unsafe class GameSimSystems
         s.SpawnTimer = Fix32.FromFloat(0.25f);
         s.SimTick = 0;
         s.GameOver = 0;
-        s.EventCount = 0;
+        s.EventWriteSeq = 0;
 
         for (int i = 0; i < GameSimState.MaxEnemies; i++) s.EnemyAlive[i] = 0;
         for (int i = 0; i < GameSimState.MaxProjectiles; i++) s.ProjAlive[i] = 0;
@@ -54,13 +54,13 @@ public static unsafe class GameSimSystems
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void EmitEvent(ref GameSimState s, SimEventKind kind, Vec3 pos, int value = 0)
     {
-        if (s.EventCount < GameSimState.MaxEventsPerTick)
-            s.Events[s.EventCount++] = new SimEvent { Kind = kind, Position = pos, Value = value };
+        uint slot = (uint)(s.EventWriteSeq & GameSimState.EventRingMask);
+        s.Events[slot] = new SimEvent { Kind = kind, Position = pos, Value = value };
+        s.EventWriteSeq++;
     }
 
     public static void StepFixed(ref GameSimState s, in InputState input, Fix32 dt)
     {
-        s.EventCount = 0;
         if (s.GameOver != 0) return;
 
         s.SimTick++;
