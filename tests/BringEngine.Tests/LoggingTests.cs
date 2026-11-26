@@ -18,6 +18,7 @@ public static unsafe class LoggingTests
         Assert.Run("LogSystem_Default10kFifoEvictionAndRestartPersistence", &TestDefault10kFifoAndPersistence);
         Assert.Run("LogSystem_MultipleFilesCustomLimitsAndCloseFile", &TestMultipleFilesAndCustomLimits);
         Assert.Run("LogSystem_ZeroGcInterpolatedHotLoopFilteredSkipAndMultiThread", &TestZeroGcFilteredSkipAndMultiThread);
+        Assert.Run("LogSystem_DedicatedWriterThreadAndAutoExceptionErrorLogging", &TestDedicatedThreadAndAutoExceptionLogging);
     }
 
     private static string CreateTempLogDir(string suffix)
@@ -297,5 +298,93 @@ public static unsafe class LoggingTests
 
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after zero-GC & multi-thread logging test");
         Assert.Equal(0L, NativeMemoryTracker.LiveBlocks, "Zero live native blocks after logging test");
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void ThrowHelperForAutoLogTest()
+    {
+        throw new InvalidOperationException("auto-logged-boom-42");
+    }
+
+    private static void TestDedicatedThreadAndAutoExceptionLogging()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        string tempDir = CreateTempLogDir("autoex");
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        LogState* log = alloc.Persistent.Alloc<LogState>(1, 64);
+
+        try
+        {
+            LogSystem.Start(log, ref alloc.Persistent, appName: "AutoExTest", minLevel: LogLevel.Info, directoryOverride: tempDir);
+            string defPath = LogSystem.GetFilePath(log);
+
+            // 1. Verify logger runs on its own dedicated background thread (never gameplay thread)
+            LogSystem.Flush(log);
+            int writerTid = Volatile.Read(ref log->WriterThreadId);
+            Assert.True(writerTid != 0 && writerTid != Environment.CurrentManagedThreadId,
+                $"LogWriter runs on dedicated separate thread (writer={writerTid}, caller={Environment.CurrentManagedThreadId})");
+
+            // 2. Throw a normal exception WITHOUT calling LogSystem.Error -> MUST be auto-logged as [ERROR]!
+            try
+            {
+                ThrowHelperForAutoLogTest();
+            }
+            catch (InvalidOperationException)
+            {
+                // Intentionally silent catch — engine must have logged it automatically
+            }
+
+            // 3. OperationCanceledException is skipped by default (normal HTTP/WS cancel flow, not an error)
+            try
+            {
+                throw new OperationCanceledException("expected-cancel-skip");
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            // 4. Explicit LogSystem.LogException helper with context
+            try
+            {
+                throw new ArgumentException("bad-slot-arg");
+            }
+            catch (ArgumentException ex)
+            {
+                LogSystem.LogException(log, ex, "ManualContext");
+            }
+
+            LogSystem.Flush(log);
+
+            string[] lines = ReadAllLinesShared(defPath);
+            bool sawAutoBoom = false;
+            bool sawCancel = false;
+            bool sawManualCtx = false;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].Contains("[ERROR] [Exception] InvalidOperationException: auto-logged-boom-42", StringComparison.Ordinal) &&
+                    lines[i].Contains("ThrowHelperForAutoLogTest", StringComparison.Ordinal))
+                    sawAutoBoom = true;
+                if (lines[i].Contains("expected-cancel-skip", StringComparison.Ordinal))
+                    sawCancel = true;
+                if (lines[i].Contains("[ERROR] [Exception] ManualContext | ArgumentException: bad-slot-arg", StringComparison.Ordinal))
+                    sawManualCtx = true;
+            }
+
+            Assert.True(sawAutoBoom, "Thrown exception automatically logged as [ERROR] with throw site without user call");
+            Assert.True(!sawCancel, "Expected OperationCanceledException skipped by default");
+            Assert.True(sawManualCtx, "Explicit LogSystem.LogException logged with context");
+            Assert.True(log->TotalExceptionsLogged.Value >= 2, "TotalExceptionsLogged tracked");
+        }
+        finally
+        {
+            LogSystem.Stop(log);
+            alloc.Dispose();
+            TryDeleteDir(tempDir);
+        }
+
+        // 5. After Stop(), exception hooks are detached cleanly -> throwing causes no crash/error
+        try { throw new InvalidOperationException("post-stop-safe"); } catch (InvalidOperationException) { }
+
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after auto-exception logging test");
     }
 }

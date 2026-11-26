@@ -150,6 +150,7 @@ public unsafe struct SaveSystemState
     public int MaxSaveBytes;
     public int PoolSlot;
     public byte Active;
+    public int WorkerThreadId;
     internal int ShutdownFlag;
 
     public CachePaddedInt PendingCount;
@@ -555,6 +556,7 @@ public static unsafe class SaveSystem
     private static void WorkerEntry(object? arg)
     {
         SaveSystemState* state = (SaveSystemState*)(nint)arg!;
+        Volatile.Write(ref state->WorkerThreadId, Environment.CurrentManagedThreadId);
         int poolSlot = state->PoolSlot;
         AutoResetEvent wakeEvt = s_pools[poolSlot].WakeEvent!;
         string savesDir = s_pools[poolSlot].SavesDirectory!;

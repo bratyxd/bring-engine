@@ -325,7 +325,7 @@ public static unsafe class SaveSystemTests
         {
             SaveSystem.Start(saves, ref alloc.Persistent, appName: "AsyncSaveTest", directoryOverride: tempDir);
 
-            // 1. Strict FIFO ordering: back-to-back saves + load on same slot never race
+            // 1. Strict FIFO ordering & dedicated background SaveWorker thread verification
             SaveOpHandle h1 = SaveSystem.SaveAsync(saves, "auto.bsav", "{\"gen\":1}"u8, schemaVersion: 1, userTag: 11UL);
             SaveOpHandle h2 = SaveSystem.SaveAsync(saves, "auto.bsav", "{\"gen\":2}"u8, schemaVersion: 2, userTag: 22UL);
             SaveOpHandle h3 = SaveSystem.LoadAsync(saves, "auto.bsav", userTag: 33UL);
@@ -334,6 +334,9 @@ public static unsafe class SaveSystemTests
             SaveResult r1 = WaitSaveResult(saves, h1);
             SaveResult r2 = WaitSaveResult(saves, h2);
             SaveResult r3 = WaitSaveResult(saves, h3);
+            int workerTid = Volatile.Read(ref saves->WorkerThreadId);
+            Assert.True(workerTid != 0 && workerTid != Environment.CurrentManagedThreadId,
+                $"SaveWorker runs on dedicated separate thread (worker={workerTid}, caller={Environment.CurrentManagedThreadId})");
             try
             {
                 Assert.True(r1.IsSuccess && r2.IsSuccess && r3.IsSuccess, "All 3 FIFO ops succeeded");

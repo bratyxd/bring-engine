@@ -34,7 +34,9 @@ Do **not** blindly use one format for everything — choose the lane that matche
 
 ---
 
-## 3. Crash Safety & Automatic Corruption Recovery
+## 3. Dedicated Background Thread, Crash Safety & Automatic Corruption Recovery
+
+- **Dedicated Background I/O Thread (`BringEngine.SaveWorker`)**: All async operations (`SaveAsync`, `SaveRawAsync`, `LoadAsync`, `LoadRawAsync`, `DeleteAsync`) run compression (LZ4/Brotli), CRC32, and atomic disk writes strictly off the Logic/Render threads on a dedicated FIFO worker thread (`saves->WorkerThreadId`) so autosaving never stalls gameplay and back-to-back writes to the same slot can never race. Reserve `SaveSync`/`LoadSync` strictly for cold startup (`settings.json` before window init) or shutdown.
 
 Every save mode (Raw and `BSAV`) runs crash-safe atomic disk I/O automatically:
 1. Write full bytes to `<slot>.tmp` in the `Saves/` folder and `Flush(flushToDisk: true)`.
