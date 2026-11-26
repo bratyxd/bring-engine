@@ -47,6 +47,7 @@ public unsafe struct MeshAssetData
     public Bounds3 LocalBounds;
     public byte HasSkinning;
     public int GpuSlot; // -1 if not uploaded to GPU
+    public uint GpuSlotGen;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -65,6 +66,7 @@ public unsafe struct TextureAssetData
     public byte ClampEdge;
     public byte NearestFilter;
     public int GpuSlot;              // -1 if not uploaded to GPU
+    public uint GpuSlotGen;
 }
 
 /// <summary>
@@ -298,6 +300,7 @@ public static unsafe class AssetSystem
                 reg.Meshes[i] = data;
                 reg.Meshes[i].Handle = h;
                 reg.Meshes[i].GpuSlot = -1;
+                reg.Meshes[i].GpuSlotGen = 0;
                 if (data.Name.IsValid) reg.MeshByName.Set(data.Name.Value, h.Raw);
                 return h;
             }
@@ -310,6 +313,13 @@ public static unsafe class AssetSystem
         if (data.Width <= 0 || data.Height <= 0)
             throw new ArgumentOutOfRangeException(nameof(data), "Texture width and height must be > 0.");
 
+        TexturePixelFormat fmt = (data.Format == TexturePixelFormat.Rgba8 && data.Channels == 1)
+            ? TexturePixelFormat.R8
+            : data.Format;
+        int dataBytes = data.DataBytes <= 0
+            ? TextureCompressionSystem.CalcByteSize(fmt, data.Width, data.Height)
+            : data.DataBytes;
+
         for (int i = 0; i < reg.MaxTextures; i++)
         {
             if (reg.TextureAlive[i] == 0)
@@ -320,10 +330,9 @@ public static unsafe class AssetSystem
                 reg.Textures[i] = data;
                 reg.Textures[i].Handle = h;
                 reg.Textures[i].GpuSlot = -1;
-                if (reg.Textures[i].Format == TexturePixelFormat.Rgba8 && reg.Textures[i].Channels == 1)
-                    reg.Textures[i].Format = TexturePixelFormat.R8;
-                if (reg.Textures[i].DataBytes <= 0)
-                    reg.Textures[i].DataBytes = TextureCompressionSystem.CalcByteSize(reg.Textures[i].Format, reg.Textures[i].Width, reg.Textures[i].Height);
+                reg.Textures[i].GpuSlotGen = 0;
+                reg.Textures[i].Format = fmt;
+                reg.Textures[i].DataBytes = dataBytes;
                 if (data.Name.IsValid) reg.TextureByName.Set(data.Name.Value, h.Raw);
                 return h;
             }
@@ -461,6 +470,85 @@ public static unsafe class AssetSystem
     }
 
     /// <summary>
+    /// Resets GpuSlot and GpuSlotGen on all live meshes and textures (called when disposing GpuContext).
+    /// </summary>
+    public static void ResetAllGpuSlots(ref AssetRegistry reg)
+    {
+        for (int i = 0; i < reg.MaxMeshes; i++)
+        {
+            if (reg.MeshAlive[i] != 0)
+            {
+                reg.Meshes[i].GpuSlot = -1;
+                reg.Meshes[i].GpuSlotGen = 0;
+            }
+        }
+        for (int i = 0; i < reg.MaxTextures; i++)
+        {
+            if (reg.TextureAlive[i] != 0)
+            {
+                reg.Textures[i].GpuSlot = -1;
+                reg.Textures[i].GpuSlotGen = 0;
+            }
+        }
+    }
+
+    internal static void UnregisterMesh(ref AssetRegistry reg, MeshHandle h)
+    {
+        if (!h.IsValid || h.Index >= (uint)reg.MaxMeshes) return;
+        uint i = h.Index;
+        if (reg.MeshAlive[i] == 0 || reg.MeshGens[i] != h.Generation) return;
+        if (reg.Meshes[i].GpuSlot >= 0 && reg.ReleaseGpuMesh != null)
+            reg.ReleaseGpuMesh(reg.GpuContextPtr, reg.Meshes[i].GpuSlot);
+        reg.Meshes[i].GpuSlot = -1;
+        reg.Meshes[i].GpuSlotGen = 0;
+        if (reg.Meshes[i].Name.IsValid && reg.MeshByName.TryGet(reg.Meshes[i].Name.Value, out uint cur) && cur == h.Raw)
+            reg.MeshByName.Remove(reg.Meshes[i].Name.Value);
+        reg.MeshAlive[i] = 0;
+        reg.LiveMeshCount--;
+        reg.MeshGens[i] = HandlePacking.NextGeneration(reg.MeshGens[i]);
+    }
+
+    internal static void UnregisterTexture(ref AssetRegistry reg, TextureHandle h)
+    {
+        if (!h.IsValid || h.Index >= (uint)reg.MaxTextures) return;
+        uint i = h.Index;
+        if (reg.TextureAlive[i] == 0 || reg.TextureGens[i] != h.Generation) return;
+        if (reg.Textures[i].GpuSlot >= 0 && reg.ReleaseGpuTexture != null)
+            reg.ReleaseGpuTexture(reg.GpuContextPtr, reg.Textures[i].GpuSlot);
+        reg.Textures[i].GpuSlot = -1;
+        reg.Textures[i].GpuSlotGen = 0;
+        if (reg.Textures[i].Name.IsValid && reg.TextureByName.TryGet(reg.Textures[i].Name.Value, out uint cur) && cur == h.Raw)
+            reg.TextureByName.Remove(reg.Textures[i].Name.Value);
+        reg.TextureAlive[i] = 0;
+        reg.LiveTextureCount--;
+        reg.TextureGens[i] = HandlePacking.NextGeneration(reg.TextureGens[i]);
+    }
+
+    internal static void UnregisterMaterial(ref AssetRegistry reg, MaterialHandle h)
+    {
+        if (!h.IsValid || h.Index >= (uint)reg.MaxMaterials) return;
+        uint i = h.Index;
+        if (reg.MaterialAlive[i] == 0 || reg.MaterialGens[i] != h.Generation) return;
+        if (reg.Materials[i].Name.IsValid && reg.MaterialByName.TryGet(reg.Materials[i].Name.Value, out uint cur) && cur == h.Raw)
+            reg.MaterialByName.Remove(reg.Materials[i].Name.Value);
+        reg.MaterialAlive[i] = 0;
+        reg.LiveMaterialCount--;
+        reg.MaterialGens[i] = HandlePacking.NextGeneration(reg.MaterialGens[i]);
+    }
+
+    internal static void UnregisterFont(ref AssetRegistry reg, FontHandle h)
+    {
+        if (!h.IsValid || h.Index >= (uint)reg.MaxFonts) return;
+        uint i = h.Index;
+        if (reg.FontAlive[i] == 0 || reg.FontGens[i] != h.Generation) return;
+        if (reg.Fonts[i].Name.IsValid && reg.FontByName.TryGet(reg.Fonts[i].Name.Value, out uint cur) && cur == h.Raw)
+            reg.FontByName.Remove(reg.Fonts[i].Name.Value);
+        reg.FontAlive[i] = 0;
+        reg.LiveFontCount--;
+        reg.FontGens[i] = HandlePacking.NextGeneration(reg.FontGens[i]);
+    }
+
+    /// <summary>
     /// Releases all CPU metadata and GPU resources owned by a bundle.
     /// Called immediately before the bundle's LinearArena is disposed.
     /// </summary>
@@ -472,12 +560,13 @@ public static unsafe class AssetSystem
             {
                 if (reg.Meshes[i].GpuSlot >= 0 && reg.ReleaseGpuMesh != null)
                     reg.ReleaseGpuMesh(reg.GpuContextPtr, reg.Meshes[i].GpuSlot);
+                reg.Meshes[i].GpuSlot = -1;
+                reg.Meshes[i].GpuSlotGen = 0;
                 if (reg.Meshes[i].Name.IsValid && reg.MeshByName.TryGet(reg.Meshes[i].Name.Value, out uint cur) && cur == reg.Meshes[i].Handle.Raw)
                     reg.MeshByName.Remove(reg.Meshes[i].Name.Value);
                 reg.MeshAlive[i] = 0;
                 reg.LiveMeshCount--;
-                uint g = (reg.MeshGens[i] + 1) & HandlePacking.GenerationMask;
-                reg.MeshGens[i] = g == 0 ? 1u : g;
+                reg.MeshGens[i] = HandlePacking.NextGeneration(reg.MeshGens[i]);
             }
         }
         for (int i = 0; i < reg.MaxTextures; i++)
@@ -486,12 +575,13 @@ public static unsafe class AssetSystem
             {
                 if (reg.Textures[i].GpuSlot >= 0 && reg.ReleaseGpuTexture != null)
                     reg.ReleaseGpuTexture(reg.GpuContextPtr, reg.Textures[i].GpuSlot);
+                reg.Textures[i].GpuSlot = -1;
+                reg.Textures[i].GpuSlotGen = 0;
                 if (reg.Textures[i].Name.IsValid && reg.TextureByName.TryGet(reg.Textures[i].Name.Value, out uint cur) && cur == reg.Textures[i].Handle.Raw)
                     reg.TextureByName.Remove(reg.Textures[i].Name.Value);
                 reg.TextureAlive[i] = 0;
                 reg.LiveTextureCount--;
-                uint g = (reg.TextureGens[i] + 1) & HandlePacking.GenerationMask;
-                reg.TextureGens[i] = g == 0 ? 1u : g;
+                reg.TextureGens[i] = HandlePacking.NextGeneration(reg.TextureGens[i]);
             }
         }
         for (int i = 0; i < reg.MaxMaterials; i++)
@@ -502,8 +592,7 @@ public static unsafe class AssetSystem
                     reg.MaterialByName.Remove(reg.Materials[i].Name.Value);
                 reg.MaterialAlive[i] = 0;
                 reg.LiveMaterialCount--;
-                uint g = (reg.MaterialGens[i] + 1) & HandlePacking.GenerationMask;
-                reg.MaterialGens[i] = g == 0 ? 1u : g;
+                reg.MaterialGens[i] = HandlePacking.NextGeneration(reg.MaterialGens[i]);
             }
         }
         for (int i = 0; i < reg.MaxFonts; i++)
@@ -514,8 +603,7 @@ public static unsafe class AssetSystem
                     reg.FontByName.Remove(reg.Fonts[i].Name.Value);
                 reg.FontAlive[i] = 0;
                 reg.LiveFontCount--;
-                uint g = (reg.FontGens[i] + 1) & HandlePacking.GenerationMask;
-                reg.FontGens[i] = g == 0 ? 1u : g;
+                reg.FontGens[i] = HandlePacking.NextGeneration(reg.FontGens[i]);
             }
         }
         for (int i = 0; i < reg.MaxGltfModels; i++)
@@ -526,8 +614,7 @@ public static unsafe class AssetSystem
                     reg.GltfByName.Remove(reg.GltfModels[i].Name.Value);
                 reg.GltfAlive[i] = 0;
                 reg.LiveGltfCount--;
-                uint g = (reg.GltfGens[i] + 1) & HandlePacking.GenerationMask;
-                reg.GltfGens[i] = g == 0 ? 1u : g;
+                reg.GltfGens[i] = HandlePacking.NextGeneration(reg.GltfGens[i]);
             }
         }
         for (int i = 0; i < reg.MaxSpriteRegions; i++)

@@ -52,7 +52,7 @@ public unsafe struct GameViewState
     public EntityId FloorRuneEntity;
     public SpriteHandle FloorRuneSprite;
     public SpriteAnimPlayerHandle FloorRuneAnim;
-    public int PickupStarClipIndex;
+    public SpriteAnimClipHandle PickupStarClip;
     public MaterialHandle CoreMaterial;
 
     public EmitterHandle PlayerTrailEmitter;

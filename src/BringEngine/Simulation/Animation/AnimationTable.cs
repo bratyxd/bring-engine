@@ -37,6 +37,7 @@ public struct AnimChannelData
     public int SamplerIndex;
     public int TargetJointIndex;
     public AnimTargetPath Path;
+    public short TargetSkinPlusOne; // 0 = any/all skins; skinIdx + 1 = targets glTF skin skinIdx
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -63,6 +64,7 @@ public unsafe struct SkeletonData
     public Vec3* BindPositions;
     public Quat* BindRotations;
     public Vec3* BindScales;
+    public short SkinIndexPlusOne;    // 0 = any/untagged; skinIdx + 1 = glTF skin skinIdx
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -88,6 +90,7 @@ public struct AnimPlayerData
 [StructLayout(LayoutKind.Sequential)]
 public struct SpriteAnimClipData
 {
+    public SpriteAnimClipHandle Handle;
     public StringId Name;
     public SceneId OwnerScene;
     public BundleId OwnerBundle;
@@ -105,7 +108,7 @@ public struct SpriteAnimPlayerData
     public SpriteAnimPlayerHandle Handle;
     public EntityId Entity;
     public SceneId OwnerScene;
-    public int ClipIndex;
+    public SpriteAnimClipHandle Clip;
     public float Time;
     public float Speed;
     public int CurrentFrame;
@@ -140,6 +143,7 @@ public unsafe struct AnimationTable
     public int PlayerNextSlot;
 
     public SpriteAnimClipData* SpriteClips;
+    public uint* SpriteClipGens;
     public byte* SpriteClipAlive;
     public int SpriteClipCount;
     public int MaxSpriteClips;
@@ -155,6 +159,8 @@ public unsafe struct AnimationTable
 
     // Populated each frame in FrameArena during AnimationSystem.StepAll
     public NativeSlice<Mat4> FrameJointPalette;
+    public byte* FrameJointPaletteArenaBase;
+    public uint FrameJointPaletteArenaReset;
 
     public static AnimationTable Create(
         ref LinearArena arena,
@@ -164,10 +170,24 @@ public unsafe struct AnimationTable
         int maxSpriteClips = 256,
         int maxSpritePlayers = 2048)
     {
+        const int maxCap = (int)(HandlePacking.IndexMask + 1u);
+        if (maxSkeletons < 1 || maxSkeletons > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxSkeletons), maxSkeletons, $"Capacity must be in [1, {maxCap}].");
+        if (maxClips < 1 || maxClips > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxClips), maxClips, $"Capacity must be in [1, {maxCap}].");
+        if (maxPlayers < 1 || maxPlayers > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxPlayers), maxPlayers, $"Capacity must be in [1, {maxCap}].");
+        if (maxSpriteClips < 1 || maxSpriteClips > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxSpriteClips), maxSpriteClips, $"Capacity must be in [1, {maxCap}].");
+        if (maxSpritePlayers < 1 || maxSpritePlayers > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxSpritePlayers), maxSpritePlayers, $"Capacity must be in [1, {maxCap}].");
+
         uint* skelGens = arena.AllocUninitialized<uint>(maxSkeletons, 16);
         for (int i = 0; i < maxSkeletons; i++) skelGens[i] = 1;
         uint* clipGens = arena.AllocUninitialized<uint>(maxClips, 16);
         for (int i = 0; i < maxClips; i++) clipGens[i] = 1;
+        uint* spriteClipGens = arena.AllocUninitialized<uint>(maxSpriteClips, 16);
+        for (int i = 0; i < maxSpriteClips; i++) spriteClipGens[i] = 1;
 
         int* pSlotToDense = arena.AllocUninitialized<int>(maxPlayers, 64);
         uint* pGens = arena.AllocUninitialized<uint>(maxPlayers, 64);
@@ -199,6 +219,7 @@ public unsafe struct AnimationTable
             PlayerNextSlot = 0,
 
             SpriteClips = arena.Alloc<SpriteAnimClipData>(maxSpriteClips, 64),
+            SpriteClipGens = spriteClipGens,
             SpriteClipAlive = arena.Alloc<byte>(maxSpriteClips, 16),
             SpriteClipCount = 0,
             MaxSpriteClips = maxSpriteClips,
@@ -212,6 +233,8 @@ public unsafe struct AnimationTable
             SpritePlayerFreeCount = 0,
             SpritePlayerNextSlot = 0,
             FrameJointPalette = default,
+            FrameJointPaletteArenaBase = null,
+            FrameJointPaletteArenaReset = 0,
         };
     }
 }
@@ -220,6 +243,17 @@ public static unsafe class AnimationSystem
 {
     public static SkeletonHandle RegisterSkeleton(ref AnimationTable table, in SkeletonData data)
     {
+        if (data.JointCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(data), data.JointCount, "Skeleton JointCount must be >= 0.");
+        if (data.JointCount > 0)
+        {
+            if (data.ParentIndices == null) throw new ArgumentNullException(nameof(data), "Skeleton ParentIndices must not be null when JointCount > 0.");
+            if (data.InverseBindMatrices == null) throw new ArgumentNullException(nameof(data), "Skeleton InverseBindMatrices must not be null when JointCount > 0.");
+            if (data.BindPositions == null) throw new ArgumentNullException(nameof(data), "Skeleton BindPositions must not be null when JointCount > 0.");
+            if (data.BindRotations == null) throw new ArgumentNullException(nameof(data), "Skeleton BindRotations must not be null when JointCount > 0.");
+            if (data.BindScales == null) throw new ArgumentNullException(nameof(data), "Skeleton BindScales must not be null when JointCount > 0.");
+        }
+
         for (int i = 0; i < table.MaxSkeletons; i++)
         {
             if (table.SkeletonAlive[i] == 0)
@@ -250,15 +284,33 @@ public static unsafe class AnimationSystem
         throw new OutOfMemoryException("AnimationTable clip slots exhausted.");
     }
 
+    internal static void UnregisterSkeleton(ref AnimationTable table, SkeletonHandle handle)
+    {
+        if (!handle.IsValid || handle.Index >= (uint)table.MaxSkeletons) return;
+        uint i = handle.Index;
+        if (table.SkeletonAlive[i] == 0 || table.SkeletonGens[i] != handle.Generation) return;
+        table.SkeletonAlive[i] = 0;
+        table.SkeletonGens[i] = HandlePacking.NextGeneration(table.SkeletonGens[i]);
+    }
+
+    internal static void UnregisterClip(ref AnimationTable table, AnimClipHandle handle)
+    {
+        if (!handle.IsValid || handle.Index >= (uint)table.MaxClips) return;
+        uint i = handle.Index;
+        if (table.ClipAlive[i] == 0 || table.ClipGens[i] != handle.Generation) return;
+        table.ClipAlive[i] = 0;
+        table.ClipGens[i] = HandlePacking.NextGeneration(table.ClipGens[i]);
+    }
+
     public static void UnregisterByBundle(ref AnimationTable table, BundleId bundle)
     {
+        if (!bundle.IsValid) return;
         for (int i = 0; i < table.MaxSkeletons; i++)
         {
             if (table.SkeletonAlive[i] != 0 && table.Skeletons[i].OwnerBundle == bundle)
             {
                 table.SkeletonAlive[i] = 0;
-                uint g = (table.SkeletonGens[i] + 1) & HandlePacking.GenerationMask;
-                table.SkeletonGens[i] = g == 0 ? 1u : g;
+                table.SkeletonGens[i] = HandlePacking.NextGeneration(table.SkeletonGens[i]);
             }
         }
         for (int i = 0; i < table.MaxClips; i++)
@@ -266,19 +318,16 @@ public static unsafe class AnimationSystem
             if (table.ClipAlive[i] != 0 && table.Clips[i].OwnerBundle == bundle)
             {
                 table.ClipAlive[i] = 0;
-                uint g = (table.ClipGens[i] + 1) & HandlePacking.GenerationMask;
-                table.ClipGens[i] = g == 0 ? 1u : g;
+                table.ClipGens[i] = HandlePacking.NextGeneration(table.ClipGens[i]);
             }
         }
-        if (bundle.IsValid)
+        for (int i = 0; i < table.MaxSpriteClips; i++)
         {
-            for (int i = 0; i < table.MaxSpriteClips; i++)
+            if (table.SpriteClipAlive[i] != 0 && table.SpriteClips[i].OwnerBundle == bundle)
             {
-                if (table.SpriteClipAlive[i] != 0 && table.SpriteClips[i].OwnerBundle == bundle)
-                {
-                    table.SpriteClipAlive[i] = 0;
-                    table.SpriteClipCount--;
-                }
+                table.SpriteClipAlive[i] = 0;
+                table.SpriteClipCount--;
+                table.SpriteClipGens[i] = HandlePacking.NextGeneration(table.SpriteClipGens[i]);
             }
         }
     }
@@ -407,30 +456,52 @@ public static unsafe class AnimationSystem
         return AnimPlayerHandle.Invalid;
     }
 
-    public static int RegisterSpriteClip(ref AnimationTable table, in SpriteAnimClipData clip)
+    public static SpriteAnimClipHandle RegisterSpriteClip(ref AnimationTable table, in SpriteAnimClipData clip)
     {
         if (clip.Name.Value != 0)
         {
             for (int i = 0; i < table.MaxSpriteClips; i++)
             {
-                if (table.SpriteClipAlive[i] != 0 && table.SpriteClips[i].Name == clip.Name)
-                    return i;
+                if (table.SpriteClipAlive[i] != 0)
+                {
+                    ref readonly SpriteAnimClipData existing = ref table.SpriteClips[i];
+                    if (existing.Name == clip.Name &&
+                        existing.OwnerScene == clip.OwnerScene &&
+                        existing.OwnerBundle == clip.OwnerBundle &&
+                        existing.Columns == clip.Columns &&
+                        existing.Rows == clip.Rows &&
+                        existing.StartFrame == clip.StartFrame &&
+                        existing.FrameCount == clip.FrameCount)
+                    {
+                        return existing.Handle;
+                    }
+                }
             }
         }
         for (int i = 0; i < table.MaxSpriteClips; i++)
         {
             if (table.SpriteClipAlive[i] == 0)
             {
+                var h = SpriteAnimClipHandle.Create((uint)i, table.SpriteClipGens[i]);
                 table.SpriteClipAlive[i] = 1;
                 table.SpriteClips[i] = clip;
+                table.SpriteClips[i].Handle = h;
                 table.SpriteClipCount++;
-                return i;
+                return h;
             }
         }
         throw new OutOfMemoryException("SpriteAnimClips exhausted.");
     }
 
-    public static SpriteAnimPlayerHandle AddSpritePlayer(ref AnimationTable table, EntityId entity, int clipIndex, SceneId scene = default, float speed = 1f)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static SpriteAnimClipData* TryGetSpriteClip(in AnimationTable table, SpriteAnimClipHandle handle)
+    {
+        if (!handle.IsValid || handle.Index >= (uint)table.MaxSpriteClips) return null;
+        if (table.SpriteClipAlive[handle.Index] == 0 || table.SpriteClipGens[handle.Index] != handle.Generation) return null;
+        return table.SpriteClips + handle.Index;
+    }
+
+    public static SpriteAnimPlayerHandle AddSpritePlayer(ref AnimationTable table, EntityId entity, SpriteAnimClipHandle clip, SceneId scene = default, float speed = 1f)
     {
         uint slot;
         if (table.SpritePlayerFreeCount > 0)
@@ -452,7 +523,7 @@ public static unsafe class AnimationSystem
             Handle = handle,
             Entity = entity,
             OwnerScene = scene,
-            ClipIndex = clipIndex,
+            Clip = clip,
             Speed = speed,
             Playing = 1,
             CurrentUvRect = new Vec4(0, 0, 1, 1),
@@ -518,6 +589,7 @@ public static unsafe class AnimationSystem
                 {
                     table.SpriteClipAlive[i] = 0;
                     table.SpriteClipCount--;
+                    table.SpriteClipGens[i] = HandlePacking.NextGeneration(table.SpriteClipGens[i]);
                 }
             }
         }
@@ -537,40 +609,68 @@ public static unsafe class AnimationSystem
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool HasValidJointBuffers(SkeletonData* skel)
+        => skel->JointCount > 0
+        && skel->ParentIndices != null
+        && skel->InverseBindMatrices != null
+        && skel->BindPositions != null
+        && skel->BindRotations != null
+        && skel->BindScales != null;
+
     /// <summary>
     /// Advances skeletal & sprite animation players and builds the frame joint skinning palette in FrameArena.
     /// Zero GC allocations.
     /// </summary>
     public static void StepAll(ref AnimationTable table, float dt, ref LinearArena frameArena, ref LinearArena scratchArena)
     {
+        if (!float.IsFinite(dt) || dt < 0f)
+            dt = 0f;
+
         // 1. Compute total joints needed this frame
-        int totalJoints = 0;
+        long totalJoints = 0;
         for (int i = 0; i < table.PlayerCount; i++)
         {
             SkeletonData* skel = TryGetSkeleton(in table, table.Players[i].Skeleton);
-            if (skel != null) totalJoints += skel->JointCount;
+            if (skel != null && HasValidJointBuffers(skel))
+                totalJoints += skel->JointCount;
         }
+        if (totalJoints > int.MaxValue)
+            throw new OverflowException($"Total active skeleton joints ({totalJoints}) exceeds int.MaxValue.");
 
-        table.FrameJointPalette = totalJoints > 0
-            ? frameArena.AllocSlice<Mat4>(totalJoints, 64, zeroed: false)
-            : default;
+        if (totalJoints > 0)
+        {
+            table.FrameJointPalette = frameArena.AllocSlice<Mat4>((int)totalJoints, 64, zeroed: false);
+            table.FrameJointPaletteArenaBase = frameArena.BasePtr;
+            table.FrameJointPaletteArenaReset = frameArena.ResetCount;
+        }
+        else
+        {
+            table.FrameJointPalette = default;
+            table.FrameJointPaletteArenaBase = null;
+            table.FrameJointPaletteArenaReset = 0;
+        }
 
         int jointCursor = 0;
         for (int i = 0; i < table.PlayerCount; i++)
         {
             ref AnimPlayerData p = ref table.Players[i];
             SkeletonData* skel = TryGetSkeleton(in table, p.Skeleton);
-            if (skel == null)
+            if (skel == null || !HasValidJointBuffers(skel))
             {
                 p.FrameJointOffset = 0;
                 p.FrameJointCount = 0;
                 continue;
             }
 
+            if (!float.IsFinite(p.Time)) p.Time = 0f;
+            if (!float.IsFinite(p.NextTime)) p.NextTime = 0f;
+
             AnimClipData* clip = TryGetClip(in table, p.Clip);
-            if (p.Playing != 0 && clip != null && clip->Duration > 0f)
+            if (p.Playing != 0 && dt > 0f && float.IsFinite(p.Speed) && clip != null && clip->Duration > 0f)
             {
                 p.Time += dt * p.Speed;
+                if (!float.IsFinite(p.Time)) p.Time = 0f;
                 if (p.Loop != 0)
                 {
                     p.Time %= clip->Duration;
@@ -586,11 +686,12 @@ public static unsafe class AnimationSystem
             AnimClipData* nextClip = TryGetClip(in table, p.NextClip);
             if (nextClip != null && p.CrossfadeDuration > 0f)
             {
-                if (p.Playing != 0)
+                if (p.Playing != 0 && dt > 0f)
                 {
-                    if (nextClip->Duration > 0f)
+                    if (float.IsFinite(p.Speed) && nextClip->Duration > 0f)
                     {
                         p.NextTime += dt * p.Speed;
+                        if (!float.IsFinite(p.NextTime)) p.NextTime = 0f;
                         if (p.Loop != 0)
                         {
                             p.NextTime %= nextClip->Duration;
@@ -617,112 +718,180 @@ public static unsafe class AnimationSystem
             }
 
             int jc = skel->JointCount;
-            if (jc <= 0)
-            {
-                p.FrameJointOffset = jointCursor;
-                p.FrameJointCount = 0;
-                continue;
-            }
-
             ArenaMarker mark = scratchArena.SaveMarker();
-            Vec3* pos = scratchArena.AllocUninitialized<Vec3>(jc, 16);
-            Quat* rot = scratchArena.AllocUninitialized<Quat>(jc, 16);
-            Vec3* scl = scratchArena.AllocUninitialized<Vec3>(jc, 16);
-            Mat4* localMats = scratchArena.AllocUninitialized<Mat4>(jc, 64);
-            Mat4* worldMats = scratchArena.AllocUninitialized<Mat4>(jc, 64);
-            byte* computed = scratchArena.Alloc<byte>(jc, 16);
-
-            for (int j = 0; j < jc; j++)
+            try
             {
-                pos[j] = skel->BindPositions[j];
-                rot[j] = skel->BindRotations[j];
-                scl[j] = skel->BindScales[j];
-            }
+                Vec3* pos = scratchArena.AllocUninitialized<Vec3>(jc, 16);
+                Quat* rot = scratchArena.AllocUninitialized<Quat>(jc, 16);
+                Vec3* scl = scratchArena.AllocUninitialized<Vec3>(jc, 16);
+                Mat4* localMats = scratchArena.AllocUninitialized<Mat4>(jc, 64);
+                Mat4* worldMats = scratchArena.AllocUninitialized<Mat4>(jc, 64);
+                byte* computed = scratchArena.Alloc<byte>(jc, 16);
 
-            if (clip != null)
-                SampleClipIntoPose(clip, p.Time, pos, rot, scl, jc, weight: 1f);
-
-            if (nextClip != null && blendAlpha > 0f)
-                SampleClipIntoPose(nextClip, p.NextTime, pos, rot, scl, jc, weight: blendAlpha);
-
-            p.FrameJointOffset = jointCursor;
-            p.FrameJointCount = jc;
-
-            bool anyUnresolved = false;
-            for (int j = 0; j < jc; j++)
-            {
-                localMats[j] = Mat4.CreateTRS(pos[j], rot[j], scl[j]);
-                int parent = skel->ParentIndices[j];
-                if ((uint)parent >= (uint)jc || parent == j)
-                {
-                    worldMats[j] = localMats[j];
-                    computed[j] = 2;
-                }
-                else if (parent < j && computed[parent] == 2)
-                {
-                    worldMats[j] = Mat4.Multiply(in worldMats[parent], in localMats[j]);
-                    computed[j] = 2;
-                }
-                else
-                {
-                    anyUnresolved = true;
-                }
-            }
-
-            if (anyUnresolved)
-            {
-                int* stack = scratchArena.AllocUninitialized<int>(jc, 16);
                 for (int j = 0; j < jc; j++)
                 {
-                    if (computed[j] == 2) continue;
-                    int sp = 0;
-                    int cur = j;
-                    while (true)
+                    pos[j] = skel->BindPositions[j];
+                    rot[j] = skel->BindRotations[j];
+                    scl[j] = skel->BindScales[j];
+                }
+
+                if (clip != null)
+                    SampleClipIntoPose(clip, p.Time, pos, rot, scl, jc, weight: 1f, skel->SkinIndexPlusOne);
+
+                if (nextClip != null && blendAlpha > 0f)
+                {
+                    Vec3* posB = scratchArena.AllocUninitialized<Vec3>(jc, 16);
+                    Quat* rotB = scratchArena.AllocUninitialized<Quat>(jc, 16);
+                    Vec3* sclB = scratchArena.AllocUninitialized<Vec3>(jc, 16);
+                    for (int j = 0; j < jc; j++)
                     {
-                        computed[cur] = 1;
-                        stack[sp++] = cur;
-                        int parent = skel->ParentIndices[cur];
-                        if ((uint)parent >= (uint)jc || parent == cur || computed[parent] == 2 || computed[parent] == 1)
-                            break;
-                        cur = parent;
+                        posB[j] = skel->BindPositions[j];
+                        rotB[j] = skel->BindRotations[j];
+                        sclB[j] = skel->BindScales[j];
                     }
-                    for (int s = sp - 1; s >= 0; s--)
+                    SampleClipIntoPose(nextClip, p.NextTime, posB, rotB, sclB, jc, weight: 1f, skel->SkinIndexPlusOne);
+                    for (int j = 0; j < jc; j++)
                     {
-                        int node = stack[s];
-                        int parent = skel->ParentIndices[node];
-                        worldMats[node] = ((uint)parent < (uint)jc && computed[parent] == 2)
-                            ? Mat4.Multiply(in worldMats[parent], in localMats[node])
-                            : localMats[node];
-                        computed[node] = 2;
+                        pos[j] = Vec3.Lerp(pos[j], posB[j], blendAlpha);
+                        rot[j] = Quat.Slerp(rot[j], rotB[j], blendAlpha);
+                        scl[j] = Vec3.Lerp(scl[j], sclB[j], blendAlpha);
                     }
                 }
+
+                bool anyUnresolved = false;
+                for (int j = 0; j < jc; j++)
+                {
+                    localMats[j] = Mat4.CreateTRS(pos[j], rot[j], scl[j]);
+                    int parent = skel->ParentIndices[j];
+                    if ((uint)parent >= (uint)jc || parent == j)
+                    {
+                        worldMats[j] = localMats[j];
+                        computed[j] = 2;
+                    }
+                    else if (parent < j && computed[parent] == 2)
+                    {
+                        worldMats[j] = Mat4.Multiply(in worldMats[parent], in localMats[j]);
+                        computed[j] = 2;
+                    }
+                    else
+                    {
+                        anyUnresolved = true;
+                    }
+                }
+
+                if (anyUnresolved)
+                {
+                    int* stack = scratchArena.AllocUninitialized<int>(jc, 16);
+                    for (int j = 0; j < jc; j++)
+                    {
+                        if (computed[j] == 2) continue;
+                        int sp = 0;
+                        int cur = j;
+                        while (true)
+                        {
+                            computed[cur] = 1;
+                            stack[sp++] = cur;
+                            int parent = skel->ParentIndices[cur];
+                            if ((uint)parent >= (uint)jc || parent == cur || computed[parent] == 2 || computed[parent] == 1)
+                                break;
+                            cur = parent;
+                        }
+                        for (int s = sp - 1; s >= 0; s--)
+                        {
+                            int node = stack[s];
+                            int parent = skel->ParentIndices[node];
+                            worldMats[node] = ((uint)parent < (uint)jc && computed[parent] == 2)
+                                ? Mat4.Multiply(in worldMats[parent], in localMats[node])
+                                : localMats[node];
+                            computed[node] = 2;
+                        }
+                    }
+                }
+
+                p.FrameJointOffset = jointCursor;
+                p.FrameJointCount = jc;
+
+                for (int j = 0; j < jc; j++)
+                    table.FrameJointPalette[jointCursor + j] = Mat4.Multiply(in worldMats[j], in skel->InverseBindMatrices[j]);
+
+                jointCursor += jc;
             }
-
-            for (int j = 0; j < jc; j++)
-                table.FrameJointPalette[jointCursor + j] = Mat4.Multiply(in worldMats[j], in skel->InverseBindMatrices[j]);
-
-            jointCursor += jc;
-            scratchArena.Rollback(mark);
+            finally
+            {
+                scratchArena.Rollback(mark);
+            }
         }
 
         // 2. Step 2D sprite sheet animations
         for (int i = 0; i < table.SpritePlayerCount; i++)
         {
             ref SpriteAnimPlayerData sp = ref table.SpritePlayers[i];
-            if ((uint)sp.ClipIndex >= (uint)table.MaxSpriteClips || table.SpriteClipAlive[sp.ClipIndex] == 0) continue;
-            ref SpriteAnimClipData clip = ref table.SpriteClips[sp.ClipIndex];
+            SpriteAnimClipData* clipPtr = TryGetSpriteClip(in table, sp.Clip);
+            if (clipPtr == null) continue;
+            ref SpriteAnimClipData clip = ref *clipPtr;
             if (clip.FrameCount <= 0 || clip.Columns <= 0 || clip.Rows <= 0) continue;
 
-            if (sp.Playing != 0)
-                sp.Time += dt * sp.Speed;
+            if (!float.IsFinite(sp.Time))
+                sp.Time = 0f;
 
-            int frameOffset = (int)MathF.Floor(sp.Time * clip.Fps);
-            if (clip.Loop != 0)
-                frameOffset = ((frameOffset % clip.FrameCount) + clip.FrameCount) % clip.FrameCount;
-            else
-                frameOffset = frameOffset < 0 ? 0 : (frameOffset >= clip.FrameCount ? clip.FrameCount - 1 : frameOffset);
+            if (sp.Playing != 0 && dt > 0f && float.IsFinite(sp.Speed))
+            {
+                double nextTime = (double)sp.Time + (double)dt * (double)sp.Speed;
+                if (!double.IsFinite(nextTime))
+                    nextTime = 0.0;
+                if (clip.Loop != 0 && float.IsFinite(clip.Fps) && clip.Fps > 0f)
+                {
+                    double period = (double)clip.FrameCount / (double)clip.Fps;
+                    if (period > 0.0 && double.IsFinite(period))
+                    {
+                        nextTime %= period;
+                        if (nextTime < 0.0) nextTime += period;
+                    }
+                }
+                sp.Time = (float)nextTime;
+                if (!float.IsFinite(sp.Time)) sp.Time = 0f;
+            }
+            else if (clip.Loop != 0 && float.IsFinite(clip.Fps) && clip.Fps > 0f)
+            {
+                double period = (double)clip.FrameCount / (double)clip.Fps;
+                if (period > 0.0 && double.IsFinite(period))
+                {
+                    double wrapped = (double)sp.Time % period;
+                    if (wrapped < 0.0) wrapped += period;
+                    sp.Time = (float)wrapped;
+                    if (!float.IsFinite(sp.Time)) sp.Time = 0f;
+                }
+            }
 
-            int frame = clip.StartFrame + frameOffset;
+            int frameOffset = 0;
+            if (float.IsFinite(clip.Fps) && clip.Fps != 0f)
+            {
+                double frameD = Math.Floor((double)sp.Time * (double)clip.Fps);
+                if (!double.IsFinite(frameD))
+                {
+                    frameOffset = 0;
+                }
+                else if (clip.Loop != 0)
+                {
+                    double fc = (double)clip.FrameCount;
+                    double mod = frameD % fc;
+                    if (mod < 0.0) mod += fc;
+                    int f = (int)mod;
+                    if (f < 0) f = 0;
+                    else if (f >= clip.FrameCount) f = clip.FrameCount - 1;
+                    frameOffset = f;
+                }
+                else
+                {
+                    if (frameD <= 0.0) frameOffset = 0;
+                    else if (frameD >= (double)(clip.FrameCount - 1)) frameOffset = clip.FrameCount - 1;
+                    else frameOffset = (int)frameD;
+                }
+            }
+
+            int startFrame = clip.StartFrame < 0 ? 0 : clip.StartFrame;
+            long frameLong = (long)startFrame + frameOffset;
+            int frame = frameLong > int.MaxValue ? int.MaxValue : (int)frameLong;
             sp.CurrentFrame = frame;
 
             int col = frame % clip.Columns;
@@ -734,11 +903,12 @@ public static unsafe class AnimationSystem
     }
 
     private static void SampleClipIntoPose(
-        AnimClipData* clip, float time, Vec3* pos, Quat* rot, Vec3* scl, int jointCount, float weight)
+        AnimClipData* clip, float time, Vec3* pos, Quat* rot, Vec3* scl, int jointCount, float weight, short skeletonSkinPlusOne)
     {
         for (int c = 0; c < clip->ChannelCount; c++)
         {
             AnimChannelData ch = clip->Channels[c];
+            if (ch.TargetSkinPlusOne != 0 && skeletonSkinPlusOne != 0 && ch.TargetSkinPlusOne != skeletonSkinPlusOne) continue;
             if ((uint)ch.TargetJointIndex >= (uint)jointCount) continue;
             if ((uint)ch.SamplerIndex >= (uint)clip->SamplerCount) continue;
             ref AnimSamplerData sampler = ref clip->Samplers[ch.SamplerIndex];

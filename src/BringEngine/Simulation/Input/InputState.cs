@@ -338,6 +338,35 @@ public unsafe struct InputState
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void ClearTextInput() => TextInputLength = 0;
 
+    /// <summary>
+    /// Applies window focus loss: marks the window unfocused and zeroes held keyboard, mouse,
+    /// and gamepad buttons + analog axes while preserving previous-frame masks so release edges
+    /// fire cleanly on the focus-lost frame.
+    /// </summary>
+    public void ApplyFocusLost()
+    {
+        SetWindowFocused(false);
+        for (int i = 0; i < 8; i++)
+            KeysDown[i] = 0;
+        MouseButtonsDown = 0;
+        ClearGamepadFocusState(ref Gamepad0);
+        ClearGamepadFocusState(ref Gamepad1);
+        ClearGamepadFocusState(ref Gamepad2);
+        ClearGamepadFocusState(ref Gamepad3);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ClearGamepadFocusState(ref GamepadState pad)
+    {
+        pad.ButtonsDown = 0;
+        pad.LeftX = 0f;
+        pad.LeftY = 0f;
+        pad.RightX = 0f;
+        pad.RightY = 0f;
+        pad.LeftTrigger = 0f;
+        pad.RightTrigger = 0f;
+    }
+
     private static int TrimToUtf8RuneBoundary(byte* buf, int start, int end)
     {
         if (end <= start) return start;
@@ -346,7 +375,7 @@ public unsafe struct InputState
         int idx = end - 1;
         while (idx >= minSearch && (buf[idx] & 0xC0) == 0x80)
             idx--;
-        if (idx < start) return start;
+        if (idx < minSearch) return minSearch;
 
         byte lead = buf[idx];
         int expected;
@@ -356,7 +385,10 @@ public unsafe struct InputState
         else if ((lead & 0xF8) == 0xF0) expected = 4;
         else return idx; // invalid lead byte at boundary
 
-        return (end - idx < expected) ? idx : end;
+        int actual = end - idx;
+        if (actual < expected) return idx;
+        if (actual > expected) return idx + expected;
+        return end;
     }
 
     /// <summary>
@@ -631,4 +663,17 @@ public unsafe struct InputState
         }
         return new Vec2(x, y);
     }
+}
+
+/// <summary>
+/// Stateless input system helpers operating on unmanaged InputState.
+/// </summary>
+public static unsafe class InputSystem
+{
+    /// <summary>
+    /// Applies window focus loss across keyboard, mouse, and all 4 gamepads, preserving
+    /// previous-frame masks so IsKeyReleased / IsMouseReleased / IsGamepadButtonReleased fire cleanly.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void ApplyFocusLost(ref InputState input) => input.ApplyFocusLost();
 }

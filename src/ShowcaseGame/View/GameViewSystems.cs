@@ -74,7 +74,7 @@ public static unsafe class GameViewSystems
             DepthTest = 1,
             Visible = 1,
         });
-        int runeClip = AnimationSystem.RegisterSpriteClip(ref w.Animations, new SpriteAnimClipData
+        SpriteAnimClipHandle runeClip = AnimationSystem.RegisterSpriteClip(ref w.Animations, new SpriteAnimClipData
         {
             Name = StringId.Hash("title_rune"),
             StartFrame = 4, FrameCount = 4, Columns = 4, Rows = 2, Fps = 6f, Loop = 1,
@@ -223,14 +223,14 @@ public static unsafe class GameViewSystems
             DepthTest = 1,
             Visible = 1,
         });
-        int runeClip = AnimationSystem.RegisterSpriteClip(ref w.Animations, new SpriteAnimClipData
+        SpriteAnimClipHandle runeClip = AnimationSystem.RegisterSpriteClip(ref w.Animations, new SpriteAnimClipData
         {
             Name = StringId.Hash("arena_rune"),
             StartFrame = 4, FrameCount = 4, Columns = 4, Rows = 2, Fps = 7f, Loop = 1,
         });
         v->FloorRuneAnim = AnimationSystem.AddSpritePlayer(ref w.Animations, v->FloorRuneEntity, runeClip, sc);
 
-        v->PickupStarClipIndex = AnimationSystem.RegisterSpriteClip(ref w.Animations, new SpriteAnimClipData
+        v->PickupStarClip = AnimationSystem.RegisterSpriteClip(ref w.Animations, new SpriteAnimClipData
         {
             Name = StringId.Hash("pickup_star"),
             StartFrame = 0, FrameCount = 4, Columns = 4, Rows = 2, Fps = 8f, Loop = 1,
@@ -453,7 +453,7 @@ public static unsafe class GameViewSystems
                         DepthTest = 1,
                         Visible = 1,
                     });
-                    v->PickupSpriteAnims[i] = AnimationSystem.AddSpritePlayer(ref w.Animations, ke, v->PickupStarClipIndex, sc);
+                    v->PickupSpriteAnims[i] = AnimationSystem.AddSpritePlayer(ref w.Animations, ke, v->PickupStarClip, sc);
                 }
                 TransformSystem.SetLocalPosition(ref w.Transforms, v->PickupEntities[i], pos);
                 SpriteData* psp = RenderComponentSystem.TryGetSprite(in w.RenderComponents, v->PickupSprites[i]);

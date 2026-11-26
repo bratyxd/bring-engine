@@ -520,3 +520,24 @@ public readonly struct SpriteAnimPlayerHandle : IEquatable<SpriteAnimPlayerHandl
     public static bool operator !=(SpriteAnimPlayerHandle a, SpriteAnimPlayerHandle b) => a.Raw != b.Raw;
     public override string ToString() => IsValid ? $"SpriteAnimPlayer({Index}:g{Generation})" : "SpriteAnimPlayer(Invalid)";
 }
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct SpriteAnimClipHandle : IEquatable<SpriteAnimClipHandle>
+{
+    public readonly uint Raw;
+    public static readonly SpriteAnimClipHandle Invalid = default;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public SpriteAnimClipHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static SpriteAnimClipHandle Create(uint index, uint generation) => new SpriteAnimClipHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(SpriteAnimClipHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is SpriteAnimClipHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(SpriteAnimClipHandle a, SpriteAnimClipHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(SpriteAnimClipHandle a, SpriteAnimClipHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"SpriteAnimClip({Index}:g{Generation})" : "SpriteAnimClip(Invalid)";
+}

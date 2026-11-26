@@ -323,7 +323,7 @@ public static unsafe class TweenAnimParticleTests
         AnimPlayerHandle pHandle = AnimationSystem.AddPlayer(ref anims, entity, skel, clip);
 
         // Sprite anim clip (4x2 sheet, 4 frames at 8 fps)
-        int sClip = AnimationSystem.RegisterSpriteClip(ref anims, new SpriteAnimClipData
+        SpriteAnimClipHandle sClip = AnimationSystem.RegisterSpriteClip(ref anims, new SpriteAnimClipData
         {
             Name = StringId.Hash("Walk"),
             StartFrame = 0,
@@ -463,17 +463,17 @@ public static unsafe class TweenAnimParticleTests
 
         // 5. RegisterSpriteClip deduplication by Name (300 calls with MaxSpriteClips=8 must NOT exhaust!)
         var starName = StringId.Hash("pickup_star");
-        int firstIdx = -1;
+        SpriteAnimClipHandle firstClip = SpriteAnimClipHandle.Invalid;
         for (int i = 0; i < 300; i++)
         {
-            int idx = AnimationSystem.RegisterSpriteClip(ref anims, new SpriteAnimClipData
+            SpriteAnimClipHandle clipH = AnimationSystem.RegisterSpriteClip(ref anims, new SpriteAnimClipData
             {
                 Name = starName,
                 OwnerScene = scB,
                 StartFrame = 0, FrameCount = 4, Columns = 4, Rows = 2, Fps = 8f, Loop = 1,
             });
-            if (i == 0) firstIdx = idx;
-            else Assert.Equal(firstIdx, idx, "RegisterSpriteClip deduplicated by Name");
+            if (i == 0) firstClip = clipH;
+            else Assert.Equal(firstClip, clipH, "RegisterSpriteClip deduplicated by Name");
         }
         Assert.Equal(1, anims.SpriteClipCount, "SpriteClipCount remains 1 after 300 duplicate registrations");
 
