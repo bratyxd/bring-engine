@@ -11,7 +11,9 @@ All controllers live as plain fields inside `CameraData`:
 - `CameraMode.FollowTarget`: set `TargetEntity`, `FollowOffset`, `LookOffset`, `FollowDamping`.
 - `CameraMode.OrbitTarget`: set `TargetEntity`, `OrbitYaw`, `OrbitPitch`, `OrbitDistance`.
 - `CameraMode.LookAtTarget`: aims at `TargetEntity + LookOffset`.
-- **Deterministic Screen Shake**: call `CameraSystem.AddTrauma(ref cameras, camHandle, 0.6f)`. Shake decays deterministically using trigonometric noise with zero RNG state corruption.
+- **Deterministic Screen Shake**: call `CameraSystem.AddTrauma(ref cameras, camHandle, 0.2f)`. Shake decays deterministically using trigonometric noise with zero RNG state corruption.
+
+> **Smooth Camera & Subtle Feedback**: Favor smooth `FollowDamping` for steady, comfortable tracking. Keep screen shake light (`0.15f–0.25f`) and infrequent — reserve trauma for major impacts, explosions, or heavy damage rather than shaking on every routine hit, pickup, or shot.
 
 ## Frustum Culling & Picking
 After `CameraSystem.UpdateAll(ref cameras, in transforms, dt, width, height)`:

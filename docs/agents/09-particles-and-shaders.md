@@ -7,7 +7,7 @@ Particles live in 64-byte aligned Structure-of-Arrays (`PosX/Y/Z`, `VelX/Y/Z`, `
 var cfg = ParticleSystem.DefaultEmitter(new Vec3(0, 1, 0), seed: 42);
 cfg.Shape = ParticleShape.Sphere;
 cfg.BlendMode = ParticleBlendMode.Additive;
-cfg.EmitRate = 60f;
+cfg.EmitRate = 20f;
 cfg.StartColor = ColorF.Cyan;
 cfg.EndColor = new ColorF(0.1f, 0.2f, 1f, 0f);
 cfg.FollowEntity = playerEntity; // optional entity tracking
@@ -15,12 +15,14 @@ cfg.StretchedBillboard = 1;       // optional velocity/streak billboard stretch 
 
 EmitterHandle emitter = ParticleSystem.CreateEmitter(ref particles, in cfg, sceneId);
 
-// Trigger instant explosions/hits deterministically:
-ParticleSystem.Burst(ref particles, emitter, 48);
+// Trigger crisp, controlled impact/burst effects deterministically:
+ParticleSystem.Burst(ref particles, emitter, 16);
 
 // Simulation step (headless-compatible, uses per-emitter DetRng):
 ParticleSystem.Step(ref particles, in transforms, dt);
 ```
+
+> **Visual Restraint**: Keep particle counts, sizes, and lifetimes restrained (`EmitRate` ~`10–25`, routine hit/pickup bursts ~`8–16`, reserving larger bursts for major impacts or explosions) so effects stay crisp and readable without flooding the viewport or obscuring gameplay silhouettes.
 
 ## Custom Shaders (`ShaderSystem` — Added in Phase 6-7)
 Bring Engine uses **HLSL** as its unified cross-platform shader language, compiled automatically via **`SDL_shadercross`** into DXIL (D3D12), SPIR-V (Vulkan), or MSL (Metal) matching the active GPU backend:
