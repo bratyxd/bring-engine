@@ -53,9 +53,9 @@ public static unsafe class LoggingTests
         if (OperatingSystem.IsWindows())
             Assert.True(resolved.EndsWith(Path.Combine("BringTestGame", "Logs"), StringComparison.OrdinalIgnoreCase), "Windows uses LocalAppData/<App>/Logs");
         else if (OperatingSystem.IsMacOS())
-            Assert.True(resolved.Contains(Path.Combine("Library", "Logs", "BringTestGame"), StringComparison.Ordinal), "macOS uses ~/Library/Logs/<App>");
+            Assert.True(resolved.Contains(Path.Combine("Library", "Application Support", "BringTestGame", "Logs"), StringComparison.Ordinal), "macOS uses ~/Library/Application Support/<App>/Logs");
         else
-            Assert.True(resolved.EndsWith(Path.Combine("BringTestGame", "logs"), StringComparison.Ordinal), "Linux uses XDG_STATE_HOME/<App>/logs");
+            Assert.True(resolved.EndsWith(Path.Combine("BringTestGame", "logs"), StringComparison.Ordinal), "Linux uses XDG_DATA_HOME/<App>/logs");
 
         // 2. Verify default file creation, timestamp + priority format, level filtering, and CR/LF sanitization
         string tempDir = CreateTempLogDir("format");

@@ -406,3 +406,24 @@ public readonly struct LogFileHandle : IEquatable<LogFileHandle>
     public static bool operator !=(LogFileHandle a, LogFileHandle b) => a.Raw != b.Raw;
     public override string ToString() => IsValid ? $"LogFile({Index}:g{Generation})" : "LogFile(Default)";
 }
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct SaveOpHandle : IEquatable<SaveOpHandle>
+{
+    public readonly uint Raw;
+    public static readonly SaveOpHandle Invalid = default;
+    public bool IsValid => Raw != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public SaveOpHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static SaveOpHandle Create(uint index, uint generation) => new SaveOpHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(SaveOpHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is SaveOpHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(SaveOpHandle a, SaveOpHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(SaveOpHandle a, SaveOpHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"SaveOp({Index}:g{Generation})" : "SaveOp(Invalid)";
+}

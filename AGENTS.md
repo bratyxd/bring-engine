@@ -9,7 +9,7 @@
 
 1. **NO OOP — Pure Data + Static Systems**
    - NEVER use class inheritance, `virtual`, `override`, `abstract`, or interface dispatch in engine or game code.
-   - Store all state in `[StructLayout(LayoutKind.Sequential)]` `unmanaged struct` tables (SoA / dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`, `HttpRequestHandle`, `WebSocketHandle`, `LogFileHandle`).
+   - Store all state in `[StructLayout(LayoutKind.Sequential)]` `unmanaged struct` tables (SoA / dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`, `HttpRequestHandle`, `WebSocketHandle`, `LogFileHandle`, `SaveOpHandle`).
    - Put behavior in `public static unsafe class <Feature>System` methods and use unmanaged function pointers (`delegate*<...>`) for callbacks.
 
 2. **Desktop CoreCLR (.NET 10) + Self-Contained ReadyToRun — Windows, Linux (Steam Deck), macOS**
@@ -26,7 +26,7 @@
    - **View (`*.View.*` / `BringEngine.Rendering.*`)**: Reads simulation state & `SimEvent`s; never mutates gameplay truth.
    - **2-Thread Pipeline (`EnginePipelineSystem`)**: Logic Thread (Frame `N`) runs concurrently with Main/Render Thread (Frame `N-1`). All SDL3 window/event/swapchain/rumble calls stay on the Main Thread.
    - **Two-Zone Async Architecture (Mandatory for Engine & Games)**:
-     - **Zone 1 — Core Engine APIs, `Simulation/`, `View/`, and simple async work**: MUST use **32-bit Generational Handles + Native Ring-Buffer Mailbox + Zero-GC Frame Polling + `Cancel`/`Release`/`Stop`** (`JobSystem`, `HttpSystem`, `WebSocketSystem`, future async I/O/streaming). NEVER expose `Task<T>`, `async`/`await`, or managed callback closures in core engine APIs or frame loops.
+     - **Zone 1 — Core Engine APIs, `Simulation/`, `View/`, and simple async work**: MUST use **32-bit Generational Handles + Native Ring-Buffer Mailbox + Zero-GC Frame Polling + `Cancel`/`Release`/`Stop`** (`JobSystem`, `HttpSystem`, `WebSocketSystem`, `SaveSystem`, future async I/O/streaming). NEVER expose `Task<T>`, `async`/`await`, or managed callback closures in core engine APIs or frame loops.
      - **Zone 2 — Game-level heavy cold-path orchestration** (multi-step live-ops, auth/JWT refresh, retries, IAP, CDN patching, backend SDKs like PlayFab/Nakama/EOS): Quarantine standard C# `async`/`await` + `Task` (`.NET 10` `HttpClient` or NuGet SDKs) inside an isolated background `Services/` layer with a shutdown `CancellationToken`. Background `async` code MUST NEVER touch `GameSimState`, `EngineWorld`, `EngineAllocators`, or SDL3/GPU directly — publish plain unmanaged results/snapshots into a thread-safe mailbox polled synchronously once per frame on the Logic Thread (0 GC). See [`docs/agents/16-networking-and-multiplayer.md`](docs/agents/16-networking-and-multiplayer.md).
    - **Multithreading (`JobSystem`)**: Use only when profiling justifies it (heavy SoA loops or multi-frame background jobs — never tiny loops). See [`docs/agents/12-multithreading-and-jobs.md`](docs/agents/12-multithreading-and-jobs.md).
    - **Defaults**: Launch in **Borderless Full Window** (`WindowMode.BorderlessFullscreen`), **VSync ON**, **60 FPS cap**, and wire `ProfilerOverlay` (`F1` overlay, `F2` VSync, `F3` FPS cap, `F11` borderless/windowed). See [`docs/agents/11-vsync-fps-cap-and-profiling.md`](docs/agents/11-vsync-fps-cap-and-profiling.md).
@@ -42,7 +42,7 @@
 
 - `BringEngine.sln` & `Directory.Build.props` — Solution and Desktop CoreCLR (`.NET 10`) build settings.
 - `src/BringEngine/` — Core Engine Library (`net10.0`):
-  - `Core/` — `Memory/` (`LinearArena`, `PoolAllocator<T>`, `FreeListAllocator`, `EngineAllocators`, native containers, `FixedString*`, `StringId`), `Logging/` (`LogSystem`, zero-GC UTF-8 `[InterpolatedStringHandler]`, OS-standard rolling files), `Profiling/` (`FrameProfiler`, `ProfilerSystem`), `Threading/` (`EnginePipelineSystem`, `JobSystem`), `Handles/`, `Math/` (`Fix32/64`, `FixVec2/3`, `DetMath`, `DetRng`, `Vec/Quat/Mat4`).
+  - `Core/` — `Memory/` (`LinearArena`, `PoolAllocator<T>`, `FreeListAllocator`, `EngineAllocators`, native containers, `FixedString*`, `StringId`), `Logging/` (`LogSystem`, zero-GC UTF-8 `[InterpolatedStringHandler]`, rolling files), `Storage/` (`PlatformPaths`, `SaveSystem`, atomic `.tmp`/`.bak` `BSAV` + Raw JSON + `SaveChunkWriter`/`SaveChunkReader`), `Profiling/` (`FrameProfiler`, `ProfilerSystem`), `Threading/` (`EnginePipelineSystem`, `JobSystem`), `Handles/`, `Math/` (`Fix32/64`, `FixVec2/3`, `DetMath`, `DetRng`, `Vec/Quat/Mat4`).
   - `Networking/` — Zero-dependency `.NET 10` BCL networking (`HttpSystem`, `WebSocketSystem`), zero-GC binary `NetWriter`/`NetReader`/`NetHash.Crc32`, pluggable `NetTransportVTable`, and deterministic `LoopbackTransportSystem`.
   - `Simulation/` — `EntityTable`, `TransformTable`, `EngineWorld`, `CameraTable`, `InputState`, `TweenTable`, `AnimationTable`, `ParticleTable`, `RenderComponentTables`, `SceneManager`.
   - `Assets/` — `AssetRegistry`, `BundleManager`, `Compression/` (BC1/BC3 `BRTX`, LZ4/Brotli, `BGLB`), `Atlases/` (`AtlasPacker`), `Packing/` (`AssetPackBuilder` / `AssetPackLoader`), `TextureLoader`, `SdfFontLoader`, `GltfLoader`, `GlbBuilder`.
@@ -80,7 +80,8 @@
 | 12 | [`12-multithreading-and-jobs.md`](docs/agents/12-multithreading-and-jobs.md) | Data-oriented `JobSystem` (`ParallelFor`, async DAGs, cancel, worker scratch, when NOT to parallelize) |
 | 13 | [`13-asset-compression-atlases-and-9slice.md`](docs/agents/13-asset-compression-atlases-and-9slice.md) | BC1/BC3 texture compression, LZ4/Brotli `.bpack` & GLB compression, default atlasing, `BringPacker`, 9-slice UI |
 | 16 | [`16-networking-and-multiplayer.md`](docs/agents/16-networking-and-multiplayer.md) | Lean core `HttpSystem`, `WebSocketSystem`, zero-GC `NetWriter`/`NetReader`, `NetTransportVTable`, `LoopbackTransport`, and game-level multiplayer (`LiteNetLib`, `Backdash`, `Facepunch.Steamworks`) |
-| 17 | [`17-logging.md`](docs/agents/17-logging.md) | Zero-GC core `LogSystem`, OS-standard log paths (`%LOCALAPPDATA%` / `~/Library/Logs` / `$XDG_STATE_HOME`), `LogFileHandle`, and 10k-line FIFO trimming |
+| 17 | [`17-logging.md`](docs/agents/17-logging.md) | Zero-GC core `LogSystem`, unified OS paths (`PlatformPaths`), `LogFileHandle`, 10k-line FIFO trimming, and selective logging discipline |
+| 18 | [`18-save-system.md`](docs/agents/18-save-system.md) | Crash-safe atomic `SaveSystem` (`.tmp`/`.bak`, CRC32 recovery, LZ4/Brotli), Raw JSON vs. `BSAV`+JSON vs. versioned binary `SaveChunks` |
 
 ---
 

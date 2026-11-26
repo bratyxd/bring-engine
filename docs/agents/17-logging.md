@@ -6,13 +6,13 @@
 
 ## 1. Platform Log Directories (Headless-Safe, Zero SDL3 Dependency)
 
-`LogSystem.ResolvePlatformLogDirectory(appName)` automatically selects the OS-standard writable log folder without requiring SDL3 initialization (works identically in windowed games, `--headless` tests, and dedicated Linux servers):
+`LogSystem.ResolvePlatformLogDirectory(appName)` delegates to `PlatformPaths.ResolveLogsDirectory(appName)` so logs and saves share the exact same OS-standard per-game parent folder without requiring SDL3 initialization (works identically in windowed games, `--headless` tests, and dedicated Linux servers):
 
 | Platform | Dynamic Standard Path | Default File |
 |---|---|---|
 | **Windows** | `%LOCALAPPDATA%\<AppName>\Logs\` | `engine.log` |
-| **macOS** | `~/Library/Logs/<AppName>/` *(discoverable in Console.app)* | `engine.log` |
-| **Linux / Steam Deck (SteamOS)** | `$XDG_STATE_HOME/<AppName>/logs/` → fallback `~/.local/state/<AppName>/logs/` | `engine.log` |
+| **macOS** | `~/Library/Application Support/<AppName>/Logs/` | `engine.log` |
+| **Linux / Steam Deck (SteamOS)** | `$XDG_DATA_HOME/<AppName>/logs/` → fallback `~/.local/share/<AppName>/logs/` | `engine.log` |
 
 Pass `directoryOverride` to `LogSystem.Start(...)` when you need a portable folder or isolated test directory.
 

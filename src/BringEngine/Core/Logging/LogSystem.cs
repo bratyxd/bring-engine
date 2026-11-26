@@ -6,6 +6,7 @@ using System.Text;
 using System.Threading;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Memory;
+using BringEngine.Core.Storage;
 using BringEngine.Core.Threading;
 
 namespace BringEngine.Core.Logging;
@@ -146,41 +147,13 @@ public static unsafe class LogSystem
     private static readonly object s_poolLock = new();
 
     /// <summary>
-    /// Resolves the OS-standard writable log directory for the given app name (headless-safe, zero SDL3 dependency):
+    /// Resolves the OS-standard writable log directory under the unified per-game app-data parent (headless-safe, zero SDL3 dependency):
     /// - Windows: %LOCALAPPDATA%\&lt;AppName&gt;\Logs
-    /// - macOS:   ~/Library/Logs/&lt;AppName&gt;
-    /// - Linux:   $XDG_STATE_HOME/&lt;AppName&gt;/logs (fallback ~/.local/state/&lt;AppName&gt;/logs)
+    /// - macOS:   ~/Library/Application Support/&lt;AppName&gt;/Logs
+    /// - Linux:   $XDG_DATA_HOME/&lt;AppName&gt;/logs (fallback ~/.local/share/&lt;AppName&gt;/logs)
     /// </summary>
     public static string ResolvePlatformLogDirectory(ReadOnlySpan<char> appName)
-    {
-        string safeApp = SanitizeSegment(appName, "BringEngine");
-
-        if (OperatingSystem.IsWindows())
-        {
-            string baseDir = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            if (string.IsNullOrWhiteSpace(baseDir))
-                baseDir = Path.GetTempPath();
-            return Path.Combine(baseDir, safeApp, "Logs");
-        }
-
-        if (OperatingSystem.IsMacOS())
-        {
-            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            if (string.IsNullOrWhiteSpace(home))
-                home = Path.GetTempPath();
-            return Path.Combine(home, "Library", "Logs", safeApp);
-        }
-
-        // Linux / SteamOS / Unix (XDG Base Directory Specification)
-        string? xdgState = Environment.GetEnvironmentVariable("XDG_STATE_HOME");
-        if (!string.IsNullOrWhiteSpace(xdgState))
-            return Path.Combine(xdgState, safeApp, "logs");
-
-        string unixHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (string.IsNullOrWhiteSpace(unixHome))
-            unixHome = Path.GetTempPath();
-        return Path.Combine(unixHome, ".local", "state", safeApp, "logs");
-    }
+        => PlatformPaths.ResolveLogsDirectory(appName);
 
     /// <summary>
     /// Initializes LogState inside stable pinned native memory (e.g., EngineAllocators.Persistent),
