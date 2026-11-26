@@ -6,6 +6,7 @@ using BringEngine.Core.Threading;
 using BringEngine.Simulation.Animation;
 using BringEngine.Simulation.Camera;
 using BringEngine.Simulation.Particles;
+using BringEngine.Simulation.RenderData;
 using BringEngine.Simulation.Tween;
 using BringEngine.Simulation.World;
 
@@ -15,6 +16,8 @@ public static unsafe class TweenAnimParticleTests
 {
     private static uint s_completedUserData;
     private static TweenTable* s_reentrantTweens;
+    private static TransformTable* s_reentrantTransforms;
+    private static CameraTable* s_reentrantCameras;
     private static TweenHandle s_reentrantVictim;
     private static TweenHandle s_reentrantSelf;
     private static int s_reentrantStepCount;
@@ -26,10 +29,13 @@ public static unsafe class TweenAnimParticleTests
         Assert.Run("Easing_All32CurvesAndCubicCurveDeterminism", &TestEasingAllCurves);
         Assert.Run("TweenSystem_PointersComponentsSequencesAndLoops", &TestTweenSystem);
         Assert.Run("TweenSystem_HelpersReentrancyKillChainAndZeroGc", &TestTweenHelpersReentrancyAndChain);
+        Assert.Run("TweenSystem_ChainCycleNanOvershootStepReentrancyAndHandleSafeRenderTargets", &TestTweenAuditRegressions);
         Assert.Run("AnimationSystem_SkeletalCrossfadeAndSpriteFrames", &TestAnimationSystem);
         Assert.Run("AnimationSystem_CubicSplineCrossfadeNonTopoJointsAndHandles", &TestAnimationEdgeCases);
+        Assert.Run("AnimationSystem_SkeletonGuardsScratchOomSpriteClipHandlesOverflowCrossfadeAndBounds", &TestAnimationAuditRegressions);
         Assert.Run("ParticleSystem_SoADeterministicZeroGc", &TestParticleSystem);
         Assert.Run("ParticleSystem_ParallelParityShapesOverflowHoldPosAndMaxEmitters", &TestParticleParallelAndEdgeCases);
+        Assert.Run("ParticleSystem_ManualLocalMoveBadDtOverflowAndHighAtlasClamp", &TestParticleAuditRegressions);
     }
 
     private static void OnTweenDone(uint userData) => s_completedUserData = userData;
@@ -643,6 +649,398 @@ public static unsafe class TweenAnimParticleTests
         }
 
         JobSystem.Stop(jobs);
+        alloc.Dispose();
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
+    }
+
+    private static void OnStepCallStepAllReentrantly(uint userData, Vec4 value)
+    {
+        _ = userData;
+        _ = value;
+        s_reentrantStepCount++;
+        if (s_reentrantTweens != null && s_reentrantTransforms != null && s_reentrantCameras != null)
+            TweenSystem.StepAll(ref *s_reentrantTweens, ref *s_reentrantTransforms, ref *s_reentrantCameras, 0.25f);
+    }
+
+    private static void TestTweenAuditRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 128, 32);
+
+        // SIM-08: Chain cycle rejection (t1 -> t2 -> t1) & overwrite orphan release (t1 -> t2 then t1 -> t3)
+        float* v1 = alloc.Persistent.Alloc<float>(1);
+        float* v2 = alloc.Persistent.Alloc<float>(1);
+        float* v3 = alloc.Persistent.Alloc<float>(1);
+        var t1 = TweenSystem.TweenFloatPtr(ref world.Tweens, v1, 0f, 1f, 0.1f, EaseType.Linear);
+        var t2 = TweenSystem.TweenFloatPtr(ref world.Tweens, v2, 0f, 1f, 0.1f, EaseType.Linear);
+        TweenSystem.Chain(ref world.Tweens, t1, t2);
+        TweenSystem.Chain(ref world.Tweens, t2, t1); // Cycle must be rejected!
+        for (int s = 0; s < 5; s++)
+            TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, 0.1f);
+        Assert.Equal(0, world.Tweens.ActiveCount, "SIM-08: Cycle Chain(t2, t1) rejected so both t1 and t2 complete");
+
+        var o1 = TweenSystem.TweenFloatPtr(ref world.Tweens, v1, 0f, 1f, 0.1f, EaseType.Linear);
+        var o2 = TweenSystem.TweenFloatPtr(ref world.Tweens, v2, 0f, 1f, 0.1f, EaseType.Linear);
+        var o3 = TweenSystem.TweenFloatPtr(ref world.Tweens, v3, 0f, 1f, 0.1f, EaseType.Linear);
+        TweenSystem.Chain(ref world.Tweens, o1, o2);
+        TweenSystem.Chain(ref world.Tweens, o1, o3); // Overwriting releases o2 from WaitingInSequence
+        Assert.True(!TweenSystem.TryGetPtr(in world.Tweens, o2)->IsWaitingInSequence, "SIM-08: Overwritten o2 released from WaitingInSequence");
+        for (int s = 0; s < 5; s++)
+            TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, 0.1f);
+        Assert.Equal(0, world.Tweens.ActiveCount, "SIM-08: Overwritten o2 not orphaned; all 3 complete");
+
+        // SIM-09: NaN Duration/Delay/TimeScale sanitized, bad dt is a no-op, multi-pass PingPong overshoot
+        *v1 = 0f;
+        var nanTw = TweenSystem.TweenFloatPtr(ref world.Tweens, v1, 0f, 10f, float.NaN, EaseType.Linear, delay: float.NaN);
+        TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, float.NaN);
+        TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, -1f);
+        Assert.True(TweenSystem.IsActive(in world.Tweens, nanTw), "SIM-09: NaN and negative dt are clean no-ops");
+        TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, 0.01f);
+        Assert.True(!TweenSystem.IsActive(in world.Tweens, nanTw), "SIM-09: Sanitized NaN Duration tween completes instead of leaking");
+        Assert.Near(10f, *v1, 1e-4f, "SIM-09: Sanitized NaN Duration tween reaches EndValue");
+
+        *v2 = 0f;
+        var ppInf = TweenSystem.TweenFloatPtr(ref world.Tweens, v2, 0f, 10f, 0.5f, EaseType.Linear, loopMode: TweenLoopMode.PingPong, loops: -1);
+        TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, 2.25f); // 4 full passes (even -> forward) + 0.25s = 5.0
+        TweenData* ppPtr = TweenSystem.TryGetPtr(in world.Tweens, ppInf);
+        Assert.True(ppPtr != null, "SIM-09: Infinite PingPong remains active after dt=2.25f");
+        Assert.Near(0.25f, ppPtr->Elapsed, 1e-4f, "SIM-09: PingPong Elapsed wrapped to 0.25f");
+        Assert.True(!ppPtr->IsReversed, "SIM-09: 4 full passes -> even parity -> not reversed");
+        Assert.Near(5f, *v2, 1e-3f, "SIM-09: PingPong value at t=2.25s == 5.0");
+        TweenSystem.Kill(ref world.Tweens, ppInf);
+
+        *v3 = -1f;
+        var ppFin = TweenSystem.TweenFloatPtr(ref world.Tweens, v3, 0f, 10f, 0.5f, EaseType.Linear, loopMode: TweenLoopMode.PingPong, loops: 1);
+        TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, 2.25f);
+        Assert.True(!TweenSystem.IsActive(in world.Tweens, ppFin), "SIM-09: Finite PingPong overshoot completes immediately");
+        Assert.Near(0f, *v3, 1e-4f, "SIM-09: Finite 2-pass PingPong finishes at StartValue (0)");
+
+        // SIM-17: Re-entrant StepAll inside OnStep callback must not double-step sibling tweens
+        *v1 = 0f;
+        s_reentrantStepCount = 0;
+        var reCaller = TweenSystem.Spawn(ref world.Tweens, new TweenData
+        {
+            TargetKind = TweenTargetKind.CustomCallback,
+            Duration = 1f,
+            StartValue = Vec4.Zero,
+            EndValue = Vec4.One,
+            OnStep = &OnStepCallStepAllReentrantly,
+        });
+        var sibling = TweenSystem.TweenFloatPtr(ref world.Tweens, v1, 0f, 10f, 1f, EaseType.Linear);
+        s_reentrantTweens = &world.Tweens;
+        s_reentrantTransforms = &world.Transforms;
+        s_reentrantCameras = &world.Cameras;
+        TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, 0.25f);
+        s_reentrantTweens = null;
+        s_reentrantTransforms = null;
+        s_reentrantCameras = null;
+        Assert.Equal(1, s_reentrantStepCount, "SIM-17: Re-entrant StepAll ignored while Stepping != 0");
+        Assert.Near(2.5f, *v1, 1e-4f, "SIM-17: Sibling stepped exactly once (2.5, not 5.0)");
+        TweenSystem.Kill(ref world.Tweens, reCaller);
+        TweenSystem.Kill(ref world.Tweens, sibling);
+
+        // XMOD-06: Handle-safe Text & Sprite tweens survive swap-back compaction and auto-kill on target removal
+        var eA = EntitySystem.Spawn(ref world.Entities);
+        var eB = EntitySystem.Spawn(ref world.Entities);
+        var eC = EntitySystem.Spawn(ref world.Entities);
+
+        var tdA = RenderComponentSystem.DefaultHudText(eA, FontHandle.Create(1, 1), "TextA");
+        tdA.TypewriterProgress = 0f;
+        var tdB = RenderComponentSystem.DefaultHudText(eB, FontHandle.Create(1, 1), "TextB");
+        tdB.TypewriterProgress = 0f;
+        tdB.GlowIntensity = 0f;
+        tdB.Color = ColorF.Black;
+        TextHandle txtA = RenderComponentSystem.AddText(ref world.RenderComponents, in tdA);
+        TextHandle txtB = RenderComponentSystem.AddText(ref world.RenderComponents, in tdB);
+
+        SpriteHandle spA = RenderComponentSystem.AddSprite(ref world.RenderComponents, new SpriteData { Entity = eA, Color = ColorF.Black, Visible = 1 });
+        SpriteHandle spB = RenderComponentSystem.AddSprite(ref world.RenderComponents, new SpriteData { Entity = eB, Color = ColorF.Black, Visible = 1 });
+
+        TweenSystem.TextTypewriter(ref world.Tweens, txtB, 0f, 1f, 0.5f, EaseType.Linear);
+        TweenSystem.TextGlowIntensity(ref world.Tweens, txtB, 0f, 2f, 0.5f, EaseType.Linear);
+        TweenSystem.TextColor(ref world.Tweens, txtB, ColorF.Black, ColorF.White, 0.5f, EaseType.Linear);
+        TweenSystem.SpriteColor(ref world.Tweens, spB, ColorF.Black, ColorF.Red, 0.5f, EaseType.Linear);
+
+        // Remove A (forcing swap-back B -> dense 0), then spawn C into dense 1!
+        Assert.True(RenderComponentSystem.RemoveText(ref world.RenderComponents, txtA), "XMOD-06: Remove Text A");
+        Assert.True(RenderComponentSystem.RemoveSprite(ref world.RenderComponents, spA), "XMOD-06: Remove Sprite A");
+
+        var tdC = RenderComponentSystem.DefaultHudText(eC, FontHandle.Create(1, 1), "TextC");
+        tdC.TypewriterProgress = 0f;
+        tdC.GlowIntensity = 0f;
+        tdC.Color = ColorF.Black;
+        TextHandle txtC = RenderComponentSystem.AddText(ref world.RenderComponents, in tdC);
+        SpriteHandle spC = RenderComponentSystem.AddSprite(ref world.RenderComponents, new SpriteData { Entity = eC, Color = ColorF.Black, Visible = 1 });
+
+        // Step via EngineWorldSystem.StepCoreSystems (wired to 5-arg TweenSystem.StepAll)
+        alloc.BeginFrame();
+        EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 0.5f);
+
+        TextData* ptrB = RenderComponentSystem.TryGetText(in world.RenderComponents, txtB);
+        TextData* ptrC = RenderComponentSystem.TryGetText(in world.RenderComponents, txtC);
+        SpriteData* sPtrB = RenderComponentSystem.TryGetSprite(in world.RenderComponents, spB);
+        SpriteData* sPtrC = RenderComponentSystem.TryGetSprite(in world.RenderComponents, spC);
+        Assert.Near(1f, ptrB->TypewriterProgress, 1e-4f, "XMOD-06: Text B TypewriterProgress reached 1.0 after swap-back");
+        Assert.Near(2f, ptrB->GlowIntensity, 1e-4f, "XMOD-06: Text B GlowIntensity reached 2.0 after swap-back");
+        Assert.Near(1f, ptrB->Color.R, 1e-4f, "XMOD-06: Text B Color reached White");
+        Assert.Near(1f, sPtrB->Color.R, 1e-4f, "XMOD-06: Sprite B Color reached Red");
+        Assert.Near(0f, ptrC->TypewriterProgress, 1e-5f, "XMOD-06: Text C at former dense slot 1 remained 0.0 (no UAF corruption!)");
+        Assert.Near(0f, sPtrC->Color.R, 1e-5f, "XMOD-06: Sprite C at former dense slot 1 remained Black");
+
+        // Auto-kill when target component is destroyed
+        var orphanTw = TweenSystem.TextTypewriter(ref world.Tweens, txtC, 0f, 1f, 2f, EaseType.Linear);
+        var orphanSpTw = TweenSystem.SpriteColor(ref world.Tweens, spC, ColorF.Black, ColorF.White, 2f, EaseType.Linear);
+        Assert.True(RenderComponentSystem.RemoveText(ref world.RenderComponents, txtC), "XMOD-06: Remove Text C");
+        Assert.True(RenderComponentSystem.RemoveSprite(ref world.RenderComponents, spC), "XMOD-06: Remove Sprite C");
+        TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, ref world.RenderComponents, 0.1f);
+        Assert.True(!TweenSystem.IsActive(in world.Tweens, orphanTw), "XMOD-06: Destroyed Text tween auto-killed");
+        Assert.True(!TweenSystem.IsActive(in world.Tweens, orphanSpTw), "XMOD-06: Destroyed Sprite tween auto-killed");
+        Assert.Equal(0, world.Tweens.ActiveCount, "XMOD-06: Zero lingering tweens");
+
+        alloc.Dispose();
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
+    }
+
+    private static void TestAnimationAuditRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(1024 * 1024, 128 * 1024, 128 * 1024, 64 * 1024);
+
+        // SIM-20 (Anim): Capacity bounds validation
+        int overMax = (int)HandlePacking.IndexMask + 2;
+        bool capThrew = false;
+        try { AnimationTable.Create(ref alloc.Persistent, maxSkeletons: 0); } catch (ArgumentOutOfRangeException) { capThrew = true; }
+        Assert.True(capThrew, "SIM-20(Anim): Rejects maxSkeletons == 0");
+        capThrew = false;
+        try { AnimationTable.Create(ref alloc.Persistent, maxSpriteClips: overMax); } catch (ArgumentOutOfRangeException) { capThrew = true; }
+        Assert.True(capThrew, "SIM-20(Anim): Rejects maxSpriteClips > IndexMask+1");
+
+        var anims = AnimationTable.Create(ref alloc.Persistent, 16, 16, 32, 8, 32);
+
+        // SIM-03: Negative JointCount & null buffers rejected by RegisterSkeleton, direct mutation guarded in StepAll
+        bool negThrew = false;
+        try { AnimationSystem.RegisterSkeleton(ref anims, new SkeletonData { JointCount = -1 }); }
+        catch (ArgumentOutOfRangeException) { negThrew = true; }
+        Assert.True(negThrew, "SIM-03: RegisterSkeleton rejects negative JointCount");
+
+        bool nullThrew = false;
+        try { AnimationSystem.RegisterSkeleton(ref anims, new SkeletonData { JointCount = 2 }); }
+        catch (ArgumentNullException) { nullThrew = true; }
+        Assert.True(nullThrew, "SIM-03: RegisterSkeleton rejects null joint buffers when JointCount > 0");
+
+        int* parents = alloc.Persistent.Alloc<int>(2);
+        parents[0] = -1; parents[1] = 0;
+        Mat4* ibm = alloc.Persistent.Alloc<Mat4>(2);
+        ibm[0] = Mat4.Identity; ibm[1] = Mat4.Identity;
+        Vec3* bp = alloc.Persistent.Alloc<Vec3>(2);
+        bp[0] = Vec3.Zero; bp[1] = new Vec3(0f, 1f, 0f);
+        Quat* br = alloc.Persistent.Alloc<Quat>(2);
+        br[0] = Quat.Identity; br[1] = Quat.Identity;
+        Vec3* bs = alloc.Persistent.Alloc<Vec3>(2);
+        bs[0] = Vec3.One; bs[1] = Vec3.One;
+
+        var skelMut = AnimationSystem.RegisterSkeleton(ref anims, new SkeletonData
+        {
+            JointCount = 2,
+            ParentIndices = parents,
+            InverseBindMatrices = ibm,
+            BindPositions = bp,
+            BindRotations = br,
+            BindScales = bs,
+        });
+        var entMut = EntityId.Create(1, 1);
+        var pMut = AnimationSystem.AddPlayer(ref anims, entMut, skelMut, AnimClipHandle.Invalid);
+        AnimationSystem.TryGetSkeleton(in anims, skelMut)->JointCount = -5; // Direct memory mutation guard
+        alloc.BeginFrame();
+        AnimationSystem.StepAll(ref anims, 1f / 60f, ref alloc.Frame, ref alloc.Scratch);
+        Assert.Equal(0, anims.FrameJointPalette.Length, "SIM-03: Corrupted negative JointCount safely skipped in StepAll");
+        AnimationSystem.TryGetSkeleton(in anims, skelMut)->JointCount = 2; // Restore for SIM-06
+
+        // SIM-06: Undersized scratchArena throws OOM and rolls back Offset cleanly
+        var tinyScratch = LinearArena.Create(64);
+        tinyScratch.Alloc<int>(1); // Non-zero initial offset to verify exact rollback
+        nuint offsetBefore = tinyScratch.Offset;
+        bool scratchOom = false;
+        alloc.BeginFrame();
+        try { AnimationSystem.StepAll(ref anims, 1f / 60f, ref alloc.Frame, ref tinyScratch); }
+        catch (OutOfMemoryException) { scratchOom = true; }
+        Assert.True(scratchOom, "SIM-06: Undersized scratchArena threw OutOfMemoryException");
+        Assert.Equal(offsetBefore, tinyScratch.Offset, "SIM-06: scratchArena.Offset rolled back cleanly on OOM");
+        tinyScratch.Dispose();
+        AnimationSystem.RemovePlayer(ref anims, pMut);
+
+        // SIM-16: Skeletal crossfade from clipA (animates joint 0) to clipB (omits joint 0) interpolates smoothly to bind pose
+        float* times = alloc.Persistent.Alloc<float>(2);
+        times[0] = 0f; times[1] = 1f;
+        float* valsA = alloc.Persistent.Alloc<float>(6);
+        valsA[0] = 10f; valsA[1] = 0f; valsA[2] = 0f;
+        valsA[3] = 10f; valsA[4] = 0f; valsA[5] = 0f;
+        var sampA = alloc.Persistent.Alloc<AnimSamplerData>(1);
+        sampA[0] = new AnimSamplerData { Times = times, Values = valsA, KeyframeCount = 2, ComponentsPerValue = 3, Interpolation = AnimInterpolation.Linear };
+        var chanA = alloc.Persistent.Alloc<AnimChannelData>(1);
+        chanA[0] = new AnimChannelData { SamplerIndex = 0, TargetJointIndex = 0, Path = AnimTargetPath.Translation };
+        var clipA = AnimationSystem.RegisterClip(ref anims, new AnimClipData
+        {
+            Name = StringId.Hash("ClipA_J0"),
+            Duration = 1f,
+            Samplers = sampA, SamplerCount = 1,
+            Channels = chanA, ChannelCount = 1,
+        });
+
+        float* valsB = alloc.Persistent.Alloc<float>(6);
+        valsB[0] = 0f; valsB[1] = 4f; valsB[2] = 0f;
+        valsB[3] = 0f; valsB[4] = 4f; valsB[5] = 0f;
+        var sampB = alloc.Persistent.Alloc<AnimSamplerData>(1);
+        sampB[0] = new AnimSamplerData { Times = times, Values = valsB, KeyframeCount = 2, ComponentsPerValue = 3, Interpolation = AnimInterpolation.Linear };
+        var chanB = alloc.Persistent.Alloc<AnimChannelData>(1);
+        chanB[0] = new AnimChannelData { SamplerIndex = 0, TargetJointIndex = 1, Path = AnimTargetPath.Translation }; // No channel on joint 0!
+        var clipB = AnimationSystem.RegisterClip(ref anims, new AnimClipData
+        {
+            Name = StringId.Hash("ClipB_J1Only"),
+            Duration = 1f,
+            Samplers = sampB, SamplerCount = 1,
+            Channels = chanB, ChannelCount = 1,
+        });
+
+        var pFade = AnimationSystem.AddPlayer(ref anims, EntityId.Create(2, 1), skelMut, clipA);
+        AnimationSystem.Crossfade(ref anims, pFade, clipB, 1.0f);
+        alloc.BeginFrame();
+        AnimationSystem.StepAll(ref anims, 0.5f, ref alloc.Frame, ref alloc.Scratch);
+        AnimPlayerData* fadePtr = AnimationSystem.TryGetPlayer(in anims, pFade);
+        Mat4 j0Mid = anims.FrameJointPalette[fadePtr->FrameJointOffset + 0];
+        Assert.Near(5f, j0Mid.C3.X, 1e-3f, "SIM-16: Joint 0 omitted by clipB blends smoothly from 10 toward bind pose 0 (midpoint == 5.0)");
+        AnimationSystem.RemovePlayer(ref anims, pFade);
+
+        // SIM-20 (Anim): UnregisterByBundle(BundleId.Invalid) preserves standalone skeletons & clips
+        AnimationSystem.UnregisterByBundle(ref anims, BundleId.Invalid);
+        Assert.True(AnimationSystem.TryGetSkeleton(in anims, skelMut) != null, "SIM-20(Anim): Standalone skeleton preserved on Invalid bundle unregister");
+        Assert.True(AnimationSystem.TryGetClip(in anims, clipA) != null, "SIM-20(Anim): Standalone clip preserved on Invalid bundle unregister");
+
+        // SIM-07 / XMOD-11: Cross-scene same-name SpriteAnimClipHandle independence + ABA rejection
+        var scA = SceneId.Create(1, 1);
+        var scB = SceneId.Create(2, 1);
+        var sharedName = StringId.Hash("hero_run");
+        var scClipA = AnimationSystem.RegisterSpriteClip(ref anims, new SpriteAnimClipData
+        {
+            Name = sharedName, OwnerScene = scA, StartFrame = 0, FrameCount = 4, Columns = 4, Rows = 1, Fps = 8f, Loop = 1,
+        });
+        var scClipB = AnimationSystem.RegisterSpriteClip(ref anims, new SpriteAnimClipData
+        {
+            Name = sharedName, OwnerScene = scB, StartFrame = 0, FrameCount = 4, Columns = 4, Rows = 1, Fps = 8f, Loop = 1,
+        });
+        var scClipADiffGrid = AnimationSystem.RegisterSpriteClip(ref anims, new SpriteAnimClipData
+        {
+            Name = sharedName, OwnerScene = scA, StartFrame = 0, FrameCount = 8, Columns = 8, Rows = 1, Fps = 8f, Loop = 1,
+        });
+        Assert.True(scClipA != scClipB, "SIM-07: Same-name clips in distinct scenes get distinct handles");
+        Assert.True(scClipA != scClipADiffGrid, "SIM-07: Mismatched grid clips in same scene get distinct handles");
+
+        var stalePlayer = AnimationSystem.AddSpritePlayer(ref anims, EntityId.Create(3, 1), scClipA, scene: scB);
+        AnimationSystem.RemoveByScene(ref anims, scA);
+        Assert.True(AnimationSystem.TryGetSpriteClip(in anims, scClipA) == null, "SIM-07: Unloaded sceneA clip invalidated");
+        Assert.True(AnimationSystem.TryGetSpriteClip(in anims, scClipB) != null, "SIM-07: SceneB clip unaffected by sceneA unload");
+
+        // Re-register in sceneB reusing scClipA's slot index -> new generation rejects stale scClipA (ABA guard!)
+        var reusedClip = AnimationSystem.RegisterSpriteClip(ref anims, new SpriteAnimClipData
+        {
+            Name = StringId.Hash("reused_slot"), OwnerScene = scB, StartFrame = 2, FrameCount = 2, Columns = 4, Rows = 1, Fps = 4f, Loop = 1,
+        });
+        Assert.Equal(scClipA.Index, reusedClip.Index, "SIM-07: Freed sprite clip slot reused");
+        Assert.True(reusedClip.Generation != scClipA.Generation, "SIM-07: Generation bumped on slot reuse");
+        Assert.True(AnimationSystem.TryGetSpriteClip(in anims, scClipA) == null, "SIM-07: Stale handle rejected after slot reuse (ABA safe)");
+
+        // SIM-15: Large/NaN Time, bad dt, and negative StartFrame produce deterministic non-negative frame & UVs
+        var negStartClip = AnimationSystem.RegisterSpriteClip(ref anims, new SpriteAnimClipData
+        {
+            Name = StringId.Hash("neg_start"), OwnerScene = scB, StartFrame = -2, FrameCount = 4, Columns = 4, Rows = 2, Fps = 8f, Loop = 1,
+        });
+        var spExtreme = AnimationSystem.AddSpritePlayer(ref anims, EntityId.Create(4, 1), negStartClip, scene: scB);
+        SpriteAnimPlayerData* spExtPtr = AnimationSystem.TryGetSpritePlayer(in anims, spExtreme);
+
+        spExtPtr->Time = 1e12f;
+        alloc.BeginFrame();
+        AnimationSystem.StepAll(ref anims, 1f / 60f, ref alloc.Frame, ref alloc.Scratch);
+        Assert.True(spExtPtr->CurrentFrame >= 0 && spExtPtr->CurrentFrame < 4, "SIM-15: Time=1e12f yields deterministic non-negative frame");
+        Assert.True(float.IsFinite(spExtPtr->CurrentUvRect.X) && spExtPtr->CurrentUvRect.X >= 0f && spExtPtr->CurrentUvRect.Y >= 0f, "SIM-15: Time=1e12f yields valid non-negative UVs");
+
+        spExtPtr->Time = float.NaN;
+        alloc.BeginFrame();
+        AnimationSystem.StepAll(ref anims, float.NaN, ref alloc.Frame, ref alloc.Scratch);
+        Assert.True(float.IsFinite(spExtPtr->Time), "SIM-15: NaN Time sanitized");
+        Assert.True(spExtPtr->CurrentFrame >= 0, "SIM-15: NaN Time + NaN dt + negative StartFrame yields frame >= 0");
+        Assert.True(spExtPtr->CurrentUvRect.X >= 0f && spExtPtr->CurrentUvRect.Y >= 0f, "SIM-15: Non-negative UVs after NaN");
+
+        AnimationSystem.RemoveSpritePlayer(ref anims, stalePlayer);
+        AnimationSystem.RemoveByScene(ref anims, scB);
+
+        alloc.Dispose();
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
+    }
+
+    private static void TestParticleAuditRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        var transforms = TransformTable.Create(ref alloc.Persistent, 16, 16);
+        var pool = ParticleTable.Create(ref alloc.Persistent, 32, 8);
+
+        // SIM-12: Manual em->Position movement on WorldSpace=0, FollowEntity=Invalid shifts live particle by exact delta
+        var cfg = ParticleSystem.DefaultEmitter(new Vec3(1f, 2f, 3f), seed: 55);
+        cfg.WorldSpace = 0;
+        cfg.FollowEntity = EntityId.Invalid;
+        cfg.Shape = ParticleShape.Point;
+        cfg.EmitRate = 0f;
+        cfg.Gravity = Vec3.Zero;
+        cfg.SpeedMin = 0f; cfg.SpeedMax = 0f;
+        cfg.Turbulence = 0f;
+        cfg.LifetimeMin = 10f; cfg.LifetimeMax = 10f;
+        var emH = ParticleSystem.CreateEmitter(ref pool, in cfg);
+        ParticleSystem.Burst(ref pool, emH, 1);
+        ParticleSystem.Step(ref pool, in transforms, 0.01f);
+        Assert.Equal(1, pool.ParticleCount, "SIM-12: 1 local particle spawned");
+        float x0 = pool.PosX[0], y0 = pool.PosY[0], z0 = pool.PosZ[0];
+
+        ParticleEmitterData* emPtr = ParticleSystem.TryGetEmitter(in pool, emH);
+        emPtr->Position = new Vec3(11f, 7f, 1f); // delta = (+10, +5, -2)
+        ParticleSystem.Step(ref pool, in transforms, 0.01f);
+        Assert.Near(x0 + 10f, pool.PosX[0], 1e-4f, "SIM-12: Manual em->Position move shifted particle X by +10");
+        Assert.Near(y0 + 5f, pool.PosY[0], 1e-4f, "SIM-12: Manual em->Position move shifted particle Y by +5");
+        Assert.Near(z0 - 2f, pool.PosZ[0], 1e-4f, "SIM-12: Manual em->Position move shifted particle Z by -2");
+
+        // SIM-13: Negative / NaN dt is a complete no-op
+        float ageBefore = pool.Age[0];
+        float pxBefore = pool.PosX[0];
+        ParticleSystem.Step(ref pool, in transforms, -1f);
+        ParticleSystem.Step(ref pool, in transforms, float.NaN);
+        Assert.Equal(1, pool.ParticleCount, "SIM-13: Negative/NaN dt preserves particle count");
+        Assert.Equal(ageBefore, pool.Age[0], "SIM-13: Negative/NaN dt does not alter age");
+        Assert.Equal(pxBefore, pool.PosX[0], "SIM-13: Negative/NaN dt does not alter position");
+
+        // SIM-13: AtlasColumns * AtlasRows > 256 clamps FrameIndex at 255 instead of wrapping modulo 256
+        emPtr->AtlasColumns = 20;
+        emPtr->AtlasRows = 20; // 400 frames > 256
+        pool.Age[0] = 9.5f;
+        pool.Lifetime[0] = 10f;
+        ParticleSystem.Step(ref pool, in transforms, 0.1f); // age=9.6, norm=0.96 -> frame=384 -> clamped to 255!
+        Assert.Equal((byte)255, pool.FrameIndex[0], "SIM-13: AtlasColumns*AtlasRows > 256 clamps FrameIndex to 255");
+
+        // SIM-13: EmitRate = 1e38f with dt = 10f overflows float to Inf, then normal EmitRate resumes emission cleanly
+        ParticleSystem.DestroyEmitter(ref pool, emH);
+        var ovCfg = ParticleSystem.DefaultEmitter(Vec3.Zero, seed: 88);
+        ovCfg.EmitRate = 1e38f;
+        ovCfg.LifetimeMin = 0.05f;
+        ovCfg.LifetimeMax = 0.05f;
+        var ovH = ParticleSystem.CreateEmitter(ref pool, in ovCfg);
+        ParticleSystem.Step(ref pool, in transforms, 10f); // fills pool cleanly; particles also expire at dt=10f > 0.05f
+        ParticleEmitterData* ovPtr = ParticleSystem.TryGetEmitter(in pool, ovH);
+        Assert.True(float.IsFinite(ovPtr->EmitAccumulator), "SIM-13: EmitAccumulator remains finite after 1e38f*10f overflow");
+        ovPtr->EmitRate = 100f;
+        ovPtr->LifetimeMin = 5f;
+        ovPtr->LifetimeMax = 5f;
+        ParticleSystem.Step(ref pool, in transforms, 0.1f); // should emit ~10 new particles
+        Assert.True(pool.ParticleCount >= 5, "SIM-13: Emission resumed cleanly after Inf overflow recovery");
+
         alloc.Dispose();
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
     }

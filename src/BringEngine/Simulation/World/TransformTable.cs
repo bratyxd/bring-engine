@@ -31,9 +31,16 @@ public unsafe struct TransformTable
     public int Count;
     public byte MaxDepth;
     public byte NeedsDepthRecompute;
+    public byte HasUnresolvedParents;
 
     public static TransformTable Create(ref LinearArena arena, int maxEntities, int transformCapacity)
     {
+        const int maxCap = (int)(HandlePacking.IndexMask + 1u);
+        if (maxEntities < 1 || maxEntities > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxEntities), maxEntities, $"Capacity must be in [1, {maxCap}].");
+        if (transformCapacity < 1 || transformCapacity > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(transformCapacity), transformCapacity, $"Capacity must be in [1, {maxCap}].");
+
         int* sparse = arena.AllocUninitialized<int>(maxEntities, 64);
         for (int i = 0; i < maxEntities; i++) sparse[i] = -1;
 
@@ -53,6 +60,8 @@ public unsafe struct TransformTable
             Capacity = transformCapacity,
             Count = 0,
             MaxDepth = 0,
+            NeedsDepthRecompute = 0,
+            HasUnresolvedParents = 0,
         };
     }
 }
@@ -76,15 +85,15 @@ public static unsafe class TransformSystem
         EntityId cur = parent;
         int steps = 0;
         int maxSteps = table.Count;
-        while (cur.IsValid && steps < maxSteps)
+        while (cur.IsValid && steps <= maxSteps)
         {
-            if (cur == entity) return true;
             int cd = GetDenseIndex(in table, cur);
-            if (cd < 0) break;
+            if (cd < 0) return false;
             cur = table.Parent[cd];
+            if (cur == entity) return true;
             steps++;
         }
-        return false;
+        return cur.IsValid;
     }
 
     public static int Add(
@@ -110,10 +119,12 @@ public static unsafe class TransformSystem
             table.LocalScale[existing] = localScale;
             table.Parent[existing] = parent;
             table.Dirty[existing] = 1;
-            if (parent.IsValid && GetDenseIndex(in table, parent) < 0)
-                table.NeedsDepthRecompute = 1;
-            if (oldParent != parent || table.NeedsDepthRecompute != 0)
+            if (oldParent != parent)
+            {
+                if (parent.IsValid && GetDenseIndex(in table, parent) < 0)
+                    table.HasUnresolvedParents = 1;
                 RecomputeAllDepths(ref table);
+            }
             return existing;
         }
 
@@ -131,13 +142,25 @@ public static unsafe class TransformSystem
         table.WorldMatrix[d] = Mat4.CreateTRS(localPosition, localRotation, localScale);
         table.WorldPosition[d] = localPosition;
 
-        if (parent.IsValid && GetDenseIndex(in table, parent) < 0)
+        bool parentMissing = parent.IsValid && GetDenseIndex(in table, parent) < 0;
+        if (parentMissing)
+        {
+            table.HasUnresolvedParents = 1;
             table.NeedsDepthRecompute = 1;
-
-        if (table.NeedsDepthRecompute != 0)
-            RecomputeAllDepths(ref table);
-        else
-            RecomputeDepth(ref table, d);
+            table.Depth[d] = 0;
+        }
+        else if (table.HasUnresolvedParents != 0)
+        {
+            // Adding this entity may resolve a previously missing parent; recompute on next PropagateHierarchy
+            table.NeedsDepthRecompute = 1;
+            if (RecomputeDepth(ref table, d))
+                table.HasUnresolvedParents = 1;
+        }
+        else if (RecomputeDepth(ref table, d))
+        {
+            table.HasUnresolvedParents = 1;
+            table.NeedsDepthRecompute = 1;
+        }
         return d;
     }
 
@@ -150,13 +173,17 @@ public static unsafe class TransformSystem
         int d = GetDenseIndex(in table, entity);
         if (d < 0) return false;
 
+        byte removedDepth = table.Depth[d];
+
         // Detach any direct children before removing so no dangling Parent links remain
+        bool detachedAny = false;
         for (int i = 0; i < table.Count; i++)
         {
             if (table.Parent[i] == entity)
             {
                 table.Parent[i] = EntityId.Invalid;
                 table.Dirty[i] = 1;
+                detachedAny = true;
             }
         }
 
@@ -176,7 +203,8 @@ public static unsafe class TransformSystem
             table.EntityToDense[moved.Index] = d;
         }
         table.EntityToDense[entity.Index] = -1;
-        RecomputeAllDepths(ref table);
+        if (detachedAny || (removedDepth > 0 && removedDepth == table.MaxDepth))
+            RecomputeAllDepths(ref table);
         return true;
     }
 
@@ -250,7 +278,8 @@ public static unsafe class TransformSystem
             if (RecomputeDepth(ref table, i))
                 anyUnresolved = true;
         }
-        table.NeedsDepthRecompute = (byte)(anyUnresolved ? 1 : 0);
+        table.HasUnresolvedParents = (byte)(anyUnresolved ? 1 : 0);
+        table.NeedsDepthRecompute = 0;
     }
 
     /// <summary>
@@ -311,11 +340,14 @@ public static unsafe class TransformSystem
         if (table.NeedsDepthRecompute != 0)
             RecomputeAllDepths(ref table);
 
+        // Depth >= 254 clamps in byte storage, so fall back to serial propagation to avoid parallel read/write races
+        JobScheduler* effectiveJobs = table.MaxDepth >= 254 ? null : jobs;
+
         fixed (TransformTable* tPtr = &table)
         {
             var ctx = new TransformLevelJobCtx { Table = tPtr, Level = 0 };
             JobSystem.ParallelFor(
-                jobs,
+                effectiveJobs,
                 count,
                 batchSize: 256,
                 userData: &ctx,
@@ -326,7 +358,7 @@ public static unsafe class TransformSystem
             {
                 ctx.Level = level;
                 JobSystem.ParallelFor(
-                    jobs,
+                    effectiveJobs,
                     count,
                     batchSize: 256,
                     userData: &ctx,

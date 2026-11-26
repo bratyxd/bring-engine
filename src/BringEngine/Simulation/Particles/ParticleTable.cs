@@ -42,6 +42,7 @@ public struct ParticleEmitterData
     public byte AtlasRows;
 
     public Vec3 Position;
+    public Vec3 PrevPosition;
     public Vec3 ShapeExtents;
     public Vec3 BaseDirection;
     public float SpreadAngleRad;
@@ -110,6 +111,8 @@ public unsafe struct ParticleTable
 
     public static ParticleTable Create(ref LinearArena arena, int maxParticles = 16384, int maxEmitters = 256)
     {
+        if (maxParticles <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxParticles), maxParticles, "maxParticles must be >= 1.");
         if (maxEmitters <= 0 || maxEmitters > 65535)
             throw new ArgumentOutOfRangeException(nameof(maxEmitters), maxEmitters, "maxEmitters must be in [1, 65535].");
         uint* gens = arena.AllocUninitialized<uint>(maxEmitters, 16);
@@ -193,6 +196,7 @@ public static unsafe class ParticleSystem
                 table.Emitters[i] = config;
                 table.Emitters[i].Handle = h;
                 table.Emitters[i].OwnerScene = scene;
+                table.Emitters[i].PrevPosition = config.Position;
                 if (table.Emitters[i].AtlasColumns == 0) table.Emitters[i].AtlasColumns = 1;
                 if (table.Emitters[i].AtlasRows == 0) table.Emitters[i].AtlasRows = 1;
                 if ((table.Emitters[i].Rng.S0 | table.Emitters[i].Rng.S1 | table.Emitters[i].Rng.S2 | table.Emitters[i].Rng.S3) == 0)
@@ -382,15 +386,19 @@ public static unsafe class ParticleSystem
             t.PosZ[i] += vz * dt;
             t.Rotation[i] += t.AngularVel[i] * dt;
 
-            float norm = age / life;
+            float norm = DetMath.Clamp01(age / life);
             t.Size[i] = DetMath.Lerp(t.StartSize[i], t.EndSize[i], norm);
             t.Color[i] = ColorF.Lerp(t.StartColor[i], t.EndColor[i], norm);
 
             int totalFrames = em.AtlasColumns * em.AtlasRows;
             if (totalFrames > 1)
             {
+                int maxFrame = totalFrames - 1;
+                if (maxFrame > 255) maxFrame = 255;
                 int frame = (int)(norm * totalFrames);
-                t.FrameIndex[i] = (byte)(frame >= totalFrames ? totalFrames - 1 : frame);
+                if (frame < 0) frame = 0;
+                else if (frame > maxFrame) frame = maxFrame;
+                t.FrameIndex[i] = (byte)frame;
             }
         }
     }
@@ -402,13 +410,14 @@ public static unsafe class ParticleSystem
     /// </summary>
     public static void Step(ref ParticleTable t, in TransformTable transforms, float dt, JobScheduler* jobs = null)
     {
+        if (!float.IsFinite(dt) || dt < 0f) return;
+
         // 1. Emit from active emitters (sequential: preserves exact DetRng order)
         for (int s = 0; s < t.EmitterCapacity; s++)
         {
             if (t.EmitterAlive[s] == 0) continue;
             ref ParticleEmitterData em = ref t.Emitters[s];
 
-            Vec3 prevPos = em.Position;
             if (em.FollowEntity.IsValid)
             {
                 int td = TransformSystem.GetDenseIndex(in transforms, em.FollowEntity);
@@ -417,9 +426,10 @@ public static unsafe class ParticleSystem
             }
 
             // Local-space emitters (WorldSpace == 0) carry their active particles along with emitter movement
+            // (tracks both FollowEntity and manual em->Position updates via PrevPosition)
             if (em.WorldSpace == 0)
             {
-                Vec3 delta = em.Position - prevPos;
+                Vec3 delta = em.Position - em.PrevPosition;
                 if (delta.LengthSq() > 0f)
                 {
                     for (int pIdx = 0; pIdx < t.ParticleCount; pIdx++)
@@ -433,6 +443,7 @@ public static unsafe class ParticleSystem
                     }
                 }
             }
+            em.PrevPosition = em.Position;
 
             if (em.PendingBurst > 0)
             {
@@ -444,15 +455,26 @@ public static unsafe class ParticleSystem
                     SpawnParticle(ref t, (ushort)s, ref em);
             }
 
-            if (em.Enabled != 0 && em.EmitRate > 0f)
+            if (em.Enabled != 0 && float.IsFinite(em.EmitRate) && em.EmitRate > 0f)
             {
+                if (!float.IsFinite(em.EmitAccumulator) || em.EmitAccumulator < 0f)
+                    em.EmitAccumulator = 0f;
                 em.EmitAccumulator += em.EmitRate * dt;
-                if (em.EmitAccumulator >= 1f)
+                if (!float.IsFinite(em.EmitAccumulator))
+                {
+                    int avail = t.ParticleCapacity - t.ParticleCount;
+                    em.EmitAccumulator = 0f;
+                    for (int k = 0; k < avail; k++)
+                        SpawnParticle(ref t, (ushort)s, ref em);
+                }
+                else if (em.EmitAccumulator >= 1f)
                 {
                     int avail = t.ParticleCapacity - t.ParticleCount;
                     float whole = MathF.Floor(em.EmitAccumulator);
                     int spawnCount = whole > avail ? avail : (int)whole;
                     em.EmitAccumulator = whole > avail ? (em.EmitAccumulator - whole) : (em.EmitAccumulator - spawnCount);
+                    if (!float.IsFinite(em.EmitAccumulator) || em.EmitAccumulator < 0f)
+                        em.EmitAccumulator = 0f;
                     for (int k = 0; k < spawnCount; k++)
                         SpawnParticle(ref t, (ushort)s, ref em);
                 }

@@ -34,6 +34,12 @@ public static unsafe class SimulationTests
         Assert.Run("GamepadInput_ButtonsAxesRadialDeadzoneMultiSlotAndCombinedMoveZeroGc", &TestGamepadInput);
         Assert.Run("RenderComponentSystem_SpritesTextCapacityGuardsAndCleanup", &TestRenderComponentTables);
         Assert.Run("SceneManager_CapacityGuardDuplicateRejectRollbackAndLogging", &TestSceneManagerEdgeCases);
+        Assert.Run("TransformTable_ForwardRefCyclesUnresolvedFlagLeafRemoveAndDeepSerial", &TestTransformAuditRegressions);
+        Assert.Run("EngineWorld_DestroyEntity300ChildrenOverflowZeroGc", &TestDestroyEntity300ChildrenOverflow);
+        Assert.Run("CameraSystem_ViewportRectSubProjectionAndDegenerateOrbitPoleGuards", &TestCameraAuditRegressions);
+        Assert.Run("InputState_OrphanUtf8ContinuationTrimAndApplyFocusLost", &TestInputAuditRegressions);
+        Assert.Run("SceneManager_ArenaOomReentrantCallbacksRegisterOomAndTickSnapshot", &TestSceneManagerAuditRegressions);
+        Assert.Run("SimulationTables_CapacityBoundsValidation", &TestSimulationTableCapacityBounds);
     }
 
     private static void TestEntities()
@@ -771,6 +777,455 @@ public static unsafe class SimulationTests
             alloc.Dispose();
             if (Directory.Exists(tempLogDir)) Directory.Delete(tempLogDir, recursive: true);
         }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
+    }
+
+    private static void TestTransformAuditRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        var entities = EntityTable.Create(ref alloc.Persistent, 512);
+        var transforms = TransformTable.Create(ref alloc.Persistent, 512, 512);
+
+        // SIM-04: 2-node forward-ref cycle A->B then B->A must be rejected
+        var a = EntitySystem.Spawn(ref entities);
+        var b = EntitySystem.Spawn(ref entities);
+        TransformSystem.Add(ref transforms, a, new Vec3(1f, 0f, 0f), Quat.Identity, Vec3.One, parent: b);
+        TransformSystem.Add(ref transforms, b, new Vec3(2f, 0f, 0f), Quat.Identity, Vec3.One, parent: a);
+        Assert.True(!transforms.Parent[TransformSystem.GetDenseIndex(in transforms, b)].IsValid, "SIM-04: 2-node forward-ref cycle rejected");
+        TransformSystem.PropagateHierarchy(ref transforms);
+        Assert.Equal((byte)1, transforms.MaxDepth, "SIM-04: 2-node MaxDepth == 1");
+        Vec3 posA0 = TransformSystem.GetWorldPosition(in transforms, a);
+        Vec3 posB0 = TransformSystem.GetWorldPosition(in transforms, b);
+        for (int iter = 0; iter < 10; iter++)
+            TransformSystem.PropagateHierarchy(ref transforms);
+        Assert.Near(posA0.X, TransformSystem.GetWorldPosition(in transforms, a).X, 1e-5f, "SIM-04: 2-node A world X stable over 10 propagations");
+        Assert.Near(posB0.X, TransformSystem.GetWorldPosition(in transforms, b).X, 1e-5f, "SIM-04: 2-node B world X stable over 10 propagations");
+        Assert.Near(3f, posA0.X, 1e-4f, "SIM-04: A world X == 1 + 2");
+        Assert.Near(2f, posB0.X, 1e-4f, "SIM-04: B world X == 2");
+
+        // SIM-04: 3-node forward-ref cycle X->Y->Z->X must be rejected
+        var x = EntitySystem.Spawn(ref entities);
+        var y = EntitySystem.Spawn(ref entities);
+        var z = EntitySystem.Spawn(ref entities);
+        TransformSystem.Add(ref transforms, x, new Vec3(1f, 0f, 0f), Quat.Identity, Vec3.One, parent: y);
+        TransformSystem.Add(ref transforms, y, new Vec3(2f, 0f, 0f), Quat.Identity, Vec3.One, parent: z);
+        TransformSystem.Add(ref transforms, z, new Vec3(4f, 0f, 0f), Quat.Identity, Vec3.One, parent: x);
+        Assert.True(!transforms.Parent[TransformSystem.GetDenseIndex(in transforms, z)].IsValid, "SIM-04: 3-node forward-ref cycle rejected");
+        TransformSystem.PropagateHierarchy(ref transforms);
+        Assert.Equal((byte)2, transforms.MaxDepth, "SIM-04: 3-node MaxDepth == 2");
+        for (int iter = 0; iter < 10; iter++)
+            TransformSystem.PropagateHierarchy(ref transforms);
+        Assert.Near(7f, TransformSystem.GetWorldPosition(in transforms, x).X, 1e-4f, "SIM-04: 3-node X world X == 1+2+4 stable");
+
+        // SIM-14: Missing-parent entity clears NeedsDepthRecompute after first PropagateHierarchy (no permanent O(N^2))
+        var t2 = TransformTable.Create(ref alloc.Persistent, 512, 512);
+        var missingParent = EntitySystem.Spawn(ref entities);
+        var orphan = EntitySystem.Spawn(ref entities);
+        TransformSystem.Add(ref t2, orphan, new Vec3(5f, 0f, 0f), Quat.Identity, Vec3.One, parent: missingParent);
+        Assert.Equal((byte)1, t2.NeedsDepthRecompute, "SIM-14: NeedsDepthRecompute set on missing parent add");
+        Assert.Equal((byte)1, t2.HasUnresolvedParents, "SIM-14: HasUnresolvedParents set on missing parent add");
+        TransformSystem.PropagateHierarchy(ref t2);
+        Assert.Equal((byte)0, t2.NeedsDepthRecompute, "SIM-14: NeedsDepthRecompute cleared after first PropagateHierarchy");
+        Assert.Equal((byte)1, t2.HasUnresolvedParents, "SIM-14: HasUnresolvedParents remains tracked separately");
+        TransformSystem.PropagateHierarchy(ref t2);
+        Assert.Equal((byte)0, t2.NeedsDepthRecompute, "SIM-14: NeedsDepthRecompute stays 0 on subsequent frames");
+
+        // Adding the missing parent resolves the hierarchy on next PropagateHierarchy
+        TransformSystem.Add(ref t2, missingParent, new Vec3(10f, 0f, 0f));
+        Assert.Equal((byte)1, t2.NeedsDepthRecompute, "SIM-14: Adding entity while HasUnresolvedParents=1 triggers recompute");
+        TransformSystem.PropagateHierarchy(ref t2);
+        Assert.Equal((byte)0, t2.HasUnresolvedParents, "SIM-14: HasUnresolvedParents cleared once parent exists");
+        Assert.Near(15f, TransformSystem.GetWorldPosition(in t2, orphan).X, 1e-4f, "SIM-14: Late parent resolved");
+
+        // SIM-14: Leaf Remove keeps depths & MaxDepth exact
+        var root = EntitySystem.Spawn(ref entities);
+        var mid = EntitySystem.Spawn(ref entities);
+        var leaf = EntitySystem.Spawn(ref entities);
+        var sibLeaf = EntitySystem.Spawn(ref entities);
+        TransformSystem.Add(ref t2, root, Vec3.Zero);
+        TransformSystem.Add(ref t2, mid, Vec3.UnitX, Quat.Identity, Vec3.One, parent: root);
+        TransformSystem.Add(ref t2, leaf, Vec3.UnitX, Quat.Identity, Vec3.One, parent: mid);
+        TransformSystem.Add(ref t2, sibLeaf, Vec3.UnitY, Quat.Identity, Vec3.One, parent: root);
+        TransformSystem.PropagateHierarchy(ref t2);
+        Assert.Equal((byte)2, t2.MaxDepth, "SIM-14: MaxDepth == 2 before leaf removes");
+        Assert.True(TransformSystem.Remove(ref t2, sibLeaf), "SIM-14: Remove non-deepest leaf");
+        Assert.Equal((byte)2, t2.MaxDepth, "SIM-14: MaxDepth remains 2 after non-deepest leaf remove");
+        Assert.Equal((byte)2, t2.Depth[TransformSystem.GetDenseIndex(in t2, leaf)], "SIM-14: Deepest leaf depth preserved");
+        Assert.True(TransformSystem.Remove(ref t2, leaf), "SIM-14: Remove deepest leaf");
+        Assert.Equal((byte)1, t2.MaxDepth, "SIM-14: MaxDepth drops to 1 when deepest leaf removed");
+
+        // SIM-14: Depth >= 254 falls back to serial safely even when JobScheduler is provided
+        var tDeep = TransformTable.Create(ref alloc.Persistent, 512, 512);
+        EntityId prev = EntityId.Invalid;
+        EntityId lastDeep = EntityId.Invalid;
+        for (int i = 0; i < 260; i++)
+        {
+            EntityId e = EntitySystem.Spawn(ref entities);
+            TransformSystem.Add(ref tDeep, e, new Vec3(1f, 0f, 0f), Quat.Identity, Vec3.One, parent: prev);
+            prev = e;
+            lastDeep = e;
+        }
+        Assert.Equal((byte)254, tDeep.MaxDepth, "SIM-14: Deep chain clamps byte MaxDepth at 254");
+        JobScheduler* jobs = alloc.Persistent.Alloc<JobScheduler>(1, 64);
+        JobSystem.Start(jobs, ref alloc.Persistent, workerCount: 2);
+        TransformSystem.PropagateHierarchy(ref tDeep, jobs);
+        Vec3 deepPos = TransformSystem.GetWorldPosition(in tDeep, lastDeep);
+        Assert.True(float.IsFinite(deepPos.X) && deepPos.X > 0f, "SIM-14: Deep chain >= 254 propagates serially without race");
+        JobSystem.Stop(jobs);
+
+        alloc.Dispose();
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
+    }
+
+    private static void TestDestroyEntity300ChildrenOverflow()
+    {
+        // SIM-05: Root with 300 direct children (>256 stack cap) destroys every child & component with 0 GC
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 128 * 1024, 128 * 1024, 64 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 512, 64);
+
+        var root = EntitySystem.Spawn(ref world.Entities);
+        TransformSystem.Add(ref world.Transforms, root, Vec3.Zero);
+
+        for (int i = 0; i < 300; i++)
+        {
+            var child = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, child, new Vec3(i, 0f, 0f), Quat.Identity, Vec3.One, parent: root);
+            RenderComponentSystem.AddSprite(ref world.RenderComponents, new SpriteData { Entity = child, Visible = 1 });
+        }
+
+        Assert.Equal(301, world.Entities.AliveCount, "SIM-05: 301 entities alive before destroy");
+        Assert.Equal(301, world.Transforms.Count, "SIM-05: 301 transforms before destroy");
+        Assert.Equal(300, world.RenderComponents.SpriteCount, "SIM-05: 300 sprites before destroy");
+
+        // Warmup JIT on a small throwaway entity before measuring 0 GC
+        var warmup = EntitySystem.Spawn(ref world.Entities);
+        TransformSystem.Add(ref world.Transforms, warmup, Vec3.Zero);
+        EngineWorldSystem.DestroyEntity(ref world, warmup);
+
+        long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+        EngineWorldSystem.DestroyEntity(ref world, root);
+        long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+
+        Assert.Equal(0L, gcAfter - gcBefore, "SIM-05: DestroyEntity(300 children) allocates 0 GC bytes");
+        Assert.Equal(0, world.Entities.AliveCount, "SIM-05: All 301 entities destroyed");
+        Assert.Equal(0, world.Transforms.Count, "SIM-05: All 301 transforms destroyed");
+        Assert.Equal(0, world.RenderComponents.SpriteCount, "SIM-05: All 300 sprites destroyed");
+
+        alloc.Dispose();
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
+    }
+
+    private static bool IsPlaneFinite(in Plane p)
+        => float.IsFinite(p.Normal.X) && float.IsFinite(p.Normal.Y) && float.IsFinite(p.Normal.Z) && float.IsFinite(p.D);
+
+    private static bool IsFrustumFinite(in Frustum f)
+        => IsPlaneFinite(in f.Left) && IsPlaneFinite(in f.Right)
+        && IsPlaneFinite(in f.Bottom) && IsPlaneFinite(in f.Top)
+        && IsPlaneFinite(in f.Near) && IsPlaneFinite(in f.Far);
+
+    private static bool IsMat4Finite(in Mat4 m)
+        => float.IsFinite(m.C0.X) && float.IsFinite(m.C0.Y) && float.IsFinite(m.C0.Z) && float.IsFinite(m.C0.W)
+        && float.IsFinite(m.C1.X) && float.IsFinite(m.C1.Y) && float.IsFinite(m.C1.Z) && float.IsFinite(m.C1.W)
+        && float.IsFinite(m.C2.X) && float.IsFinite(m.C2.Y) && float.IsFinite(m.C2.Z) && float.IsFinite(m.C2.W)
+        && float.IsFinite(m.C3.X) && float.IsFinite(m.C3.Y) && float.IsFinite(m.C3.Z) && float.IsFinite(m.C3.W);
+
+    private static void TestCameraAuditRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(256 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        var entities = EntityTable.Create(ref alloc.Persistent, 64);
+        var transforms = TransformTable.Create(ref alloc.Persistent, 64, 64);
+        var cameras = CameraTable.Create(ref alloc.Persistent, 16);
+
+        // SIM-10: Split-screen ViewportRect=(0.5, 0, 0.5, 1) at 1280x720
+        var splitCam = CameraSystem.CreatePerspective(ref cameras, new Vec3(0f, 5f, 10f), Vec3.Zero, 60f, 0.1f, 200f);
+        var splitPtr = CameraSystem.TryGetPtr(in cameras, splitCam);
+        splitPtr->ViewportRect = new Vec4(0.5f, 0f, 0.5f, 1f);
+        CameraSystem.UpdateAll(ref cameras, in transforms, 1f / 60f, 1280f, 720f);
+
+        Assert.True(CameraSystem.WorldToScreen(in *splitPtr, splitPtr->LookTarget, 1280f, 720f, out Vec3 sp), "SIM-10: WorldToScreen succeeds in right split viewport");
+        Assert.Near(960f, sp.X, 1f, "SIM-10: WorldToScreen X == 960 (center of right half)");
+        Assert.Near(360f, sp.Y, 1f, "SIM-10: WorldToScreen Y == 360");
+
+        Ray splitRay = CameraSystem.ScreenToWorldRay(in *splitPtr, 960f, 360f, 1280f, 720f);
+        Assert.True(Vec3.Dot(splitRay.Direction, splitPtr->Forward) > 0.999f, "SIM-10: ScreenToWorldRay(960, 360) aligns with cam.Forward");
+
+        // SIM-11: Degenerate ViewportRect.Z=0, FovYDeg=0, Near==Far produce all finite matrices & frustum
+        var badPersp = CameraSystem.CreatePerspective(ref cameras, new Vec3(0f, 2f, 5f), Vec3.Zero, fovYDeg: 0f, nearPlane: 10f, farPlane: 10f);
+        var badPerspPtr = CameraSystem.TryGetPtr(in cameras, badPersp);
+        badPerspPtr->ViewportRect = new Vec4(0f, 0f, 0f, 1f);
+
+        var badOrtho = CameraSystem.CreateOrthographicUI(ref cameras, 1280f, 720f);
+        var badOrthoPtr = CameraSystem.TryGetPtr(in cameras, badOrtho);
+        badOrthoPtr->OrthoHeight = 0f;
+        badOrthoPtr->NearPlane = 5f;
+        badOrthoPtr->FarPlane = 5f;
+        badOrthoPtr->ViewportRect = new Vec4(0f, 0f, 0f, 0f);
+
+        // SIM-11: OrbitTarget pole pitch == HalfPi with distinct OrbitYaw values stays finite and preserves distinct yaw
+        var pivotEnt = EntitySystem.Spawn(ref entities);
+        TransformSystem.Add(ref transforms, pivotEnt, new Vec3(0f, 0f, 0f));
+        TransformSystem.PropagateHierarchy(ref transforms);
+
+        var poleCamA = CameraSystem.CreatePerspective(ref cameras, Vec3.Zero, Vec3.Zero);
+        var polePtrA = CameraSystem.TryGetPtr(in cameras, poleCamA);
+        polePtrA->Mode = CameraMode.OrbitTarget;
+        polePtrA->TargetEntity = pivotEnt;
+        polePtrA->OrbitDistance = 10f;
+        polePtrA->OrbitPitch = DetMath.HalfPi;
+        polePtrA->OrbitYaw = 0f;
+
+        var poleCamB = CameraSystem.CreatePerspective(ref cameras, Vec3.Zero, Vec3.Zero);
+        var polePtrB = CameraSystem.TryGetPtr(in cameras, poleCamB);
+        polePtrB->Mode = CameraMode.OrbitTarget;
+        polePtrB->TargetEntity = pivotEnt;
+        polePtrB->OrbitDistance = 10f;
+        polePtrB->OrbitPitch = DetMath.HalfPi;
+        polePtrB->OrbitYaw = DetMath.HalfPi;
+
+        CameraSystem.UpdateAll(ref cameras, in transforms, 1f / 60f, 1280f, 720f);
+
+        Assert.True(IsMat4Finite(in badPerspPtr->ViewProjMatrix) && IsMat4Finite(in badPerspPtr->ProjMatrix), "SIM-11: Degenerate perspective matrices finite");
+        Assert.True(IsFrustumFinite(in badPerspPtr->Frustum), "SIM-11: Degenerate perspective frustum finite");
+        Assert.True(IsMat4Finite(in badOrthoPtr->ViewProjMatrix) && IsMat4Finite(in badOrthoPtr->ProjMatrix) && IsFrustumFinite(in badOrthoPtr->Frustum), "SIM-11: Degenerate ortho matrices & frustum finite");
+        Assert.True(IsMat4Finite(in polePtrA->ViewProjMatrix) && IsMat4Finite(in polePtrB->ViewProjMatrix), "SIM-11: OrbitTarget pole matrices finite");
+        Assert.True(float.IsFinite(polePtrA->Right.X) && float.IsFinite(polePtrB->Right.X), "SIM-11: OrbitTarget pole basis finite");
+        Assert.True(DetMath.Abs(Vec3.Dot(polePtrA->Right, polePtrB->Right)) < 0.1f, "SIM-11: Distinct OrbitYaw preserved at HalfPi pitch");
+
+        alloc.Dispose();
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
+    }
+
+    private static void TestInputAuditRegressions()
+    {
+        // SIM-19: TrimToUtf8RuneBoundary with 4+ trailing orphan continuation bytes & excess continuation bytes after valid lead
+        InputState input = default;
+        input.BeginFrame();
+
+        // 66 orphan continuation bytes (0x80) crossing MaxTextInputBytes (64)
+        Span<byte> orphans = stackalloc byte[66];
+        orphans.Fill(0x80);
+        input.AppendTextInputUtf8(orphans);
+        Assert.True(input.TextInputLength <= InputState.MaxTextInputBytes - 4, "SIM-19: 4+ trailing orphan continuation bytes trimmed cleanly");
+
+        // 60 ASCII 'A' + valid 2-byte 'é' (0xC3 0xA9) + 4 orphan continuation bytes (0x80) = 66 bytes -> truncated at 64 -> trims to 62 bytes!
+        input.BeginFrame();
+        Span<byte> mixed = stackalloc byte[66];
+        for (int i = 0; i < 60; i++) mixed[i] = (byte)'A';
+        mixed[60] = 0xC3;
+        mixed[61] = 0xA9;
+        mixed[62] = 0x80;
+        mixed[63] = 0x80;
+        mixed[64] = 0x80;
+        mixed[65] = 0x80;
+        input.AppendTextInputUtf8(mixed);
+        Assert.Equal((byte)62, input.TextInputLength, "SIM-19: Excess trailing continuation bytes after 2-byte rune trimmed to idx + expected (62)");
+        Span<char> decoded = stackalloc char[64];
+        int chars = input.CopyTextInputChars(decoded);
+        Assert.Equal(61, chars, "SIM-19: Decoded 60 'A' + 1 'é' without replacement corruption");
+        Assert.Equal('\u00E9', decoded[60], "SIM-19: Final rune is intact 'é'");
+
+        // Wave-A InputSystem.ApplyFocusLost clears keys, mouse, and gamepads while preserving release edges
+        input.BeginFrame();
+        input.SetKey(KeyCode.Space, true);
+        input.MouseButtonsDown |= 1u;
+        input.SetGamepadConnected(0, true, 123u);
+        input.SetGamepadButton(0, GamepadButton.South, true);
+        input.SetGamepadAxis(0, GamepadAxis.LeftX, 0.8f);
+        input.BeginFrame();
+
+        InputSystem.ApplyFocusLost(ref input);
+        Assert.True(!input.IsWindowFocused && input.WasWindowFocusLost, "ApplyFocusLost marks window unfocused with edge");
+        Assert.True(!input.IsKeyDown(KeyCode.Space) && input.IsKeyReleased(KeyCode.Space), "ApplyFocusLost releases held key");
+        Assert.True(!input.IsMouseDown(0) && input.IsMouseReleased(0), "ApplyFocusLost releases held mouse button");
+        Assert.True(!input.IsGamepadButtonDown(GamepadButton.South, 0) && input.IsGamepadButtonReleased(GamepadButton.South, 0), "ApplyFocusLost releases held gamepad button");
+        Assert.Near(0f, input.GetGamepad(0).LeftX, 1e-6f, "ApplyFocusLost zeroes gamepad analog axis");
+    }
+
+    private static SceneManager* s_reentrantSceneMgr;
+    private static int s_reentrantUnloadCalls;
+    private static int s_additiveFixedTicks;
+    private static int s_additiveViewTicks;
+    private static byte s_loaderTriggered;
+
+    private static void OnUnloadSelfReentrant(ref SceneContext ctx)
+    {
+        s_reentrantUnloadCalls++;
+        if (s_reentrantSceneMgr != null)
+            SceneSystem.UnloadScene(ref *s_reentrantSceneMgr, ref *ctx.World, ref *ctx.Allocators, ref *ctx.Bundles, ctx.Scene);
+    }
+
+    private static void OnLoadSingleAndThrow(ref SceneContext ctx)
+    {
+        EntitySystem.Spawn(ref ctx.World->Entities, ctx.Scene);
+        if (s_reentrantSceneMgr != null)
+            SceneSystem.LoadScene(ref *s_reentrantSceneMgr, ref *ctx.World, ref *ctx.Allocators, ref *ctx.Bundles, StringId.Hash("S2_Survivor"), SceneLoadMode.Single);
+        throw new InvalidOperationException("Simulated throw after re-entrant Single LoadScene");
+    }
+
+    private static void OnLoadSurvivor(ref SceneContext ctx)
+    {
+        // Write into scene arena and spawn entity so we verify arena survived intact
+        int* marker = ctx.SceneArena->Alloc<int>(1);
+        *marker = 42;
+        EntitySystem.Spawn(ref ctx.World->Entities, ctx.Scene);
+    }
+
+    private static void OnFixedLoadAdditive(ref SceneContext ctx)
+    {
+        if (s_loaderTriggered == 0 && s_reentrantSceneMgr != null)
+        {
+            s_loaderTriggered = 1;
+            SceneSystem.LoadScene(ref *s_reentrantSceneMgr, ref *ctx.World, ref *ctx.Allocators, ref *ctx.Bundles, StringId.Hash("S_AddTick"), SceneLoadMode.Additive);
+        }
+    }
+
+    private static void OnFixedAdditiveTick(ref SceneContext ctx) => s_additiveFixedTicks++;
+    private static void OnViewAdditiveTick(ref SceneContext ctx) => s_additiveViewTicks++;
+
+    private static void TestSceneManagerAuditRegressions()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 64 * 1024, 64 * 1024, 64 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 128, 32);
+        var bundles = BundleManager.Create(ref alloc.Persistent, 8);
+        var scenes = SceneManager.Create(ref alloc.Persistent, maxDefinitions: 16, maxActiveScenes: 4);
+
+        var b1 = BundleSystem.Register(ref bundles, "b_shared", 32 * 1024, &LoadDummyBundle);
+        Span<BundleId> deps1 = stackalloc BundleId[] { b1 };
+
+        // SIM-01: LinearArena.Create OOM releases acquired bundles cleanly
+        SceneSystem.RegisterScene(ref scenes, ref alloc.Persistent, "S_OomArena", deps1, nuint.MaxValue, &OnLoadOk);
+        bool arenaOomThrew = false;
+        try { SceneSystem.LoadScene(ref scenes, ref world, ref alloc, ref bundles, StringId.Hash("S_OomArena"), SceneLoadMode.Single); }
+        catch (OutOfMemoryException) { arenaOomThrew = true; }
+        Assert.True(arenaOomThrew, "SIM-01: Huge sceneArenaBytes threw OutOfMemoryException");
+        Assert.Equal(0, BundleSystem.GetRefCount(in bundles, b1), "SIM-01: Acquired bundle b1 RefCount == 0 after arena OOM");
+        Assert.True(!BundleSystem.IsLoaded(in bundles, b1), "SIM-01: b1 unloaded after arena OOM");
+        Assert.Equal(0, scenes.ActiveCount, "SIM-01: ActiveCount == 0 after arena OOM");
+
+        // SIM-02 (part A): Re-entrant UnloadScene(ctx.Scene) inside OnUnload with shared bundle held by another additive scene
+        SceneSystem.RegisterScene(ref scenes, ref alloc.Persistent, "S_Holder", deps1, 16 * 1024, &OnLoadOk);
+        SceneSystem.RegisterScene(ref scenes, ref alloc.Persistent, "S_ReUnload", deps1, 16 * 1024, &OnLoadOk, onUnload: &OnUnloadSelfReentrant);
+        SceneSystem.RegisterScene(ref scenes, ref alloc.Persistent, "S2_Survivor", deps1, 16 * 1024, &OnLoadSurvivor);
+        SceneSystem.RegisterScene(ref scenes, ref alloc.Persistent, "S1_ReLoadThrow", deps1, 16 * 1024, &OnLoadSingleAndThrow);
+
+        s_reentrantSceneMgr = &scenes;
+        s_reentrantUnloadCalls = 0;
+        var hHolder = SceneSystem.LoadScene(ref scenes, ref world, ref alloc, ref bundles, StringId.Hash("S_Holder"), SceneLoadMode.Single);
+        var hReUnload = SceneSystem.LoadScene(ref scenes, ref world, ref alloc, ref bundles, StringId.Hash("S_ReUnload"), SceneLoadMode.Additive);
+        Assert.Equal(2, scenes.ActiveCount, "SIM-02: Both additive scenes active");
+        Assert.Equal(2, BundleSystem.GetRefCount(in bundles, b1), "SIM-02: Shared bundle RefCount == 2");
+
+        Assert.True(SceneSystem.UnloadScene(ref scenes, ref world, ref alloc, ref bundles, hReUnload), "SIM-02: Unload S_ReUnload succeeded");
+        Assert.Equal(1, s_reentrantUnloadCalls, "SIM-02: Re-entrant UnloadScene skipped without recursion");
+        Assert.Equal(1, scenes.ActiveCount, "SIM-02: S_Holder remains active (ActiveCount == 1)");
+        Assert.Equal(1, BundleSystem.GetRefCount(in bundles, b1), "SIM-02: Shared bundle RefCount == 1 (no double-release)");
+        Assert.True(BundleSystem.IsLoaded(in bundles, b1), "SIM-02: Shared bundle remains loaded");
+        SceneSystem.UnloadScene(ref scenes, ref world, ref alloc, ref bundles, hHolder);
+
+        // SIM-02 (part B): Re-entrant LoadScene(Single) + throw inside OnLoad leaves S2_Survivor intact
+        bool reThrow = false;
+        try { SceneSystem.LoadScene(ref scenes, ref world, ref alloc, ref bundles, StringId.Hash("S1_ReLoadThrow"), SceneLoadMode.Single); }
+        catch (InvalidOperationException) { reThrow = true; }
+        Assert.True(reThrow, "SIM-02: Re-entrant OnLoad exception propagated");
+        Assert.Equal(1, scenes.ActiveCount, "SIM-02: S2_Survivor remains active after S1 OnLoad threw");
+        Assert.Equal(1, world.Entities.AliveCount, "SIM-02: S2_Survivor entity alive");
+        Assert.Equal(1, BundleSystem.GetRefCount(in bundles, b1), "SIM-02: S2_Survivor bundle RefCount == 1");
+        SceneSystem.UnloadAllScenes(ref scenes, ref world, ref alloc, ref bundles);
+        Assert.Equal(0, scenes.ActiveCount, "SIM-02: All scenes unloaded cleanly");
+        Assert.Equal(0, BundleSystem.GetRefCount(in bundles, b1), "SIM-02: Bundle RefCount == 0 after unload");
+
+        // SIM-18 (part A): RegisterScene OOM preserves DefinitionCount
+        var tinyArena = LinearArena.Create(64);
+        int defCountBefore = scenes.DefinitionCount;
+        Span<BundleId> bigDeps = stackalloc BundleId[16];
+        for (int i = 0; i < 16; i++) bigDeps[i] = b1;
+        bool regOomThrew = false;
+        try { SceneSystem.RegisterScene(ref scenes, ref tinyArena, "S_TinyFail", bigDeps, 1024, &OnLoadOk); }
+        catch (OutOfMemoryException) { regOomThrew = true; }
+        Assert.True(regOomThrew, "SIM-18: RegisterScene threw OOM on undersized arena");
+        Assert.Equal(defCountBefore, scenes.DefinitionCount, "SIM-18: DefinitionCount preserved on OOM (no zombie slot)");
+        tinyArena.Dispose();
+
+        // SIM-18 (part B): Additive scene loaded inside OnFixedUpdate behaves identically regardless of slot order
+        SceneSystem.RegisterScene(ref scenes, ref alloc.Persistent, "S_Loader", default, 8 * 1024, &OnLoadOk, onFixedUpdate: &OnFixedLoadAdditive);
+        SceneSystem.RegisterScene(ref scenes, ref alloc.Persistent, "S_AddTick", default, 8 * 1024, &OnLoadOk, onFixedUpdate: &OnFixedAdditiveTick, onViewSync: &OnViewAdditiveTick);
+
+        // Order 1: S_Loader in slot 0 -> loads S_AddTick into slot 1
+        s_loaderTriggered = 0;
+        s_additiveFixedTicks = 0;
+        s_additiveViewTicks = 0;
+        SceneSystem.LoadScene(ref scenes, ref world, ref alloc, ref bundles, StringId.Hash("S_Loader"), SceneLoadMode.Single);
+        SceneSystem.FixedUpdateActiveScenes(ref scenes, ref world, ref alloc, ref bundles, 1f / 60f);
+        int ticksOrder1SameFrame = s_additiveFixedTicks;
+        SceneSystem.FixedUpdateActiveScenes(ref scenes, ref world, ref alloc, ref bundles, 1f / 60f);
+        SceneSystem.ViewSyncActiveScenes(ref scenes, ref world, ref alloc, ref bundles, 1f / 60f);
+        Assert.Equal(0, ticksOrder1SameFrame, "SIM-18: Order 1 newly loaded additive scene does not run on same tick");
+        Assert.Equal(1, s_additiveFixedTicks, "SIM-18: Order 1 additive scene runs on next tick");
+        Assert.Equal(1, s_additiveViewTicks, "SIM-18: Order 1 additive ViewSync runs cleanly");
+        SceneSystem.UnloadAllScenes(ref scenes, ref world, ref alloc, ref bundles);
+
+        // Order 2: Fill slot 0 with S_Holder, load S_Loader into slot 1, unload slot 0 -> S_Loader loads S_AddTick into slot 0
+        s_loaderTriggered = 0;
+        s_additiveFixedTicks = 0;
+        var hSlot0 = SceneSystem.LoadScene(ref scenes, ref world, ref alloc, ref bundles, StringId.Hash("S_Holder"), SceneLoadMode.Single);
+        SceneSystem.LoadScene(ref scenes, ref world, ref alloc, ref bundles, StringId.Hash("S_Loader"), SceneLoadMode.Additive);
+        SceneSystem.UnloadScene(ref scenes, ref world, ref alloc, ref bundles, hSlot0);
+        SceneSystem.FixedUpdateActiveScenes(ref scenes, ref world, ref alloc, ref bundles, 1f / 60f);
+        int ticksOrder2SameFrame = s_additiveFixedTicks;
+        SceneSystem.FixedUpdateActiveScenes(ref scenes, ref world, ref alloc, ref bundles, 1f / 60f);
+        Assert.Equal(ticksOrder1SameFrame, ticksOrder2SameFrame, "SIM-18: Slot order 1 and slot order 2 produce identical tick behavior");
+        Assert.Equal(1, s_additiveFixedTicks, "SIM-18: Order 2 additive scene runs on next tick");
+
+        SceneSystem.UnloadAllScenes(ref scenes, ref world, ref alloc, ref bundles);
+        s_reentrantSceneMgr = null;
+        alloc.Dispose();
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
+    }
+
+    private static void TestSimulationTableCapacityBounds()
+    {
+        // SIM-20: Simulation table Create methods reject <= 0 and > (HandlePacking.IndexMask + 1)
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(64 * 1024, 16 * 1024, 16 * 1024, 16 * 1024);
+        int overMax = (int)HandlePacking.IndexMask + 2;
+
+        bool threw = false;
+        try { EntityTable.Create(ref alloc.Persistent, overMax); } catch (ArgumentOutOfRangeException) { threw = true; }
+        Assert.True(threw, "SIM-20: EntityTable rejects capacity > IndexMask+1");
+
+        threw = false;
+        try { EntityTable.Create(ref alloc.Persistent, 0); } catch (ArgumentOutOfRangeException) { threw = true; }
+        Assert.True(threw, "SIM-20: EntityTable rejects capacity <= 0");
+
+        threw = false;
+        try { TransformTable.Create(ref alloc.Persistent, overMax, 16); } catch (ArgumentOutOfRangeException) { threw = true; }
+        Assert.True(threw, "SIM-20: TransformTable rejects maxEntities > IndexMask+1");
+
+        threw = false;
+        try { CameraTable.Create(ref alloc.Persistent, overMax); } catch (ArgumentOutOfRangeException) { threw = true; }
+        Assert.True(threw, "SIM-20: CameraTable rejects capacity > IndexMask+1");
+
+        threw = false;
+        try { TweenTable.Create(ref alloc.Persistent, overMax); } catch (ArgumentOutOfRangeException) { threw = true; }
+        Assert.True(threw, "SIM-20: TweenTable rejects capacity > IndexMask+1");
+
+        threw = false;
+        try { RenderComponentTables.Create(ref alloc.Persistent, 16, overMax, 16); } catch (ArgumentOutOfRangeException) { threw = true; }
+        Assert.True(threw, "SIM-20: RenderComponentTables rejects maxSprites > IndexMask+1");
+
+        threw = false;
+        try { RenderComponentTables.Create(ref alloc.Persistent, 16, 16, 0); } catch (ArgumentOutOfRangeException) { threw = true; }
+        Assert.True(threw, "SIM-20: RenderComponentTables rejects maxTexts <= 0");
+
+        threw = false;
+        try { SceneManager.Create(ref alloc.Persistent, 16, overMax); } catch (ArgumentOutOfRangeException) { threw = true; }
+        Assert.True(threw, "SIM-20: SceneManager rejects maxActiveScenes > IndexMask+1");
+
+        alloc.Dispose();
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
     }
 }

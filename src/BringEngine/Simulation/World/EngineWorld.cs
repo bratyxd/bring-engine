@@ -72,15 +72,21 @@ public static unsafe class EngineWorldSystem
             if (!EntitySystem.IsAlive(in world.Entities, cur)) continue;
 
             // Collect direct children before TransformSystem.Remove clears their Parent links
-            for (int i = 0; i < world.Transforms.Count; i++)
+            for (int i = world.Transforms.Count - 1; i >= 0; i--)
             {
                 if (world.Transforms.Parent[i] == cur)
                 {
                     EntityId child = world.Transforms.DenseEntity[i];
                     if (sp < StackCap)
+                    {
                         stack[sp++] = child;
+                    }
                     else
+                    {
                         DestroyEntity(ref world, child);
+                        if (i >= world.Transforms.Count)
+                            i = world.Transforms.Count;
+                    }
                 }
             }
 
@@ -127,7 +133,7 @@ public static unsafe class EngineWorldSystem
         float viewportHeight = 720f,
         JobScheduler* jobs = null)
     {
-        TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, dt);
+        TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, ref world.RenderComponents, dt);
         TransformSystem.PropagateHierarchy(ref world.Transforms, jobs);
         AnimationSystem.StepAll(ref world.Animations, dt, ref alloc.Frame, ref alloc.Scratch);
         ParticleSystem.Step(ref world.Particles, in world.Transforms, dt, jobs);

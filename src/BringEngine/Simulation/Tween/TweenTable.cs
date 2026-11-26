@@ -5,6 +5,7 @@ using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
 using BringEngine.Simulation.Camera;
+using BringEngine.Simulation.RenderData;
 using BringEngine.Simulation.World;
 
 namespace BringEngine.Simulation.Tween;
@@ -39,6 +40,10 @@ public enum TweenTargetKind : byte
     CameraOrthoHeight = 32,
     CameraOrbitYaw = 33,
     CameraOrbitDistance = 34,
+    TextTypewriter = 40,
+    TextGlowIntensity = 41,
+    TextColor = 42,
+    SpriteColor = 43,
 
     // Custom callback target (fires delegate*<uint, Vec4, void> every step with interpolated value)
     CustomCallback = 60,
@@ -102,6 +107,10 @@ public unsafe struct TweenTable
 
     public static TweenTable Create(ref LinearArena arena, int maxTweens = 4096)
     {
+        const int maxCap = (int)(HandlePacking.IndexMask + 1u);
+        if (maxTweens < 1 || maxTweens > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxTweens), maxTweens, $"Capacity must be in [1, {maxCap}].");
+
         TweenData* dense = arena.Alloc<TweenData>(maxTweens, 64);
         int* slotToDense = arena.AllocUninitialized<int>(maxTweens, 64);
         uint* gens = arena.AllocUninitialized<uint>(maxTweens, 64);
@@ -150,8 +159,10 @@ public static unsafe class TweenSystem
         data.Handle = handle;
         data.Flags |= 1; // Active
         if (table.Stepping != 0) data.Flags |= 32; // Defer stepping newly-spawned callback tweens to next tick
-        if (data.TimeScale <= 0f) data.TimeScale = 1f;
-        if (data.Duration <= 0f) data.Duration = 0.0001f;
+        if (!float.IsFinite(data.TimeScale) || data.TimeScale <= 0f) data.TimeScale = 1f;
+        if (!float.IsFinite(data.Duration) || data.Duration <= 0f) data.Duration = 0.0001f;
+        if (!float.IsFinite(data.Delay) || data.Delay < 0f) data.Delay = 0f;
+        if (!float.IsFinite(data.Elapsed) || data.Elapsed < 0f) data.Elapsed = 0f;
         table.Dense[denseIdx] = data;
         return handle;
     }
@@ -529,6 +540,98 @@ public static unsafe class TweenSystem
         });
     }
 
+    public static TweenHandle TextTypewriter(
+        ref TweenTable table, TextHandle text, float from, float to, float duration,
+        EaseType ease = EaseType.Linear, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            OwnerEntity = ownerEntity,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.TextTypewriter,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = new Vec4(from, 0, 0, 0),
+            EndValue = new Vec4(to, 0, 0, 0),
+            TargetHandleRaw = text.Raw,
+        });
+    }
+
+    public static TweenHandle TextGlowIntensity(
+        ref TweenTable table, TextHandle text, float from, float to, float duration,
+        EaseType ease = EaseType.InOutSine, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            OwnerEntity = ownerEntity,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.TextGlowIntensity,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = new Vec4(from, 0, 0, 0),
+            EndValue = new Vec4(to, 0, 0, 0),
+            TargetHandleRaw = text.Raw,
+        });
+    }
+
+    public static TweenHandle TextColor(
+        ref TweenTable table, TextHandle text, ColorF from, ColorF to, float duration,
+        EaseType ease = EaseType.OutQuad, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            OwnerEntity = ownerEntity,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.TextColor,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = from.ToVec4(),
+            EndValue = to.ToVec4(),
+            TargetHandleRaw = text.Raw,
+        });
+    }
+
+    public static TweenHandle SpriteColor(
+        ref TweenTable table, SpriteHandle sprite, ColorF from, ColorF to, float duration,
+        EaseType ease = EaseType.OutQuad, float delay = 0f,
+        TweenLoopMode loopMode = TweenLoopMode.Once, int loops = 0,
+        SceneId scene = default, uint groupId = 0, EntityId ownerEntity = default)
+    {
+        return Spawn(ref table, new TweenData
+        {
+            OwnerScene = scene,
+            OwnerEntity = ownerEntity,
+            GroupId = groupId,
+            TargetKind = TweenTargetKind.SpriteColor,
+            Ease = ease,
+            LoopMode = loopMode,
+            Delay = delay,
+            Duration = duration,
+            RemainingLoops = loops,
+            StartValue = from.ToVec4(),
+            EndValue = to.ToVec4(),
+            TargetHandleRaw = sprite.Raw,
+        });
+    }
+
     public static bool Pause(ref TweenTable table, TweenHandle handle)
     {
         TweenData* ptr = TryGetPtr(in table, handle);
@@ -547,6 +650,7 @@ public static unsafe class TweenSystem
 
     /// <summary>
     /// Chains 'next' to start automatically when 'first' completes (Tween Sequence!).
+    /// Rejects cycles and already-chained targets, and releases any overwritten previous successor.
     /// </summary>
     public static void Chain(ref TweenTable table, TweenHandle first, TweenHandle next)
     {
@@ -554,6 +658,28 @@ public static unsafe class TweenSystem
         TweenData* f = TryGetPtr(in table, first);
         TweenData* n = TryGetPtr(in table, next);
         if (f == null || n == null) return;
+        if (n->IsWaitingInSequence) return;
+
+        // Walk next's existing chain (bounded by ActiveCount) and reject cycles back to first
+        TweenHandle cur = n->NextInSequence;
+        int guard = 0;
+        while (cur.IsValid && guard < table.ActiveCount)
+        {
+            if (cur == first) return;
+            TweenData* cp = TryGetPtr(in table, cur);
+            if (cp == null) break;
+            cur = cp->NextInSequence;
+            guard++;
+        }
+
+        // Release any previous successor so overwriting Chain(first, old) does not orphan old
+        if (f->NextInSequence.IsValid && f->NextInSequence != next)
+        {
+            TweenData* oldNext = TryGetPtr(in table, f->NextInSequence);
+            if (oldNext != null)
+                oldNext->Flags = (byte)(oldNext->Flags & ~16);
+        }
+
         f->NextInSequence = next;
         n->Flags |= 16; // WaitingInSequence
     }
@@ -660,7 +786,32 @@ public static unsafe class TweenSystem
         ref CameraTable cameras,
         float dt)
     {
-        if (table.ActiveCount == 0) return;
+        StepAllInternal(ref table, ref transforms, ref cameras, null, dt);
+    }
+
+    /// <summary>
+    /// Advances all active tweens including handle-safe TextHandle and SpriteHandle render component targets.
+    /// Destroyed Text/Sprite targets auto-kill their tweens cleanly without swap-back pointer hazards. Zero heap allocations.
+    /// </summary>
+    public static void StepAll(
+        ref TweenTable table,
+        ref TransformTable transforms,
+        ref CameraTable cameras,
+        ref RenderComponentTables renderComponents,
+        float dt)
+    {
+        fixed (RenderComponentTables* rcPtr = &renderComponents)
+            StepAllInternal(ref table, ref transforms, ref cameras, rcPtr, dt);
+    }
+
+    private static void StepAllInternal(
+        ref TweenTable table,
+        ref TransformTable transforms,
+        ref CameraTable cameras,
+        RenderComponentTables* renderComponents,
+        float dt)
+    {
+        if (table.ActiveCount == 0 || table.Stepping != 0 || !float.IsFinite(dt) || dt < 0f) return;
 
         for (int k = 0; k < table.ActiveCount; k++)
             table.Dense[k].Flags = (byte)(table.Dense[k].Flags & ~32);
@@ -683,6 +834,7 @@ public static unsafe class TweenSystem
                 TweenHandle handle = tw.Handle;
 
                 float step = dt * tw.TimeScale;
+                if (!float.IsFinite(step) || step < 0f) step = 0f;
                 if (tw.Delay > 0f)
                 {
                     tw.Delay -= step;
@@ -696,13 +848,43 @@ public static unsafe class TweenSystem
                 }
 
                 tw.Elapsed += step;
-                float rawT = tw.Elapsed / tw.Duration;
-                bool finishedPass = rawT >= 1f;
-                float clampedT = DetMath.Clamp01(rawT);
+                bool finished = false;
+                if (tw.Elapsed >= tw.Duration || !float.IsFinite(tw.Elapsed))
+                {
+                    if (tw.LoopMode != TweenLoopMode.Once && tw.RemainingLoops != 0)
+                    {
+                        double ratio = (double)tw.Elapsed / (double)tw.Duration;
+                        if (tw.RemainingLoops > 0 && (!double.IsFinite(ratio) || ratio >= (double)tw.RemainingLoops + 1.0))
+                        {
+                            if (tw.LoopMode == TweenLoopMode.PingPong && (tw.RemainingLoops & 1) != 0)
+                                tw.Flags ^= 4;
+                            tw.RemainingLoops = 0;
+                            finished = true;
+                        }
+                        else
+                        {
+                            long passes = (double.IsFinite(ratio) && ratio >= 1.0 && ratio < 9.0e15)
+                                ? (long)Math.Floor(ratio)
+                                : 1L;
+                            if (tw.RemainingLoops > 0)
+                                tw.RemainingLoops -= (int)passes;
+                            if (tw.LoopMode == TweenLoopMode.PingPong && (passes & 1L) != 0)
+                                tw.Flags ^= 4;
+                            double rem = (double)tw.Elapsed % (double)tw.Duration;
+                            tw.Elapsed = (double.IsFinite(rem) && rem >= 0.0) ? (float)rem : 0f;
+                        }
+                    }
+                    else
+                    {
+                        finished = true;
+                    }
+                }
+
+                float clampedT = finished ? 1f : DetMath.Clamp01(tw.Elapsed / tw.Duration);
                 float evalT = tw.IsReversed ? (1f - clampedT) : clampedT;
                 float eased = tw.UseCustomCurve ? tw.Curve.Evaluate(evalT) : Easing.Evaluate(tw.Ease, evalT);
 
-                ApplyValue(in tw, eased, ref transforms, ref cameras);
+                bool targetAlive = ApplyValue(in tw, eased, ref transforms, ref cameras, renderComponents);
 
                 // Re-validate handle after ApplyValue because CustomCallback OnStep may kill/mutate tweens
                 TweenData* postPtr = TryGetPtr(in table, handle);
@@ -717,50 +899,45 @@ public static unsafe class TweenSystem
                 }
 
                 int curIdx = (int)(postPtr - table.Dense);
-                if (finishedPass)
+                if (!targetAlive)
                 {
-                    bool shouldLoop = postPtr->LoopMode != TweenLoopMode.Once && (postPtr->RemainingLoops != 0);
-                    if (shouldLoop)
+                    KillChainFromDense(ref table, curIdx);
+                    table.StepMutated = 0;
+                    i = 0;
+                    continue;
+                }
+
+                if (finished)
+                {
+                    TweenHandle next = postPtr->NextInSequence;
+                    var onComplete = postPtr->OnComplete;
+                    uint userData = postPtr->UserData;
+                    postPtr->NextInSequence = TweenHandle.Invalid;
+
+                    RemoveDenseAt(ref table, curIdx);
+
+                    if (next.IsValid)
                     {
-                        if (postPtr->RemainingLoops > 0) postPtr->RemainingLoops--;
-                        postPtr->Elapsed -= postPtr->Duration;
-                        if (postPtr->LoopMode == TweenLoopMode.PingPong)
-                            postPtr->Flags ^= 4; // toggle Reversed
-                        if (table.StepMutated != 0) { table.StepMutated = 0; i = 0; }
-                        else i++;
+                        TweenData* nextPtr = TryGetPtr(in table, next);
+                        if (nextPtr != null)
+                        {
+                            // Release sequence wait and mark SteppedThisPass so wakeup happens uniformly next tick regardless of slot order
+                            nextPtr->Flags = (byte)((nextPtr->Flags & ~16) | 32);
+                        }
                     }
-                    else
+
+                    if (onComplete != null)
+                        onComplete(userData);
+
+                    if (table.StepMutated != 0)
                     {
-                        TweenHandle next = postPtr->NextInSequence;
-                        var onComplete = postPtr->OnComplete;
-                        uint userData = postPtr->UserData;
-                        postPtr->NextInSequence = TweenHandle.Invalid;
-
-                        RemoveDenseAt(ref table, curIdx);
-
-                        if (next.IsValid)
-                        {
-                            TweenData* nextPtr = TryGetPtr(in table, next);
-                            if (nextPtr != null)
-                            {
-                                // Release sequence wait and mark SteppedThisPass so wakeup happens uniformly next tick regardless of slot order
-                                nextPtr->Flags = (byte)((nextPtr->Flags & ~16) | 32);
-                            }
-                        }
-
-                        if (onComplete != null)
-                            onComplete(userData);
-
-                        if (table.StepMutated != 0)
-                        {
-                            table.StepMutated = 0;
-                            i = 0;
-                        }
-                        else if (curIdx != i)
-                        {
-                            // A callback shifted our tween before removal; restart safely
-                            i = 0;
-                        }
+                        table.StepMutated = 0;
+                        i = 0;
+                    }
+                    else if (curIdx != i)
+                    {
+                        // A callback shifted our tween before removal; restart safely
+                        i = 0;
                     }
                 }
                 else
@@ -785,7 +962,12 @@ public static unsafe class TweenSystem
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ApplyValue(in TweenData tw, float t, ref TransformTable transforms, ref CameraTable cameras)
+    private static bool ApplyValue(
+        in TweenData tw,
+        float t,
+        ref TransformTable transforms,
+        ref CameraTable cameras,
+        RenderComponentTables* renderComponents)
     {
         Vec4 v = Vec4.Lerp(tw.StartValue, tw.EndValue, t);
 
@@ -866,9 +1048,43 @@ public static unsafe class TweenSystem
                 }
                 break;
 
+            case TweenTargetKind.TextTypewriter:
+                if (renderComponents != null)
+                {
+                    TextData* txt = RenderComponentSystem.TryGetText(in *renderComponents, new TextHandle(tw.TargetHandleRaw));
+                    if (txt == null) return false;
+                    txt->TypewriterProgress = v.X;
+                }
+                break;
+            case TweenTargetKind.TextGlowIntensity:
+                if (renderComponents != null)
+                {
+                    TextData* txt = RenderComponentSystem.TryGetText(in *renderComponents, new TextHandle(tw.TargetHandleRaw));
+                    if (txt == null) return false;
+                    txt->GlowIntensity = v.X;
+                }
+                break;
+            case TweenTargetKind.TextColor:
+                if (renderComponents != null)
+                {
+                    TextData* txt = RenderComponentSystem.TryGetText(in *renderComponents, new TextHandle(tw.TargetHandleRaw));
+                    if (txt == null) return false;
+                    txt->Color = new ColorF(v.X, v.Y, v.Z, v.W);
+                }
+                break;
+            case TweenTargetKind.SpriteColor:
+                if (renderComponents != null)
+                {
+                    SpriteData* sp = RenderComponentSystem.TryGetSprite(in *renderComponents, new SpriteHandle(tw.TargetHandleRaw));
+                    if (sp == null) return false;
+                    sp->Color = new ColorF(v.X, v.Y, v.Z, v.W);
+                }
+                break;
+
             case TweenTargetKind.CustomCallback:
                 if (tw.OnStep != null) tw.OnStep(tw.UserData, v);
                 break;
         }
+        return true;
     }
 }

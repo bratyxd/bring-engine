@@ -96,6 +96,10 @@ public unsafe struct CameraTable
 
     public static CameraTable Create(ref LinearArena arena, int maxCameras = 32)
     {
+        const int maxCap = (int)(HandlePacking.IndexMask + 1u);
+        if (maxCameras < 1 || maxCameras > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxCameras), maxCameras, $"Capacity must be in [1, {maxCap}].");
+
         CameraData* slots = arena.Alloc<CameraData>(maxCameras, 64);
         uint* gens = arena.AllocUninitialized<uint>(maxCameras, 16);
         byte* alive = arena.Alloc<byte>(maxCameras, 16);
@@ -255,8 +259,9 @@ public static unsafe class CameraSystem
     /// </summary>
     public static void UpdateAll(ref CameraTable table, in TransformTable transforms, float dt, float viewportWidth, float viewportHeight)
     {
-        if (viewportWidth < 1f) viewportWidth = 1f;
-        if (viewportHeight < 1f) viewportHeight = 1f;
+        if (!float.IsFinite(dt) || dt < 0f) dt = 0f;
+        if (!float.IsFinite(viewportWidth) || viewportWidth < 1f) viewportWidth = 1f;
+        if (!float.IsFinite(viewportHeight) || viewportHeight < 1f) viewportHeight = 1f;
 
         for (int i = 0; i < table.Capacity; i++)
         {
@@ -283,11 +288,16 @@ public static unsafe class CameraSystem
                 if (td >= 0)
                 {
                     Vec3 pivot = transforms.WorldPosition[td] + cam.LookOffset;
-                    float cp = DetMath.Cos(cam.OrbitPitch);
+                    float pitch = float.IsFinite(cam.OrbitPitch)
+                        ? DetMath.Clamp(cam.OrbitPitch, -DetMath.HalfPi + 0.001f, DetMath.HalfPi - 0.001f)
+                        : 0f;
+                    float yaw = float.IsFinite(cam.OrbitYaw) ? cam.OrbitYaw : 0f;
+                    float dist = float.IsFinite(cam.OrbitDistance) ? cam.OrbitDistance : 1f;
+                    float cp = DetMath.Cos(pitch);
                     Vec3 offset = new Vec3(
-                        DetMath.Sin(cam.OrbitYaw) * cp * cam.OrbitDistance,
-                        DetMath.Sin(cam.OrbitPitch) * cam.OrbitDistance,
-                        DetMath.Cos(cam.OrbitYaw) * cp * cam.OrbitDistance);
+                        DetMath.Sin(yaw) * cp * dist,
+                        DetMath.Sin(pitch) * dist,
+                        DetMath.Cos(yaw) * cp * dist);
                     cam.Position = pivot + offset;
                     cam.LookTarget = pivot;
                 }
@@ -328,32 +338,42 @@ public static unsafe class CameraSystem
             cam.ShakenPosition = cam.Position + shakeOffset;
             float vpW = viewportWidth * cam.ViewportRect.Z;
             float vpH = viewportHeight * cam.ViewportRect.W;
-            float aspect = vpH > 0f ? vpW / vpH : 16f / 9f;
+            float aspect = (float.IsFinite(vpW) && float.IsFinite(vpH) && vpW > 0f && vpH > 0f) ? vpW / vpH : (16f / 9f);
 
             Vec3 shakenTarget = cam.Projection == CameraProjection.Perspective
                 ? cam.LookTarget + shakeOffset * 0.35f
                 : cam.LookTarget + shakeOffset;
 
-            Vec3 effectiveUp = cam.Up;
+            Vec3 effectiveUp = cam.Up.LengthSq() > 1e-6f ? cam.Up : Vec3.Up;
             if (shakeRoll != 0f)
             {
                 Vec3 fwdAxis = (shakenTarget - cam.ShakenPosition).Normalized();
                 if (fwdAxis.LengthSq() > 1e-6f)
-                    effectiveUp = Quat.FromAxisAngle(fwdAxis, shakeRoll).Rotate(cam.Up);
+                    effectiveUp = Quat.FromAxisAngle(fwdAxis, shakeRoll).Rotate(effectiveUp);
             }
 
             if (cam.Projection == CameraProjection.Perspective)
             {
+                float fovDeg = float.IsFinite(cam.FovYDeg) ? DetMath.Clamp(cam.FovYDeg, 1f, 179f) : 60f;
+                float near = (float.IsFinite(cam.NearPlane) && cam.NearPlane > 1e-4f) ? cam.NearPlane : 0.1f;
+                float far = float.IsFinite(cam.FarPlane) ? cam.FarPlane : near + 100f;
+                if (DetMath.Abs(far - near) <= 1e-4f || far <= near)
+                    far = near + 1f;
                 cam.ViewMatrix = Mat4.CreateLookAt(cam.ShakenPosition, shakenTarget, effectiveUp);
-                cam.ProjMatrix = Mat4.CreatePerspective(cam.FovYDeg * DetMath.Deg2Rad, aspect, cam.NearPlane, cam.FarPlane);
+                cam.ProjMatrix = Mat4.CreatePerspective(fovDeg * DetMath.Deg2Rad, aspect, near, far);
             }
             else
             {
                 // UI / 2D orthographic: origin top-left or centered via Position
-                float halfH = cam.OrthoHeight * 0.5f;
+                float orthoH = (float.IsFinite(cam.OrthoHeight) && cam.OrthoHeight > 1e-4f) ? cam.OrthoHeight : 1f;
+                float near = float.IsFinite(cam.NearPlane) ? cam.NearPlane : -100f;
+                float far = float.IsFinite(cam.FarPlane) ? cam.FarPlane : 100f;
+                if (DetMath.Abs(far - near) <= 1e-4f)
+                    far = near + 1f;
+                float halfH = orthoH * 0.5f;
                 float halfW = halfH * aspect;
                 cam.ViewMatrix = Mat4.CreateLookAt(cam.ShakenPosition, shakenTarget, effectiveUp);
-                cam.ProjMatrix = Mat4.CreateOrtho(-halfW, halfW, -halfH, halfH, cam.NearPlane, cam.FarPlane);
+                cam.ProjMatrix = Mat4.CreateOrtho(-halfW, halfW, -halfH, halfH, near, far);
             }
 
             cam.ViewProjMatrix = Mat4.Multiply(in cam.ProjMatrix, in cam.ViewMatrix);
@@ -367,15 +387,30 @@ public static unsafe class CameraSystem
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ComputeViewportPixels(
+        in CameraData cam, float screenW, float screenH,
+        out float vpX, out float vpY, out float vpW, out float vpH)
+    {
+        if (!float.IsFinite(screenW) || screenW < 1f) screenW = 1f;
+        if (!float.IsFinite(screenH) || screenH < 1f) screenH = 1f;
+        vpX = float.IsFinite(cam.ViewportRect.X) ? cam.ViewportRect.X * screenW : 0f;
+        vpY = float.IsFinite(cam.ViewportRect.Y) ? cam.ViewportRect.Y * screenH : 0f;
+        vpW = (float.IsFinite(cam.ViewportRect.Z) && cam.ViewportRect.Z > 0f) ? cam.ViewportRect.Z * screenW : screenW;
+        vpH = (float.IsFinite(cam.ViewportRect.W) && cam.ViewportRect.W > 0f) ? cam.ViewportRect.W * screenH : screenH;
+        if (vpW < 1f) vpW = 1f;
+        if (vpH < 1f) vpH = 1f;
+    }
+
     /// <summary>
-    /// Unprojects screen pixel coordinates (0..screenW, 0..screenH top-left origin) into a 3D world ray.
+    /// Unprojects screen pixel coordinates (0..screenW, 0..screenH top-left origin) into a 3D world ray,
+    /// respecting the camera's normalized ViewportRect for split-screen and picture-in-picture cameras.
     /// </summary>
     public static Ray ScreenToWorldRay(in CameraData cam, float screenX, float screenY, float screenW, float screenH)
     {
-        if (screenW < 1f) screenW = 1f;
-        if (screenH < 1f) screenH = 1f;
-        float ndcX = (screenX / screenW) * 2f - 1f;
-        float ndcY = 1f - (screenY / screenH) * 2f;
+        ComputeViewportPixels(in cam, screenW, screenH, out float vpX, out float vpY, out float vpW, out float vpH);
+        float ndcX = ((screenX - vpX) / vpW) * 2f - 1f;
+        float ndcY = 1f - ((screenY - vpY) / vpH) * 2f;
 
         Vec4 nearClip = new Vec4(ndcX, ndcY, 0f, 1f);
         Vec4 farClip = new Vec4(ndcX, ndcY, 1f, 1f);
@@ -396,11 +431,12 @@ public static unsafe class CameraSystem
             screenPos = Vec3.Zero;
             return false;
         }
+        ComputeViewportPixels(in cam, screenW, screenH, out float vpX, out float vpY, out float vpW, out float vpH);
         float invW = 1f / clip.W;
         float ndcX = clip.X * invW;
         float ndcY = clip.Y * invW;
         float ndcZ = clip.Z * invW;
-        screenPos = new Vec3((ndcX * 0.5f + 0.5f) * screenW, (0.5f - ndcY * 0.5f) * screenH, ndcZ);
+        screenPos = new Vec3(vpX + (ndcX * 0.5f + 0.5f) * vpW, vpY + (0.5f - ndcY * 0.5f) * vpH, ndcZ);
         return ndcZ >= 0f && ndcZ <= 1f;
     }
 

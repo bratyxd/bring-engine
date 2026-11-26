@@ -26,6 +26,10 @@ public unsafe struct EntityTable
 
     public static EntityTable Create(ref LinearArena arena, int maxEntities)
     {
+        const int maxCap = (int)(HandlePacking.IndexMask + 1u);
+        if (maxEntities < 1 || maxEntities > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxEntities), maxEntities, $"Capacity must be in [1, {maxCap}].");
+
         uint* gens = arena.AllocUninitialized<uint>(maxEntities, 64);
         byte* alive = arena.Alloc<byte>(maxEntities, 64);
         SceneId* scenes = arena.Alloc<SceneId>(maxEntities, 64);

@@ -75,6 +75,12 @@ public unsafe struct SceneManager
         int maxActiveScenes = 8,
         LogState* log = null)
     {
+        const int maxCap = (int)(HandlePacking.IndexMask + 1u);
+        if (maxDefinitions < 1 || maxDefinitions > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxDefinitions), maxDefinitions, $"Capacity must be in [1, {maxCap}].");
+        if (maxActiveScenes < 1 || maxActiveScenes > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxActiveScenes), maxActiveScenes, $"Capacity must be in [1, {maxCap}].");
+
         uint* gens = persistentArena.AllocUninitialized<uint>(maxActiveScenes, 16);
         for (int i = 0; i < maxActiveScenes; i++) gens[i] = 1;
 
@@ -117,7 +123,7 @@ public static unsafe class SceneSystem
         if (mgr.DefinitionCount >= mgr.MaxDefinitions)
             throw new OutOfMemoryException("SceneManager definition capacity exceeded.");
 
-        int idx = mgr.DefinitionCount++;
+        int idx = mgr.DefinitionCount;
         BundleId* bundleCopy = null;
         if (requiredBundles.Length > 0)
         {
@@ -139,6 +145,7 @@ public static unsafe class SceneSystem
             UserData = userData,
         };
         mgr.NameToDef.Set(id.Value, idx);
+        mgr.DefinitionCount = idx + 1;
         return idx;
     }
 
@@ -244,12 +251,24 @@ public static unsafe class SceneSystem
             }
         }
 
+        LinearArena sceneArena;
+        try
+        {
+            sceneArena = LinearArena.Create(newDef.SceneArenaBytes, newDef.Name.Value);
+        }
+        catch
+        {
+            for (int b = 0; b < newDef.RequiredBundleCount; b++)
+                BundleSystem.Release(ref bundles, newDef.RequiredBundles[b], ref world);
+            throw;
+        }
+
         SceneId handle = SceneId.Create((uint)slot, mgr.SceneGens[slot]);
         ref ActiveSceneData inst = ref mgr.ActiveScenes[slot];
         inst.Handle = handle;
         inst.DefinitionIndex = defIdx;
-        inst.SceneArena = LinearArena.Create(newDef.SceneArenaBytes, newDef.Name.Value);
-        inst.Active = 1;
+        inst.SceneArena = sceneArena;
+        inst.Active = 1; // Loading
         mgr.ActiveCount++;
 
         if (newDef.OnLoad != null)
@@ -275,18 +294,32 @@ public static unsafe class SceneSystem
             }
             catch
             {
-                EngineWorldSystem.DestroySceneObjects(ref world, handle, ref alloc.Scratch);
-                inst.SceneArena.Dispose();
-                inst.Active = 0;
-                mgr.SceneGens[slot] = HandlePacking.NextGeneration(mgr.SceneGens[slot]);
-                mgr.ActiveCount--;
-                for (int b = 0; b < newDef.RequiredBundleCount; b++)
-                    BundleSystem.Release(ref bundles, newDef.RequiredBundles[b], ref world);
+                if (inst.Handle == handle && (inst.Active == 1 || inst.Active == 2))
+                {
+                    inst.Active = 3; // Unloading
+                    try
+                    {
+                        EngineWorldSystem.DestroySceneObjects(ref world, handle, ref alloc.Scratch);
+                    }
+                    finally
+                    {
+                        inst.SceneArena.Dispose();
+                        inst.Active = 0;
+                        inst.Handle = SceneId.Invalid;
+                        mgr.SceneGens[slot] = HandlePacking.NextGeneration(mgr.SceneGens[slot]);
+                        mgr.ActiveCount--;
+                        for (int b = 0; b < newDef.RequiredBundleCount; b++)
+                            BundleSystem.Release(ref bundles, newDef.RequiredBundles[b], ref world);
+                    }
+                }
                 if (activeLog != null)
                     LogSystem.Error(activeLog, $"Scene '{newDef.NameText}' OnLoad failed; rolled back (handle={handle})");
                 throw;
             }
         }
+
+        if (inst.Handle == handle && inst.Active == 1)
+            inst.Active = 2; // Active
 
         if (activeLog != null)
         {
@@ -307,13 +340,17 @@ public static unsafe class SceneSystem
     {
         if (!sceneId.IsValid || sceneId.Index >= (uint)mgr.MaxActiveScenes) return false;
         ref ActiveSceneData inst = ref mgr.ActiveScenes[sceneId.Index];
-        if (inst.Active == 0 || inst.Handle != sceneId) return false;
+        if ((inst.Active != 1 && inst.Active != 2) || inst.Handle != sceneId) return false;
+
+        // Transition immediately to Unloading (3) before OnUnload so re-entrant UnloadScene/UnloadAllScenes skips this slot
+        inst.Active = 3;
+        int defIdx = inst.DefinitionIndex;
 
         LogState* activeLog = log != null ? log : mgr.Log;
         long startTicks = Stopwatch.GetTimestamp();
         int entitiesBefore = world.Entities.AliveCount;
         nuint arenaBytes = inst.SceneArena.Capacity;
-        ref SceneDefinition def = ref mgr.Definitions[inst.DefinitionIndex];
+        ref SceneDefinition def = ref mgr.Definitions[defIdx];
 
         try
         {
@@ -345,6 +382,7 @@ public static unsafe class SceneSystem
             // Dispose per-scene arena immediately
             inst.SceneArena.Dispose();
             inst.Active = 0;
+            inst.Handle = SceneId.Invalid;
             mgr.SceneGens[sceneId.Index] = HandlePacking.NextGeneration(mgr.SceneGens[sceneId.Index]);
             mgr.ActiveCount--;
 
@@ -372,7 +410,8 @@ public static unsafe class SceneSystem
     {
         for (int i = mgr.MaxActiveScenes - 1; i >= 0; i--)
         {
-            if (mgr.ActiveScenes[i].Active != 0)
+            byte st = mgr.ActiveScenes[i].Active;
+            if (st == 1 || st == 2)
                 UnloadScene(ref mgr, ref world, ref alloc, ref bundles, mgr.ActiveScenes[i].Handle, log);
         }
     }
@@ -384,30 +423,62 @@ public static unsafe class SceneSystem
         ref BundleManager bundles,
         float dt)
     {
-        for (int i = 0; i < mgr.MaxActiveScenes; i++)
-        {
-            if (mgr.ActiveScenes[i].Active == 0) continue;
-            ref ActiveSceneData inst = ref mgr.ActiveScenes[i];
-            ref SceneDefinition def = ref mgr.Definitions[inst.DefinitionIndex];
-            if (def.OnFixedUpdate == null) continue;
+        int maxSlots = mgr.MaxActiveScenes;
+        if (maxSlots <= 0 || mgr.ActiveCount <= 0) return;
 
-            fixed (LinearArena* sa = &inst.SceneArena)
-            fixed (EngineWorld* wp = &world)
-            fixed (EngineAllocators* ap = &alloc)
-            fixed (BundleManager* bp = &bundles)
+        SceneId* stackSnap = stackalloc SceneId[64];
+        ArenaMarker mark = default;
+        bool usedScratch = false;
+        SceneId* snap = stackSnap;
+        if (maxSlots > 64)
+        {
+            mark = alloc.Scratch.SaveMarker();
+            snap = alloc.Scratch.AllocUninitialized<SceneId>(maxSlots, 16);
+            usedScratch = true;
+        }
+
+        try
+        {
+            int snapCount = 0;
+            for (int i = 0; i < maxSlots; i++)
             {
-                var ctx = new SceneContext
-                {
-                    Scene = inst.Handle,
-                    SceneArena = sa,
-                    World = wp,
-                    Allocators = ap,
-                    Bundles = bp,
-                    UserData = def.UserData,
-                    DeltaTime = dt,
-                };
-                def.OnFixedUpdate(ref ctx);
+                if (mgr.ActiveScenes[i].Active == 2)
+                    snap[snapCount++] = mgr.ActiveScenes[i].Handle;
             }
+
+            for (int s = 0; s < snapCount; s++)
+            {
+                SceneId snapHandle = snap[s];
+                uint slot = snapHandle.Index;
+                if (slot >= (uint)mgr.MaxActiveScenes) continue;
+                ref ActiveSceneData inst = ref mgr.ActiveScenes[slot];
+                if (inst.Active != 2 || inst.Handle != snapHandle) continue;
+                ref SceneDefinition def = ref mgr.Definitions[inst.DefinitionIndex];
+                if (def.OnFixedUpdate == null) continue;
+
+                fixed (LinearArena* sa = &inst.SceneArena)
+                fixed (EngineWorld* wp = &world)
+                fixed (EngineAllocators* ap = &alloc)
+                fixed (BundleManager* bp = &bundles)
+                {
+                    var ctx = new SceneContext
+                    {
+                        Scene = snapHandle,
+                        SceneArena = sa,
+                        World = wp,
+                        Allocators = ap,
+                        Bundles = bp,
+                        UserData = def.UserData,
+                        DeltaTime = dt,
+                    };
+                    def.OnFixedUpdate(ref ctx);
+                }
+            }
+        }
+        finally
+        {
+            if (usedScratch)
+                alloc.Scratch.Rollback(mark);
         }
     }
 
@@ -418,30 +489,62 @@ public static unsafe class SceneSystem
         ref BundleManager bundles,
         float dt)
     {
-        for (int i = 0; i < mgr.MaxActiveScenes; i++)
-        {
-            if (mgr.ActiveScenes[i].Active == 0) continue;
-            ref ActiveSceneData inst = ref mgr.ActiveScenes[i];
-            ref SceneDefinition def = ref mgr.Definitions[inst.DefinitionIndex];
-            if (def.OnViewSync == null) continue;
+        int maxSlots = mgr.MaxActiveScenes;
+        if (maxSlots <= 0 || mgr.ActiveCount <= 0) return;
 
-            fixed (LinearArena* sa = &inst.SceneArena)
-            fixed (EngineWorld* wp = &world)
-            fixed (EngineAllocators* ap = &alloc)
-            fixed (BundleManager* bp = &bundles)
+        SceneId* stackSnap = stackalloc SceneId[64];
+        ArenaMarker mark = default;
+        bool usedScratch = false;
+        SceneId* snap = stackSnap;
+        if (maxSlots > 64)
+        {
+            mark = alloc.Scratch.SaveMarker();
+            snap = alloc.Scratch.AllocUninitialized<SceneId>(maxSlots, 16);
+            usedScratch = true;
+        }
+
+        try
+        {
+            int snapCount = 0;
+            for (int i = 0; i < maxSlots; i++)
             {
-                var ctx = new SceneContext
-                {
-                    Scene = inst.Handle,
-                    SceneArena = sa,
-                    World = wp,
-                    Allocators = ap,
-                    Bundles = bp,
-                    UserData = def.UserData,
-                    DeltaTime = dt,
-                };
-                def.OnViewSync(ref ctx);
+                if (mgr.ActiveScenes[i].Active == 2)
+                    snap[snapCount++] = mgr.ActiveScenes[i].Handle;
             }
+
+            for (int s = 0; s < snapCount; s++)
+            {
+                SceneId snapHandle = snap[s];
+                uint slot = snapHandle.Index;
+                if (slot >= (uint)mgr.MaxActiveScenes) continue;
+                ref ActiveSceneData inst = ref mgr.ActiveScenes[slot];
+                if (inst.Active != 2 || inst.Handle != snapHandle) continue;
+                ref SceneDefinition def = ref mgr.Definitions[inst.DefinitionIndex];
+                if (def.OnViewSync == null) continue;
+
+                fixed (LinearArena* sa = &inst.SceneArena)
+                fixed (EngineWorld* wp = &world)
+                fixed (EngineAllocators* ap = &alloc)
+                fixed (BundleManager* bp = &bundles)
+                {
+                    var ctx = new SceneContext
+                    {
+                        Scene = snapHandle,
+                        SceneArena = sa,
+                        World = wp,
+                        Allocators = ap,
+                        Bundles = bp,
+                        UserData = def.UserData,
+                        DeltaTime = dt,
+                    };
+                    def.OnViewSync(ref ctx);
+                }
+            }
+        }
+        finally
+        {
+            if (usedScratch)
+                alloc.Scratch.Rollback(mark);
         }
     }
 }

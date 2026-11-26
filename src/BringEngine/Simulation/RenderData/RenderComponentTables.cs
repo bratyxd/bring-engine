@@ -189,6 +189,14 @@ public unsafe struct RenderComponentTables
         int maxSprites = 4096,
         int maxTexts = 1024)
     {
+        const int maxCap = (int)(HandlePacking.IndexMask + 1u);
+        if (maxMeshRenderers < 1 || maxMeshRenderers > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxMeshRenderers), maxMeshRenderers, $"Capacity must be in [1, {maxCap}].");
+        if (maxSprites < 1 || maxSprites > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxSprites), maxSprites, $"Capacity must be in [1, {maxCap}].");
+        if (maxTexts < 1 || maxTexts > maxCap)
+            throw new ArgumentOutOfRangeException(nameof(maxTexts), maxTexts, $"Capacity must be in [1, {maxCap}].");
+
         int* s2d = arena.AllocUninitialized<int>(maxSprites, 64);
         uint* sGens = arena.AllocUninitialized<uint>(maxSprites, 64);
         for (int i = 0; i < maxSprites; i++) { s2d[i] = -1; sGens[i] = 1; }
