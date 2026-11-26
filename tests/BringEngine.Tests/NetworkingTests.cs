@@ -241,7 +241,7 @@ public static class NetworkingTests
                     int seq = r.ReadInt32();
                     if (tag == 1)
                     {
-                        Assert.True(seq > lastRelId1, $"ReliableOrdered strictly ordered ({seq} > {lastRelId1})");
+                        Assert.True(seq > lastRelId1, "ReliableOrdered strictly ordered");
                         lastRelId1 = seq;
                         relCount1++;
                     }
