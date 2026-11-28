@@ -41,13 +41,16 @@ public unsafe struct EngineWorld
         int maxRig2DAssets = 128,
         int maxRig2DInstances = 256)
     {
+        int maxAnimPlayers = maxEntities < 512 ? 256 : (maxEntities <= 1024 ? 512 : 1024);
+        int maxSpritePlayers = maxEntities < 512 ? 512 : (maxEntities <= 1024 ? 1024 : 2048);
+
         return new EngineWorld
         {
             Entities = EntityTable.Create(ref persistentArena, maxEntities),
             Transforms = TransformTable.Create(ref persistentArena, maxEntities, maxEntities),
             Cameras = CameraTable.Create(ref persistentArena, 32),
             Tweens = TweenTable.Create(ref persistentArena, 4096),
-            Animations = AnimationTable.Create(ref persistentArena, 256, 512, 1024, 256, 2048),
+            Animations = AnimationTable.Create(ref persistentArena, 256, 512, maxAnimPlayers, 256, maxSpritePlayers),
             Rigs = Rig2DTable.Create(ref persistentArena, maxRig2DAssets, maxRig2DInstances),
             Particles = ParticleTable.Create(ref persistentArena, maxParticles, 256),
             RenderComponents = RenderComponentTables.Create(ref persistentArena, 8192, 4096, 1024),
