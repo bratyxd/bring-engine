@@ -92,7 +92,7 @@
 | 17 | [`17-logging.md`](docs/agents/17-logging.md) | Zero-GC core `LogSystem`, unified OS paths (`PlatformPaths`), `LogFileHandle`, 10k-line FIFO trimming, and selective logging discipline |
 | 18 | [`18-save-system.md`](docs/agents/18-save-system.md) | Crash-safe atomic `SaveSystem` (`.tmp`/`.bak`, CRC32 recovery, LZ4/Brotli), Raw JSON vs. `BSAV`+JSON vs. versioned binary `SaveChunks` |
 | 19 | [`19-audio.md`](docs/agents/19-audio.md) | Zero-GC core `AudioSystem` (SDL3 `SDL_AudioStream`, dedicated mixer thread, WAV/`.bpack`, `Master`/`Music`/`Sfx`/`Ui` buses, pitch/pan/loop, headless fallback) |
-| 20 | [`20-2d-skeletal-rigging.md`](docs/agents/20-2d-skeletal-rigging.md) | Zero-OOP/0-GC `Rig2D` skeletal & deformable mesh animation (IK, springs, skins, FFD, 8-track mixer, batched `rig_2d.hlsl`), `.bpack` `BRIG` packing & `BringRig2D` CLI |
+| 20 | [`20-2d-skeletal-rigging.md`](docs/agents/20-2d-skeletal-rigging.md) | Zero-OOP/0-GC `Rig2D` skeletal & deformable mesh runtime (IK, springs, skins, FFD, 8-track mixer, single-draw-call `rig_2d.hlsl`), **complete zero-editor AI asset-creation workflow**, full `.rig2d.json` schema, `.bpack` `BRIG` packing & `BringRig2D` CLI |
 
 ---
 
