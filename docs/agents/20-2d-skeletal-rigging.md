@@ -87,14 +87,48 @@ for (int i = 0; i < events.Length; i++)
 Follow these 7 steps to generate high-definition, consistent, Spine-grade 2D animated characters, creatures, or props with **zero human GUI editor**:
 
 ### Step 1 — Anchor-First Visual Consistency (`raw_gen/hero_anchor.png`)
-- Generate **one full-body high-res neutral reference sprite first** (`raw_gen/hero_anchor.png`): clean 3/4 side-facing combat stance facing **right (`+X`)**, limbs slightly separated so silhouettes read clearly, on a **flat solid chroma background** (`#00FF00` for dark/warm/steel/crimson palettes, or `#FF00FF` if the character has bright greens) with **zero floor shadows, gradients, or backdrop glow**.
-- Visually inspect `hero_anchor.png` before continuing. Never generate body parts independently from text alone.
+- **Game Art Bible Handoff**: If the game uses a locked `art_bible.json` and Visual Style Anchors ([`21-2d-hd-art-pipeline.md`](21-2d-hd-art-pipeline.md)), compile the prompt with `python "$sdk/docs/agents/scripts/bring-2d-art/art_bible_tool.py" prompt --bible art_bible.json --category rig_hero_anchor --subject "<character>"` (which automatically locks the `[STYLE LOCK]` block and references `anchors/style_anchor_characters.png`) so the rigged character matches all environments, props, tiles, and UI 100%.
+- **Choose ONE Non-Clashing Flat Chroma Background** for the entire character set:
+  - **`#00FF00` pure neon green**: warm, crimson, iron/steel, gold, navy, purple, dark fantasy, bone palettes.
+  - **`#FF00FF` pure bright magenta**: emerald, forest/nature, poison green, orc/goblin skin, foliage palettes.
+- **Standalone Hero Anchor Prompt Template** (when not using `art_bible_tool.py`):
+  ```text
+  High-definition 2D hand-painted game character illustration of <CHARACTER DESCRIPTION>,
+  <ART STYLE — e.g. crisp stylized dark-fantasy illustrated 2D game art, rich painterly brushwork, clean dark ink contour lines, dramatic cel-shaded specular highlights, sharp silhouette readability>.
+  Full body head-to-toe in a clean 3/4 side-facing neutral combat-ready stance facing RIGHT (+X),
+  arms and weapon slightly separated from the torso and legs clearly spaced apart so every limb silhouette is distinct and easy to read.
+  Centered with comfortable margin on all sides, isolated on a completely flat solid pure neon green #00FF00 background.
+  Flat even studio game-sprite lighting, no cast shadow, no drop shadow, no floor, no ground plane, no background gradient, no glow halo on background, no text, no watermark, no multiple views, single character only.
+  ```
+- Visually inspect `raw_gen/hero_anchor.png` before continuing. Regenerate if silhouette is cropped, background has gradients/shadows, or limbs tangle together. **Never generate body parts independently from text alone.**
 
 ### Step 2 — Anchor-Locked Modular Parts (`raw_gen/parts/` & optional `raw_gen/fx/`)
-- Condition **every** isolated body part, alternate skin weapon/armor, and VFX smear on `hero_anchor.png` so brush strokes, ink weight, palette, lighting direction, and proportions stay 100% locked.
-- Typical biped decomposition (8–11 parts): `head`, `torso`, `cape` (or hair/scarf for weighted mesh + springs), `arm_front_upper`, `arm_front_lower`, `arm_back_upper`, `arm_back_lower`, `thigh_front`, `shin_front` (reusable for back leg with darker slot tint), `weapon`, plus optional alternate skin weapons and 4-frame `fx/slash_0..3` Additive sequence sprites.
-- **Critical**: Paint **rounded, extended overlap joint caps** at every shoulder, elbow, hip, knee, and neck pivot so rotating limbs ±90° never exposes transparent gaps.
-- Keep each limb strictly upright/vertical on the same flat `#00FF00`/`#FF00FF` background and inspect every generated part before prepping.
+- Condition **every** isolated body part, alternate skin weapon/armor, and VFX smear on `raw_gen/hero_anchor.png` (one isolated part per file — cleaner resolution, zero accidental overlap). With an Art Bible, run:
+  ```powershell
+  python "$sdk/docs/agents/scripts/bring-2d-art/art_bible_tool.py" prompt `
+    --bible art_bible.json --category rig_modular_part `
+    --extra-ref raw_gen/hero_anchor.png `
+    --subject "<part description + orientation + joint cap>"
+  ```
+- **Standalone Modular Part Prompt Template** (always attach `raw_gen/hero_anchor.png` as visual reference):
+  ```text
+  Matching the EXACT art style, color palette, painterly brushwork, ink outline weight, and lighting of the reference character in hero_anchor.png:
+  Render ONLY the isolated <PART NAME> as a standalone modular 2D game sprite part for skeletal animation.
+  - Orientation: strictly vertical upright (top of part at top, bottom at bottom, facing RIGHT matching hero_anchor.png).
+  - Joint overlap cap: include a clean rounded, slightly extended overlap cap at the <SHOULDER/ELBOW/HIP/KNEE/NECK/GRIP> attachment joint so rotating ±90° never exposes transparent gaps.
+  - Show ONLY this single part — omit all other body parts, head, torso, other limbs, and background props.
+  - Centered with generous empty margin, isolated on a completely flat solid pure neon green #00FF00 background.
+  - No cast shadow, no drop shadow, no background gradient, no glow bleeding to backdrop, no text, crisp clean silhouette edges.
+  ```
+- **Typical Biped Decomposition & Part Orientation Rules (8–11 parts)**:
+  - `head`: Upright, facing right; include neck collar overlap cap at bottom.
+  - `torso`: Upright chest + waist + belt/pelvis overlap cap at bottom so legs & head tuck cleanly.
+  - `cape` / `cloak` / `hair` (**Weighted Mesh + Springs!**): Hanging vertically downward from shoulder clasp at top to tattered/flowing hem at bottom, slightly billowing left (`-X`, behind character) so `cape_0 -> cape_1 -> cape_2` bone segments sit cleanly down its spine.
+  - `arm_front` / `arm_back` (or split `arm_upper` + `forearm`): Hanging straight down vertically (rounded shoulder/elbow cap at top, hand/gauntlet at bottom).
+  - `leg_front` / `leg_back` (or split `thigh` + `shin_boot`, reusable for back leg with darker slot tint): Hanging straight down vertically (rounded hip/knee cap at top, boot pointing right at bottom).
+  - `weapon_default` & optional skin swaps (`weapon_alt`, alternate helm/shield): Straight vertical blade/shaft (pommel/grip near bottom, tip at top).
+  - `fx/slash_0..3` (**Sequence Slot!**): Generate frame 0 first, then condition frames 1–3 on frame 0 + `hero_anchor.png` for a progressive glowing motion-arc cleave (thin start → bold wide sweep → dispersing trail → fading wisps) on flat chroma background.
+- **Pre-Prep Checklist** (inspect every raw output before `BringRig2D prep`): flat uniform chroma backdrop, strictly ONE part with no stray limbs, exact style/outline match to `hero_anchor.png`, and cleanly rounded overlap caps at joints. Convert `.jpg` outputs to lossless `.png` in `raw_gen/parts/` before prepping.
 
 ### Step 3 — Deterministic Chroma Keying, Despill & Atlas Sizing (`BringRig2D prep`)
 ```bash
@@ -111,12 +145,18 @@ Bootstrap from `BringRig2D template --type biped|quadruped|creature|prop --name 
 
 - **Skeleton space**: Pixel units (`pixelsPerUnit: 100`), `+X` right (facing right), `+Y` up, `root` at `(0, 0)` on the ground baseline between the feet.
 - **Angles**: Degrees counter-clockwise (`0° = +X`, `+90° = +Y`, `-90° = -Y`). A bone extends along its local `+X` from `(0, 0)` to `(length, 0)`.
-- **Attachment rotation rule of thumb**:
-  - Upward bones (`torso`, `head`, `weapon` pointing `+90°` up from base/hilt to top/tip): set attachment **`"rotation": -90`**.
-  - Downward hanging limb PNGs (`arm_*`, `thigh_*`, `shin_*` with parent joint at top of image and child joint at bottom): set attachment **`"rotation": 90`** so the limb automatically rotates along the bone's `+X` axis.
-  - Arbitrary bind-angle meshes (`cape` with `cape_0` at `worldRot`): set **`"rotation": -worldRot`** to keep the image visually upright at bind pose.
+- **Universal attachment orientation formula**:
+  - `worldAngleOfImageUp = boneWorldRotation + attachmentRotation + 90°`. To keep any upright vertical PNG visually upright at bind pose (`worldAngleOfImageUp = 90°`), set **`"rotation": -boneWorldRotation`**:
+    - Upward bones (`torso`, `head`, `weapon` at `+90°`): set **`"rotation": -90`**.
+    - Downward hanging limb PNGs (`arm_*`, `thigh_*`, `shin_*` at `-90°`): set **`"rotation": 90`**.
+    - Angled cloth/cape bind bones (e.g. `cape_0` at `-135°`): set **`"rotation": 135`**.
 - **Never hand-write mesh vertices or bone weights**: Declare `"type": "mesh"` + `"autoMesh": { "bones": [...], "density": 24, "outlineMargin": 2, "smoothIterations": 3, "weightPins": [...] }` and let `BringRig2D mesh` generate the triangulated silhouette mesh and smooth normalized bone weights.
 - **2-bone leg IK**: Set `bendDirection` (`-1` for right-facing forward knee bend in standard `-Y` legs; verify visually in `strip_walk.png`), `softness: 4–8`, and animate `foot_front_ik` / `foot_back_ik` targets cleanly along the `y = 0` baseline.
+- **Core Animation Recipes** (smooth eased curves `"easeInOutSine"`, `"easeOutCubic"`, `"easeInOut"` + gameplay events):
+  - **`idle`** (~1.4–2.0s loop): subtle `hip` vertical breathing bob (`±3–5px`), gentle `torso` tilt (`±2°`), counter-stabilized `head` (`∓1.5°`), poised `weapon` sway, and natural `spring` cape drift.
+  - **`walk`** (~0.7–0.9s loop): opposite `foot_front_ik` / `foot_back_ik` planted-ground stride curves (`y = 0` during contact/push-off, smooth arc lift during swing) with `footstep` events at contact frames, slight forward `torso` lean (`-5°`), and counter-phase arm swing.
+  - **`attack`** (~0.65–0.85s): clear anticipation wind-up (0–28%, torso & arm pull back) → crisp fast cleave (28–45%, torso lunge forward, `hit_frame` event, toggle Additive `slash_fx` sequence attachment & step frames `0→3`) → damped follow-through & recovery (45–100%).
+  - **`hurt`** (~0.35–0.45s): sharp backward recoil tilt (`+12°–18°`), head snap, brief drop, and clean recovery back to `0`.
 
 ### Step 5 — Auto-Mesh, Validate & Headless Software Visual QA (`BringRig2D`)
 ```bash
@@ -270,7 +310,10 @@ BringPacker --verify-no-loose-textures dist
           "color":      [ { "time": 0.26, "color": "#FFFFFFFF" }, { "time": 0.56, "color": "#FFFFFF00" } ]
         }
       },
-      "drawOrder": [ { "time": 0.0, "offsets": [] } ],
+      "constraints": {
+        "leg_front_ik": [ { "time": 0.0, "mix": 1.0 } ]
+      },
+      "drawOrder": [ { "time": 0.0, "offsets": [] } ], // Or explicit full order: { "time": 0.3, "order": ["cape", ...] }
       "events":    [ { "time": 0.33, "name": "hit_frame", "int": 1, "string": "crimson_cleave" } ]
     }
   }

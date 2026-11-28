@@ -93,6 +93,7 @@
 | 18 | [`18-save-system.md`](docs/agents/18-save-system.md) | Crash-safe atomic `SaveSystem` (`.tmp`/`.bak`, CRC32 recovery, LZ4/Brotli), Raw JSON vs. `BSAV`+JSON vs. versioned binary `SaveChunks` |
 | 19 | [`19-audio.md`](docs/agents/19-audio.md) | Zero-GC core `AudioSystem` (SDL3 `SDL_AudioStream`, dedicated mixer thread, WAV/`.bpack`, `Master`/`Music`/`Sfx`/`Ui` buses, pitch/pan/loop, headless fallback) |
 | 20 | [`20-2d-skeletal-rigging.md`](docs/agents/20-2d-skeletal-rigging.md) | Zero-OOP/0-GC `Rig2D` skeletal & deformable mesh runtime (IK, springs, skins, FFD, 8-track mixer, single-draw-call `rig_2d.hlsl`), **complete zero-editor AI asset-creation workflow**, full `.rig2d.json` schema, `.bpack` `BRIG` packing & `BringRig2D` CLI |
+| 21 | [`21-2d-hd-art-pipeline.md`](docs/agents/21-2d-hd-art-pipeline.md) | **Style-locked HD hand-drawn 2D game art pipeline** (8 interchangeable presets + custom `art_bible.json`, Visual Style Anchors, seamless tiles, 9-slice UI, Consistency QA Board, optional Recraft/Fal/Scenario adapter, `Rig2D` handoff, `BringPacker` `pack.json`) + bundled Python scripts under `docs/agents/scripts/bring-2d-art/` |
 
 ---
 
