@@ -15,6 +15,7 @@ using BringEngine.Simulation.Animation;
 using BringEngine.Simulation.Camera;
 using BringEngine.Simulation.Particles;
 using BringEngine.Simulation.RenderData;
+using BringEngine.Simulation.Rig2D;
 using BringEngine.Simulation.World;
 using SDL3;
 
@@ -44,6 +45,8 @@ public static unsafe class BatchRenderer
     private const uint GpuWarnGrowParticles = 1u << 4;
     private const uint GpuWarnGrowTransfer = 1u << 5;
     private const uint GpuWarnMapTransfer = 1u << 6;
+    private const uint GpuWarnGrowRig2DVerts = 1u << 7;
+    private const uint GpuWarnGrowRig2DIndices = 1u << 8;
 
     // Extract warning latch bits (auto-resets whenever LogState* changes; resettable for tests)
     private const uint ExtractWarnCap3D = 1u << 0;
@@ -52,6 +55,7 @@ public static unsafe class BatchRenderer
     private const uint ExtractWarnCapParticles = 1u << 3;
     private const uint ExtractWarnCapParticleBatches = 1u << 4;
     private const uint ExtractWarnCapShadows = 1u << 5;
+    private const uint ExtractWarnCapRig2D = 1u << 6;
 
     private static long s_warnedExtractLogPtr;
     private static uint s_warnedExtractCapsMask;
@@ -91,20 +95,33 @@ public static unsafe class BatchRenderer
         public uint Sprites;
         public uint Glyphs;
         public uint Particles;
+        public uint Rig2DVerts;
+        public uint Rig2DIndices;
 
         public uint Bytes3D;
         public uint BytesJoints;
         public uint BytesSprites;
         public uint BytesGlyphs;
         public uint BytesParticles;
+        public uint BytesRig2DVerts;
+        public uint BytesRig2DIndices;
 
         public uint Off3D;
         public uint OffJoints;
         public uint OffSprites;
         public uint OffGlyphs;
         public uint OffParticles;
+        public uint OffRig2DVerts;
+        public uint OffRig2DIndices;
 
         public uint TotalBytes;
+    }
+
+    private struct Rig2DSortItem
+    {
+        public ulong SortKey;
+        public int OriginalIndex;
+        public int InstanceIndex;
     }
 
     private struct Draw3DSortItem
@@ -245,12 +262,53 @@ public static unsafe class BatchRenderer
         int batText = Math.Clamp(Math.Max(64, world.RenderComponents.TextCount * camCount), 64, 4096);
         int batParticles = Math.Clamp(Math.Max(64, world.Particles.ActiveEmitters * camCount), 64, 4096);
 
+        int capRig2DVerts = 0;
+        int capRig2DIndices = 0;
+        int batRig2D = 0;
+        if (world.Rigs.InstanceCount > 0)
+        {
+            long estVerts = 0;
+            long estIndices = 0;
+            long estBatches = 0;
+            for (int ri = 0; ri < world.Rigs.InstanceCount; ri++)
+            {
+                ref readonly Rig2DInstanceData inst = ref world.Rigs.Instances[ri];
+                if (inst.Visible == 0) continue;
+                Rig2DAssetData* asset = Rig2DSystem.TryGetAsset(in world.Rigs, inst.Asset);
+                if (asset == null) continue;
+                estBatches += Math.Max(1, asset->SlotCount);
+                for (int s = 0; s < inst.SlotSliceCount; s++)
+                {
+                    int attIdx = world.Rigs.SlotStates[inst.SlotSliceStart + s].ActiveAttachmentIndex;
+                    if ((uint)attIdx >= (uint)asset->AttachmentCount) continue;
+                    ref readonly Rig2DAttachmentData att = ref asset->Attachments[attIdx];
+                    if (att.Kind == Rig2DAttachmentKind.WeightedMesh)
+                    {
+                        estVerts += att.VertexCount;
+                        estIndices += att.IndexCount;
+                    }
+                    else if (att.Kind == Rig2DAttachmentKind.Region || att.Kind == Rig2DAttachmentKind.Sequence)
+                    {
+                        estVerts += 4;
+                        estIndices += 6;
+                    }
+                }
+            }
+            if (estVerts > 0 && estIndices > 0)
+            {
+                capRig2DVerts = (int)Math.Clamp(estVerts * camCount, 64L, 131072L);
+                capRig2DIndices = (int)Math.Clamp(estIndices * camCount, 96L, 393216L);
+                batRig2D = (int)Math.Clamp(estBatches * camCount, 16L, 4096L);
+            }
+        }
+
         // Bound packet list allocations cleanly to remaining packetArena space so large scenes never throw LinearArena overflow
         FitPacketCapsToArenaBudget(
             packetArena.Remaining,
             wantShadows,
             ref cap3D, ref bat3D, ref batShadow,
             ref capSprites, ref batSprites,
+            ref capRig2DVerts, ref capRig2DIndices, ref batRig2D,
             ref capGlyphs, ref batText,
             ref capParticles, ref batParticles);
 
@@ -261,10 +319,18 @@ public static unsafe class BatchRenderer
             : default;
         var allSprites = capSprites > 0 ? NativeList<SpriteGpuInstance>.CreateInArena(ref packetArena, capSprites, 64) : default;
         var allSpriteBatches = batSprites > 0 ? NativeList<SpriteBatchCmd>.CreateInArena(ref packetArena, batSprites, 16) : default;
+        var allRig2DVerts = capRig2DVerts > 0 ? NativeList<Rig2DVertexGpu>.CreateInArena(ref packetArena, capRig2DVerts, 64) : default;
+        var allRig2DIndices = capRig2DIndices > 0 ? NativeList<uint>.CreateInArena(ref packetArena, capRig2DIndices, 64) : default;
+        var allRig2DBatches = batRig2D > 0 ? NativeList<Rig2DBatchCmd>.CreateInArena(ref packetArena, batRig2D, 16) : default;
         var allGlyphs = capGlyphs > 0 ? NativeList<GlyphGpuInstance>.CreateInArena(ref packetArena, capGlyphs, 64) : default;
         var allTextBatches = batText > 0 ? NativeList<TextBatchCmd>.CreateInArena(ref packetArena, batText, 16) : default;
         var allParticles = capParticles > 0 ? NativeList<ParticleGpuInstance>.CreateInArena(ref packetArena, capParticles, 64) : default;
         var allParticleBatches = batParticles > 0 ? NativeList<ParticleBatchCmd>.CreateInArena(ref packetArena, batParticles, 16) : default;
+
+        bool rig2DDeformFresh = world.Rigs.FrameDeformDeltas.Length > 0 &&
+                                world.Rigs.FrameDeformDeltas.Ptr != null &&
+                                world.Rigs.FrameDeformArenaBase == packetArena.BasePtr &&
+                                world.Rigs.FrameDeformArenaReset == packetArena.ResetCount;
 
         int availableJointCount = jointCopy.Length;
 
@@ -307,6 +373,12 @@ public static unsafe class BatchRenderer
             GatherAndBatchSprites(in shaders, in world, in cam, ref scratchArena, ref allSprites, ref allSpriteBatches, ref stats, log);
             snap.SpriteBatchCount = allSpriteBatches.Count - snap.SpriteBatchStart;
 
+            // 1B2. Gather & Batch Rig2D Skeletal Meshes
+            snap.Rig2DBatchStart = allRig2DBatches.Count;
+            if (world.Rigs.InstanceCount > 0 && allRig2DVerts.Capacity > 0 && allRig2DIndices.Capacity > 0 && allRig2DBatches.Capacity > 0)
+                GatherAndBatchRig2D(in shaders, in world, in cam, rig2DDeformFresh, ref scratchArena, ref allRig2DVerts, ref allRig2DIndices, ref allRig2DBatches, ref stats, log);
+            snap.Rig2DBatchCount = allRig2DBatches.Count - snap.Rig2DBatchStart;
+
             // 1C. Gather, Layout & Batch Advanced SDF Text
             snap.TextBatchStart = allTextBatches.Count;
             GatherAndBatchText(in shaders, in world, in cam, ref scratchArena, ref allGlyphs, ref allTextBatches, ref stats, log);
@@ -325,6 +397,9 @@ public static unsafe class BatchRenderer
         packet.JointPalette = jointCopy;
         packet.Sprites = allSprites;
         packet.SpriteBatches = allSpriteBatches;
+        packet.Rig2DVertices = allRig2DVerts;
+        packet.Rig2DIndices = allRig2DIndices;
+        packet.Rig2DBatches = allRig2DBatches;
         packet.Glyphs = allGlyphs;
         packet.TextBatches = allTextBatches;
         packet.Particles = allParticles;
@@ -422,6 +497,8 @@ public static unsafe class BatchRenderer
             in packet.Sprites,
             in packet.Glyphs,
             in packet.Particles,
+            in packet.Rig2DVertices,
+            in packet.Rig2DIndices,
             out UploadedFrameCounts uploaded))
         {
             stats.CopyPasses++;
@@ -433,6 +510,8 @@ public static unsafe class BatchRenderer
         uint maxSprites = uploaded.Sprites;
         uint maxGlyphs = uploaded.Glyphs;
         uint maxParticles = uploaded.Particles;
+        uint maxRig2DVerts = uploaded.Rig2DVerts;
+        uint maxRig2DIndices = uploaded.Rig2DIndices;
 
         // 3. Execute Directional Sun Shadow Depth Pass (before main scene passes)
         long encodeStart = uploadEnd;
@@ -748,6 +827,77 @@ public static unsafe class BatchRenderer
                     SDL.DrawGPUIndexedPrimitives(pass, 6, drawInst, 0, 0, 0);
                     stats.DrawCalls++;
                     stats.Triangles += (int)(2 * drawInst);
+                }
+            }
+
+            // --- Draw Batched Rig2D Skeletal Meshes ---
+            if (cam.Rig2DBatchCount > 0 &&
+                maxRig2DVerts > 0u &&
+                maxRig2DVerts == (uint)packet.Rig2DVertices.Count &&
+                maxRig2DIndices > 0u &&
+                gpu.Rig2DVertexBuffer != nint.Zero &&
+                gpu.Rig2DIndexBuffer != nint.Zero)
+            {
+                var cu = new SimpleCameraUniformsGpu { ViewProj = cam.ViewProjMatrix, CameraPosTime = new Vec4(cam.ShakenPosition, packet.WorldTotalTime) };
+                SDL.PushGPUVertexUniformData(cmd, 0, (nint)(&cu), (uint)sizeof(SimpleCameraUniformsGpu));
+
+                var rvb = new SDL.GPUBufferBinding { Buffer = gpu.Rig2DVertexBuffer, Offset = 0 };
+                var rib = new SDL.GPUBufferBinding { Buffer = gpu.Rig2DIndexBuffer, Offset = 0 };
+                SDL.BindGPUVertexBuffers(pass, 0, (nint)(&rvb), 1);
+                SDL.BindGPUIndexBuffer(pass, in rib, SDL.GPUIndexElementSize.IndexElementSize32Bit);
+                boundMeshSlot = -1;
+                quadIndexBound = false;
+                boundSamplerCount = -1;
+
+                for (int bi = 0; bi < cam.Rig2DBatchCount; bi++)
+                {
+                    Rig2DBatchCmd b = packet.Rig2DBatches[cam.Rig2DBatchStart + bi];
+                    if (b.TextureGpuSlot >= 0 && !IsTextureSlotValid(in gpu, b.TextureGpuSlot, b.TextureGpuGen)) continue;
+                    if (b.IndexOffset >= maxRig2DIndices) continue;
+                    uint drawIndices = Math.Min(b.IndexCount, maxRig2DIndices - b.IndexOffset);
+                    drawIndices -= drawIndices % 3u;
+                    if (drawIndices == 0u) continue;
+
+                    ShaderHandle sh = b.Shader.IsValid ? b.Shader : gpu.BuiltinRig2DShader;
+                    GpuShaderSlot* sSlot = ResolveShaderSlot(ref gpu, sh, ShaderVertexLayout.Rig2DMesh, gpu.BuiltinRig2DShader);
+                    if (sSlot == null) continue;
+
+                    bool passChanged = false;
+                    nint pipe = SelectRig2DPipeline(sSlot, b.BlendMode, b.DepthTest != 0);
+                    if (pipe == nint.Zero) continue;
+
+                    if (pipe != boundPipeline)
+                    {
+                        SDL.BindGPUGraphicsPipeline(pass, pipe);
+                        boundPipeline = pipe;
+                        stats.PipelineBinds++;
+                        passChanged = true;
+                    }
+
+                    int neededSamplers = sSlot->FragmentSamplerCount;
+                    if (neededSamplers >= 1)
+                    {
+                        if (b.TextureGpuSlot != boundTexSlot || b.TextureGpuGen != boundTexGen || boundSamplerCount != neededSamplers || passChanged)
+                        {
+                            BindFragmentTexture(pass, in gpu, b.TextureGpuSlot, b.TextureGpuGen);
+                            boundTexSlot = b.TextureGpuSlot;
+                            boundTexGen = b.TextureGpuGen;
+                            boundSamplerCount = neededSamplers;
+                            passChanged = true;
+                        }
+                    }
+                    else if (boundSamplerCount != 0)
+                    {
+                        boundTexSlot = int.MinValue;
+                        boundTexGen = 0u;
+                        boundSamplerCount = 0;
+                        passChanged = true;
+                    }
+                    if (passChanged) stats.SetPassCalls++;
+
+                    SDL.DrawGPUIndexedPrimitives(pass, drawIndices, 1, b.IndexOffset, 0, 0);
+                    stats.DrawCalls++;
+                    stats.Triangles += (int)(drawIndices / 3u);
                 }
             }
 
@@ -1121,17 +1271,21 @@ public static unsafe class BatchRenderer
         bool wantShadows,
         ref int cap3D, ref int bat3D, ref int batShadow,
         ref int capSprites, ref int batSprites,
+        ref int capRig2DVerts, ref int capRig2DIndices, ref int batRig2D,
         ref int capGlyphs, ref int batText,
         ref int capParticles, ref int batParticles)
     {
-        const ulong alignSlack = 1024UL;
-        static ulong CalcBytes(int c3D, int b3D, int bSh, int cSp, int bSp, int cGl, int bTx, int cPt, int bPt)
+        const ulong alignSlack = 1536UL;
+        static ulong CalcBytes(int c3D, int b3D, int bSh, int cSp, int bSp, int cR2V, int cR2I, int bR2, int cGl, int bTx, int cPt, int bPt)
         {
             return (ulong)c3D * (ulong)sizeof(Instance3DGpu)
                  + (ulong)b3D * (ulong)sizeof(Batch3DCmd)
                  + (ulong)bSh * (ulong)sizeof(Batch3DCmd)
                  + (ulong)cSp * (ulong)sizeof(SpriteGpuInstance)
                  + (ulong)bSp * (ulong)sizeof(SpriteBatchCmd)
+                 + (ulong)cR2V * (ulong)sizeof(Rig2DVertexGpu)
+                 + (ulong)cR2I * (ulong)sizeof(uint)
+                 + (ulong)bR2 * (ulong)sizeof(Rig2DBatchCmd)
                  + (ulong)cGl * (ulong)sizeof(GlyphGpuInstance)
                  + (ulong)bTx * (ulong)sizeof(TextBatchCmd)
                  + (ulong)cPt * (ulong)sizeof(ParticleGpuInstance)
@@ -1140,12 +1294,12 @@ public static unsafe class BatchRenderer
         }
 
         ulong budget = availBytes;
-        ulong needed = CalcBytes(cap3D, bat3D, batShadow, capSprites, batSprites, capGlyphs, batText, capParticles, batParticles);
+        ulong needed = CalcBytes(cap3D, bat3D, batShadow, capSprites, batSprites, capRig2DVerts, capRig2DIndices, batRig2D, capGlyphs, batText, capParticles, batParticles);
         if (needed <= budget) return;
 
         if (budget <= alignSlack)
         {
-            cap3D = bat3D = batShadow = capSprites = batSprites = capGlyphs = batText = capParticles = batParticles = 0;
+            cap3D = bat3D = batShadow = capSprites = batSprites = capRig2DVerts = capRig2DIndices = batRig2D = capGlyphs = batText = capParticles = batParticles = 0;
             return;
         }
 
@@ -1157,19 +1311,22 @@ public static unsafe class BatchRenderer
             batShadow = wantShadows ? Math.Min(cap3D, Math.Max(0, (int)(batShadow * ratio))) : 0;
             capSprites = Math.Max(0, (int)(capSprites * ratio));
             batSprites = Math.Min(capSprites, Math.Max(0, (int)(batSprites * ratio)));
+            capRig2DVerts = Math.Max(0, (int)(capRig2DVerts * ratio));
+            capRig2DIndices = Math.Max(0, (int)(capRig2DIndices * ratio));
+            batRig2D = Math.Max(0, (int)(batRig2D * ratio));
             capGlyphs = Math.Max(0, (int)(capGlyphs * ratio));
             batText = Math.Max(0, (int)(batText * ratio));
             capParticles = Math.Max(0, (int)(capParticles * ratio));
             batParticles = Math.Max(0, (int)(batParticles * ratio));
 
-            needed = CalcBytes(cap3D, bat3D, batShadow, capSprites, batSprites, capGlyphs, batText, capParticles, batParticles);
+            needed = CalcBytes(cap3D, bat3D, batShadow, capSprites, batSprites, capRig2DVerts, capRig2DIndices, batRig2D, capGlyphs, batText, capParticles, batParticles);
             if (needed <= budget) break;
             ratio = 0.85;
         }
 
         if (needed > budget)
         {
-            cap3D = bat3D = batShadow = capSprites = batSprites = capGlyphs = batText = capParticles = batParticles = 0;
+            cap3D = bat3D = batShadow = capSprites = batSprites = capRig2DVerts = capRig2DIndices = batRig2D = capGlyphs = batText = capParticles = batParticles = 0;
         }
     }
 
@@ -1181,8 +1338,8 @@ public static unsafe class BatchRenderer
     }
 
     /// <summary>
-    /// Pure element-aligned upload budget calculation bounding all 5 per-frame GPU streams by both
-    /// their individual storage buffer capacities and the shared UploadTransferBuffer capacity.
+    /// Pure element-aligned upload budget calculation bounding all per-frame GPU streams by both
+    /// their individual buffer capacities and the shared UploadTransferBuffer capacity.
     /// </summary>
     public static UploadedFrameCounts ComputeUploadBudget(
         int reqInst3D,
@@ -1195,19 +1352,27 @@ public static unsafe class BatchRenderer
         uint spriteBufBytes,
         uint glyphBufBytes,
         uint particleBufBytes,
-        uint transferBufBytes)
+        uint transferBufBytes,
+        int reqRig2DVerts = 0,
+        int reqRig2DIndices = 0,
+        uint rig2DVertBufBytes = 0,
+        uint rig2DIdxBufBytes = 0)
     {
         uint sz3D = (uint)sizeof(Instance3DGpu);
         uint szJ = (uint)sizeof(Mat4);
         uint szS = (uint)sizeof(SpriteGpuInstance);
         uint szG = (uint)sizeof(GlyphGpuInstance);
         uint szP = (uint)sizeof(ParticleGpuInstance);
+        uint szRV = (uint)sizeof(Rig2DVertexGpu);
+        uint szRI = (uint)sizeof(uint);
 
         uint c3D = reqInst3D > 0 ? Math.Min((uint)reqInst3D, inst3DBufBytes / sz3D) : 0u;
         uint cJ = reqJoints > 0 ? Math.Min((uint)reqJoints, jointBufBytes / szJ) : 0u;
         uint cS = reqSprites > 0 ? Math.Min((uint)reqSprites, spriteBufBytes / szS) : 0u;
         uint cG = reqGlyphs > 0 ? Math.Min((uint)reqGlyphs, glyphBufBytes / szG) : 0u;
         uint cP = reqParticles > 0 ? Math.Min((uint)reqParticles, particleBufBytes / szP) : 0u;
+        uint cRV = reqRig2DVerts > 0 ? Math.Min((uint)reqRig2DVerts, rig2DVertBufBytes / szRV) : 0u;
+        uint cRI = reqRig2DIndices > 0 ? Math.Min((uint)reqRig2DIndices, rig2DIdxBufBytes / szRI) : 0u;
 
         ulong tbCap = transferBufBytes;
         ulong off3D = 0UL;
@@ -1254,12 +1419,32 @@ public static unsafe class BatchRenderer
             bP = (ulong)cP * szP;
         }
 
+        ulong offRV = AlignUpU64(offP + bP, 64UL);
+        ulong remRV = tbCap > offRV ? tbCap - offRV : 0UL;
+        ulong bRV = (ulong)cRV * szRV;
+        if (bRV > remRV)
+        {
+            cRV = (uint)(remRV / szRV);
+            bRV = (ulong)cRV * szRV;
+        }
+
+        ulong offRI = AlignUpU64(offRV + bRV, 64UL);
+        ulong remRI = tbCap > offRI ? tbCap - offRI : 0UL;
+        ulong bRI = (ulong)cRI * szRI;
+        if (bRI > remRI)
+        {
+            cRI = (uint)(remRI / szRI);
+            bRI = (ulong)cRI * szRI;
+        }
+
         ulong end = 0UL;
         if (b3D > 0UL) end = off3D + b3D;
         if (bJ > 0UL) end = offJ + bJ;
         if (bS > 0UL) end = offS + bS;
         if (bG > 0UL) end = offG + bG;
         if (bP > 0UL) end = offP + bP;
+        if (bRV > 0UL) end = offRV + bRV;
+        if (bRI > 0UL) end = offRI + bRI;
 
         return new UploadedFrameCounts
         {
@@ -1268,28 +1453,34 @@ public static unsafe class BatchRenderer
             Sprites = cS,
             Glyphs = cG,
             Particles = cP,
+            Rig2DVerts = cRV,
+            Rig2DIndices = cRI,
             Bytes3D = (uint)b3D,
             BytesJoints = (uint)bJ,
             BytesSprites = (uint)bS,
             BytesGlyphs = (uint)bG,
             BytesParticles = (uint)bP,
+            BytesRig2DVerts = (uint)bRV,
+            BytesRig2DIndices = (uint)bRI,
             Off3D = (uint)off3D,
             OffJoints = (uint)offJ,
             OffSprites = (uint)offS,
             OffGlyphs = (uint)offG,
             OffParticles = (uint)offP,
+            OffRig2DVerts = (uint)offRV,
+            OffRig2DIndices = (uint)offRI,
             TotalBytes = (uint)end,
         };
     }
 
-    private static void GrowStorageBufferIfNeeded(ref GpuContext gpu, ref nint buffer, ref uint currentBytes, uint neededBytes, uint failWarnBit, string label)
+    private static void GrowBufferIfNeeded(ref GpuContext gpu, ref nint buffer, ref uint currentBytes, uint neededBytes, SDL.GPUBufferUsageFlags usage, uint failWarnBit, string label)
     {
         if (neededBytes <= currentBytes) return;
         uint grown = currentBytes > (uint.MaxValue / 2u) ? neededBytes : currentBytes * 2u;
         uint newBytes = Math.Max(neededBytes, grown);
         var info = new SDL.GPUBufferCreateInfo
         {
-            Usage = SDL.GPUBufferUsageFlags.GraphicsStorageRead,
+            Usage = usage,
             Size = newBytes,
         };
         nint newBuf = SDL.CreateGPUBuffer(gpu.Device, in info);
@@ -1315,6 +1506,8 @@ public static unsafe class BatchRenderer
         in NativeList<SpriteGpuInstance> sprites,
         in NativeList<GlyphGpuInstance> glyphs,
         in NativeList<ParticleGpuInstance> particles,
+        in NativeList<Rig2DVertexGpu> rig2DVerts,
+        in NativeList<uint> rig2DIndices,
         out UploadedFrameCounts uploaded)
     {
         uploaded = default;
@@ -1324,23 +1517,30 @@ public static unsafe class BatchRenderer
         ulong reqS64 = (ulong)Math.Max(0, sprites.Count) * (ulong)sizeof(SpriteGpuInstance);
         ulong reqG64 = (ulong)Math.Max(0, glyphs.Count) * (ulong)sizeof(GlyphGpuInstance);
         ulong reqP64 = (ulong)Math.Max(0, particles.Count) * (ulong)sizeof(ParticleGpuInstance);
+        ulong reqRV64 = (ulong)Math.Max(0, rig2DVerts.Count) * (ulong)sizeof(Rig2DVertexGpu);
+        ulong reqRI64 = (ulong)Math.Max(0, rig2DIndices.Count) * (ulong)sizeof(uint);
 
         uint bytes3DReq = req3D64 > uint.MaxValue ? uint.MaxValue : (uint)req3D64;
         uint bytesJReq = reqJ64 > uint.MaxValue ? uint.MaxValue : (uint)reqJ64;
         uint bytesSReq = reqS64 > uint.MaxValue ? uint.MaxValue : (uint)reqS64;
         uint bytesGReq = reqG64 > uint.MaxValue ? uint.MaxValue : (uint)reqG64;
         uint bytesPReq = reqP64 > uint.MaxValue ? uint.MaxValue : (uint)reqP64;
+        uint bytesRVReq = reqRV64 > uint.MaxValue ? uint.MaxValue : (uint)reqRV64;
+        uint bytesRIReq = reqRI64 > uint.MaxValue ? uint.MaxValue : (uint)reqRI64;
 
-        GrowStorageBufferIfNeeded(ref gpu, ref gpu.Instance3DBuffer, ref gpu.Instance3DBufferBytes, bytes3DReq, GpuWarnGrowInst3D, "Instance3D");
-        GrowStorageBufferIfNeeded(ref gpu, ref gpu.JointPaletteBuffer, ref gpu.JointPaletteBufferBytes, bytesJReq, GpuWarnGrowJoints, "JointPalette");
-        GrowStorageBufferIfNeeded(ref gpu, ref gpu.SpriteInstanceBuffer, ref gpu.SpriteInstanceBufferBytes, bytesSReq, GpuWarnGrowSprites, "SpriteInstance");
-        GrowStorageBufferIfNeeded(ref gpu, ref gpu.TextGlyphBuffer, ref gpu.TextGlyphBufferBytes, bytesGReq, GpuWarnGrowGlyphs, "TextGlyph");
-        GrowStorageBufferIfNeeded(ref gpu, ref gpu.ParticleInstanceBuffer, ref gpu.ParticleInstanceBufferBytes, bytesPReq, GpuWarnGrowParticles, "ParticleInstance");
+        GrowBufferIfNeeded(ref gpu, ref gpu.Instance3DBuffer, ref gpu.Instance3DBufferBytes, bytes3DReq, SDL.GPUBufferUsageFlags.GraphicsStorageRead, GpuWarnGrowInst3D, "Instance3D");
+        GrowBufferIfNeeded(ref gpu, ref gpu.JointPaletteBuffer, ref gpu.JointPaletteBufferBytes, bytesJReq, SDL.GPUBufferUsageFlags.GraphicsStorageRead, GpuWarnGrowJoints, "JointPalette");
+        GrowBufferIfNeeded(ref gpu, ref gpu.SpriteInstanceBuffer, ref gpu.SpriteInstanceBufferBytes, bytesSReq, SDL.GPUBufferUsageFlags.GraphicsStorageRead, GpuWarnGrowSprites, "SpriteInstance");
+        GrowBufferIfNeeded(ref gpu, ref gpu.TextGlyphBuffer, ref gpu.TextGlyphBufferBytes, bytesGReq, SDL.GPUBufferUsageFlags.GraphicsStorageRead, GpuWarnGrowGlyphs, "TextGlyph");
+        GrowBufferIfNeeded(ref gpu, ref gpu.ParticleInstanceBuffer, ref gpu.ParticleInstanceBufferBytes, bytesPReq, SDL.GPUBufferUsageFlags.GraphicsStorageRead, GpuWarnGrowParticles, "ParticleInstance");
+        GrowBufferIfNeeded(ref gpu, ref gpu.Rig2DVertexBuffer, ref gpu.Rig2DVertexBufferBytes, bytesRVReq, SDL.GPUBufferUsageFlags.Vertex, GpuWarnGrowRig2DVerts, "Rig2DVertex");
+        GrowBufferIfNeeded(ref gpu, ref gpu.Rig2DIndexBuffer, ref gpu.Rig2DIndexBufferBytes, bytesRIReq, SDL.GPUBufferUsageFlags.Index, GpuWarnGrowRig2DIndices, "Rig2DIndex");
 
         UploadedFrameCounts desired = ComputeUploadBudget(
             instances3D.Count, jointPalette.Length, sprites.Count, glyphs.Count, particles.Count,
             gpu.Instance3DBufferBytes, gpu.JointPaletteBufferBytes, gpu.SpriteInstanceBufferBytes, gpu.TextGlyphBufferBytes, gpu.ParticleInstanceBufferBytes,
-            uint.MaxValue);
+            uint.MaxValue,
+            rig2DVerts.Count, rig2DIndices.Count, gpu.Rig2DVertexBufferBytes, gpu.Rig2DIndexBufferBytes);
 
         if (desired.TotalBytes == 0u) return false;
 
@@ -1371,7 +1571,8 @@ public static unsafe class BatchRenderer
         UploadedFrameCounts finalBudget = ComputeUploadBudget(
             instances3D.Count, jointPalette.Length, sprites.Count, glyphs.Count, particles.Count,
             gpu.Instance3DBufferBytes, gpu.JointPaletteBufferBytes, gpu.SpriteInstanceBufferBytes, gpu.TextGlyphBufferBytes, gpu.ParticleInstanceBufferBytes,
-            gpu.UploadTransferBufferBytes);
+            gpu.UploadTransferBufferBytes,
+            rig2DVerts.Count, rig2DIndices.Count, gpu.Rig2DVertexBufferBytes, gpu.Rig2DIndexBufferBytes);
 
         if (finalBudget.TotalBytes == 0u) return false;
 
@@ -1402,6 +1603,8 @@ public static unsafe class BatchRenderer
         if (finalBudget.BytesSprites > 0u) Buffer.MemoryCopy(sprites.Data, mapped + finalBudget.OffSprites, finalBudget.BytesSprites, finalBudget.BytesSprites);
         if (finalBudget.BytesGlyphs > 0u) Buffer.MemoryCopy(glyphs.Data, mapped + finalBudget.OffGlyphs, finalBudget.BytesGlyphs, finalBudget.BytesGlyphs);
         if (finalBudget.BytesParticles > 0u) Buffer.MemoryCopy(particles.Data, mapped + finalBudget.OffParticles, finalBudget.BytesParticles, finalBudget.BytesParticles);
+        if (finalBudget.BytesRig2DVerts > 0u) Buffer.MemoryCopy(rig2DVerts.Data, mapped + finalBudget.OffRig2DVerts, finalBudget.BytesRig2DVerts, finalBudget.BytesRig2DVerts);
+        if (finalBudget.BytesRig2DIndices > 0u) Buffer.MemoryCopy(rig2DIndices.Data, mapped + finalBudget.OffRig2DIndices, finalBudget.BytesRig2DIndices, finalBudget.BytesRig2DIndices);
         SDL.UnmapGPUTransferBuffer(gpu.Device, gpu.UploadTransferBuffer);
 
         nint uploadTb = gpu.UploadTransferBuffer;
@@ -1420,6 +1623,8 @@ public static unsafe class BatchRenderer
         CopySub(gpu.SpriteInstanceBuffer, finalBudget.OffSprites, finalBudget.BytesSprites);
         CopySub(gpu.TextGlyphBuffer, finalBudget.OffGlyphs, finalBudget.BytesGlyphs);
         CopySub(gpu.ParticleInstanceBuffer, finalBudget.OffParticles, finalBudget.BytesParticles);
+        CopySub(gpu.Rig2DVertexBuffer, finalBudget.OffRig2DVerts, finalBudget.BytesRig2DVerts);
+        CopySub(gpu.Rig2DIndexBuffer, finalBudget.OffRig2DIndices, finalBudget.BytesRig2DIndices);
         SDL.EndGPUCopyPass(copy);
 
         uploaded = finalBudget;
@@ -1904,6 +2109,278 @@ public static unsafe class BatchRenderer
                     },
                 });
             }
+        }
+    }
+
+    private static void GatherAndBatchRig2D(
+        in RenderShaderDefaults shaders,
+        in EngineWorld world,
+        in CameraData cam,
+        bool deformFresh,
+        ref LinearArena scratchArena,
+        ref NativeList<Rig2DVertexGpu> outVerts,
+        ref NativeList<uint> outIndices,
+        ref NativeList<Rig2DBatchCmd> outBatches,
+        ref RenderStats stats,
+        LogState* log = null)
+    {
+        int instCount = world.Rigs.InstanceCount;
+        if (instCount == 0) return;
+
+        ArenaMarker mark = scratchArena.SaveMarker();
+        try
+        {
+            var items = NativeList<Rig2DSortItem>.CreateInArena(ref scratchArena, instCount, 16);
+            for (int i = 0; i < instCount; i++)
+            {
+                ref readonly Rig2DInstanceData inst = ref world.Rigs.Instances[i];
+                if (inst.Visible == 0 || (inst.LayerMask & cam.LayerMask) == 0) continue;
+                Rig2DAssetData* asset = Rig2DSystem.TryGetAsset(in world.Rigs, inst.Asset);
+                if (asset == null || asset->SlotCount <= 0 || asset->BoneCount <= 0) continue;
+                if (TransformSystem.GetDenseIndex(in world.Transforms, inst.Entity) < 0) continue;
+
+                uint sortLayerU = (uint)(inst.SortingLayer + 32768);
+                uint orderU = (uint)(inst.OrderInLayer + 32768);
+                ulong key = ((ulong)sortLayerU << 32) | (ulong)orderU;
+                items.Add(new Rig2DSortItem
+                {
+                    SortKey = key,
+                    OriginalIndex = i,
+                    InstanceIndex = i,
+                });
+            }
+
+            if (items.Count == 0) return;
+            SortRig2DItems(items.Data, 0, items.Count - 1);
+
+            int batchStart = outBatches.Count;
+            bool warnedCap = false;
+
+            for (int ii = 0; ii < items.Count; ii++)
+            {
+                ref readonly Rig2DInstanceData inst = ref world.Rigs.Instances[items[ii].InstanceIndex];
+                Rig2DAssetData* asset = Rig2DSystem.TryGetAsset(in world.Rigs, inst.Asset);
+                if (asset == null) continue;
+
+                int td = TransformSystem.GetDenseIndex(in world.Transforms, inst.Entity);
+                if (td < 0) continue;
+
+                Mat4 worldMat = world.Transforms.WorldMatrix[td];
+                Vec3 pos = world.Transforms.WorldPosition[td];
+                Vec3 right, up;
+
+                if (inst.Billboard == SpriteBillboardMode.Spherical)
+                {
+                    Vec3 scl = world.Transforms.LocalScale[td];
+                    right = cam.Right * scl.X;
+                    up = cam.CameraUp * scl.Y;
+                }
+                else if (inst.Billboard == SpriteBillboardMode.CylindricalY)
+                {
+                    Vec3 scl = world.Transforms.LocalScale[td];
+                    Vec3 toCam = cam.ShakenPosition - pos;
+                    toCam.Y = 0f;
+                    Vec3 fwd = toCam.LengthSq() > 1e-6f ? toCam.Normalized() : Vec3.UnitZ;
+                    right = Vec3.Cross(Vec3.Up, fwd).Normalized() * scl.X;
+                    up = Vec3.Up * scl.Y;
+                }
+                else
+                {
+                    right = new Vec3(worldMat.C0.X, worldMat.C0.Y, worldMat.C0.Z);
+                    up = new Vec3(worldMat.C1.X, worldMat.C1.Y, worldMat.C1.Z);
+                }
+
+                float invPpu = asset->PixelsPerUnit > 1e-5f ? (1f / asset->PixelsPerUnit) : 0.01f;
+                float scaleX = invPpu * inst.Scale.X * (inst.FlipX != 0 ? -1f : 1f);
+                float scaleY = invPpu * inst.Scale.Y * (inst.FlipY != 0 ? -1f : 1f);
+                Vec2 originOff = asset->OriginOffset;
+
+                Rig2DAffine2D* worldBones = world.Rigs.BoneWorld + inst.BoneSliceStart;
+                Rig2DRuntimeSlotState* slotStates = world.Rigs.SlotStates + inst.SlotSliceStart;
+                int* drawOrder = world.Rigs.DrawOrder + inst.SlotSliceStart;
+                ShaderHandle sh = inst.CustomShader.IsValid ? inst.CustomShader : shaders.Rig2D;
+                byte depthTest = inst.DepthTest != 0 ? (byte)1 : (byte)0;
+
+                bool emittedAnyForRig = false;
+                for (int di = 0; di < inst.SlotSliceCount; di++)
+                {
+                    int slotIdx = drawOrder[di];
+                    if ((uint)slotIdx >= (uint)asset->SlotCount) continue;
+
+                    ref readonly Rig2DSlotSetupData slotSetup = ref asset->Slots[slotIdx];
+                    ref readonly Rig2DRuntimeSlotState st = ref slotStates[slotIdx];
+                    int attIdx = st.ActiveAttachmentIndex;
+                    if ((uint)attIdx >= (uint)asset->AttachmentCount) continue;
+
+                    ref readonly Rig2DAttachmentData att = ref asset->Attachments[attIdx];
+                    if (att.Kind == Rig2DAttachmentKind.None) continue;
+
+                    float combinedAlpha = st.LightColor.A * inst.Tint.A;
+                    if (combinedAlpha <= 0.002f) continue;
+
+                    // Resolve sprite region (compressed BC3 atlas!) or fallback texture/UV
+                    StringId regionKey = att.SpriteRegionName;
+                    if (att.Kind == Rig2DAttachmentKind.Sequence && att.SeqFrameCount > 0 && asset->SequenceFrameNames != null)
+                    {
+                        int fi = Math.Clamp(st.SequenceFrame, 0, att.SeqFrameCount - 1);
+                        regionKey = asset->SequenceFrameNames[att.SeqFrameStart + fi];
+                    }
+
+                    TextureHandle texH = att.FallbackTexture.IsValid ? att.FallbackTexture : asset->DefaultAtlasTexture;
+                    Vec4 uvRect = (att.FallbackUvRect.Z != 0f || att.FallbackUvRect.W != 0f) ? att.FallbackUvRect : new Vec4(0f, 0f, 1f, 1f);
+                    SpriteRegionData* reg = AssetSystem.TryGetSpriteRegion(in world.Assets, regionKey);
+                    if (reg != null)
+                    {
+                        texH = reg->AtlasTexture;
+                        uvRect = reg->UvRect;
+                    }
+
+                    int texSlot = -1;
+                    uint texGen = 0u;
+                    if (texH.IsValid)
+                    {
+                        TextureAssetData* tex = AssetSystem.TryGetTexture(in world.Assets, texH);
+                        if (tex != null)
+                        {
+                            texSlot = tex->GpuSlot;
+                            texGen = tex->GpuSlotGen;
+                        }
+                    }
+
+                    Color32 lightCol = Color32.FromFloat(
+                        st.LightColor.R * inst.Tint.R,
+                        st.LightColor.G * inst.Tint.G,
+                        st.LightColor.B * inst.Tint.B,
+                        combinedAlpha);
+                    Color32 darkCol = Color32.FromFloat(
+                        st.DarkColor.R + inst.DarkTint.R,
+                        st.DarkColor.G + inst.DarkTint.G,
+                        st.DarkColor.B + inst.DarkTint.B,
+                        inst.HitFlash);
+                    float alphaCutoff = slotSetup.BlendMode == Rig2DBlendMode.Multiply ? -1f : 0f;
+
+                    uint baseVert = (uint)outVerts.Count;
+                    uint idxStart = (uint)outIndices.Count;
+                    uint addedIndices = 0u;
+
+                    if (att.Kind == Rig2DAttachmentKind.Region || att.Kind == Rig2DAttachmentKind.Sequence)
+                    {
+                        if (outVerts.Count + 4 > outVerts.Capacity || outIndices.Count + 6 > outIndices.Capacity)
+                        {
+                            warnedCap = true;
+                            break;
+                        }
+
+                        Rig2DAffine2D bw = (uint)slotSetup.BoneIndex < (uint)inst.BoneSliceCount
+                            ? worldBones[slotSetup.BoneIndex]
+                            : Rig2DAffine2D.Identity;
+                        Rig2DSystem.ComputeRegionQuadCorners(in att, in bw, out Vec2 bl, out Vec2 br, out Vec2 tr, out Vec2 tl);
+
+                        Vec3 wBL = pos + right * ((bl.X - originOff.X) * scaleX) + up * ((bl.Y - originOff.Y) * scaleY);
+                        Vec3 wBR = pos + right * ((br.X - originOff.X) * scaleX) + up * ((br.Y - originOff.Y) * scaleY);
+                        Vec3 wTR = pos + right * ((tr.X - originOff.X) * scaleX) + up * ((tr.Y - originOff.Y) * scaleY);
+                        Vec3 wTL = pos + right * ((tl.X - originOff.X) * scaleX) + up * ((tl.Y - originOff.Y) * scaleY);
+
+                        outVerts.Add(new Rig2DVertexGpu { Position = wBL, Uv = new Vec2(uvRect.X, uvRect.Y + uvRect.W), LightColor = lightCol, DarkColor = darkCol, AlphaCutoff = alphaCutoff });
+                        outVerts.Add(new Rig2DVertexGpu { Position = wBR, Uv = new Vec2(uvRect.X + uvRect.Z, uvRect.Y + uvRect.W), LightColor = lightCol, DarkColor = darkCol, AlphaCutoff = alphaCutoff });
+                        outVerts.Add(new Rig2DVertexGpu { Position = wTR, Uv = new Vec2(uvRect.X + uvRect.Z, uvRect.Y), LightColor = lightCol, DarkColor = darkCol, AlphaCutoff = alphaCutoff });
+                        outVerts.Add(new Rig2DVertexGpu { Position = wTL, Uv = new Vec2(uvRect.X, uvRect.Y), LightColor = lightCol, DarkColor = darkCol, AlphaCutoff = alphaCutoff });
+
+                        outIndices.Add(baseVert + 0u);
+                        outIndices.Add(baseVert + 1u);
+                        outIndices.Add(baseVert + 2u);
+                        outIndices.Add(baseVert + 0u);
+                        outIndices.Add(baseVert + 2u);
+                        outIndices.Add(baseVert + 3u);
+                        addedIndices = 6u;
+                    }
+                    else if (att.Kind == Rig2DAttachmentKind.WeightedMesh)
+                    {
+                        int vc = att.VertexCount;
+                        int ic = att.IndexCount;
+                        if (vc <= 0 || ic <= 0) continue;
+                        if (outVerts.Count + vc > outVerts.Capacity || outIndices.Count + ic > outIndices.Capacity)
+                        {
+                            warnedCap = true;
+                            break;
+                        }
+
+                        bool hasDeform = deformFresh && st.DeformVertexCount == vc &&
+                                         st.DeformVertexOffset >= 0 &&
+                                         st.DeformVertexOffset + vc <= world.Rigs.FrameDeformDeltas.Length;
+                        Vec2* deformPtr = hasDeform ? (world.Rigs.FrameDeformDeltas.Ptr + st.DeformVertexOffset) : null;
+
+                        for (int v = 0; v < vc; v++)
+                        {
+                            ref readonly Rig2DMeshVertex mv = ref asset->MeshVertices[att.VertexStart + v];
+                            Vec2 delta = deformPtr != null ? deformPtr[v] : Vec2.Zero;
+                            Vec2 skelP = Rig2DSystem.SkinMeshVertex(asset, worldBones, slotSetup.BoneIndex, in mv, delta);
+                            Vec3 wp = pos + right * ((skelP.X - originOff.X) * scaleX) + up * ((skelP.Y - originOff.Y) * scaleY);
+                            Vec2 remappedUv = new Vec2(uvRect.X + mv.Uv.X * uvRect.Z, uvRect.Y + mv.Uv.Y * uvRect.W);
+                            outVerts.Add(new Rig2DVertexGpu
+                            {
+                                Position = wp,
+                                Uv = remappedUv,
+                                LightColor = lightCol,
+                                DarkColor = darkCol,
+                                AlphaCutoff = alphaCutoff,
+                            });
+                        }
+
+                        for (int k = 0; k < ic; k++)
+                            outIndices.Add(baseVert + asset->MeshIndices[att.IndexStart + k]);
+                        addedIndices = (uint)ic;
+                    }
+
+                    if (addedIndices == 0u) continue;
+                    emittedAnyForRig = true;
+
+                    // Coalesce consecutive draws with identical GPU state into ONE batched draw call!
+                    if (outBatches.Count > batchStart)
+                    {
+                        ref Rig2DBatchCmd prev = ref outBatches[outBatches.Count - 1];
+                        if (prev.TextureGpuSlot == texSlot &&
+                            prev.TextureGpuGen == texGen &&
+                            prev.Shader == sh &&
+                            prev.BlendMode == slotSetup.BlendMode &&
+                            prev.DepthTest == depthTest &&
+                            prev.IndexOffset + prev.IndexCount == idxStart)
+                        {
+                            prev.IndexCount += addedIndices;
+                            continue;
+                        }
+                    }
+
+                    if (outBatches.Count >= outBatches.Capacity)
+                    {
+                        warnedCap = true;
+                        break;
+                    }
+
+                    outBatches.Add(new Rig2DBatchCmd
+                    {
+                        TextureGpuSlot = texSlot,
+                        TextureGpuGen = texGen,
+                        Shader = sh,
+                        BlendMode = slotSetup.BlendMode,
+                        DepthTest = depthTest,
+                        IndexOffset = idxStart,
+                        IndexCount = addedIndices,
+                    });
+                }
+
+                if (emittedAnyForRig) stats.Rig2DInstances++;
+                if (warnedCap)
+                {
+                    if (TryLatchExtractWarn(log, ExtractWarnCapRig2D))
+                        LogSystem.Warn(log, $"BatchRenderer.GatherAndBatchRig2D capacity cap reached (verts={outVerts.Count}/{outVerts.Capacity}, indices={outIndices.Count}/{outIndices.Capacity}, batches={outBatches.Count}/{outBatches.Capacity})");
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            scratchArena.Rollback(mark);
         }
     }
 
@@ -2412,6 +2889,26 @@ public static unsafe class BatchRenderer
         };
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static nint SelectRig2DPipeline(GpuShaderSlot* s, Rig2DBlendMode blendMode, bool depthTest)
+    {
+        if (!depthTest)
+        {
+            return blendMode switch
+            {
+                Rig2DBlendMode.Additive => s->PipelineAdditiveNoDepth != nint.Zero ? s->PipelineAdditiveNoDepth : s->PipelineOverlayNoDepth,
+                Rig2DBlendMode.Multiply => s->PipelineMultiplyNoDepth != nint.Zero ? s->PipelineMultiplyNoDepth : s->PipelineOverlayNoDepth,
+                _ => s->PipelineOverlayNoDepth,
+            };
+        }
+        return blendMode switch
+        {
+            Rig2DBlendMode.Additive => s->PipelineAdditive,
+            Rig2DBlendMode.Multiply => s->PipelineMultiply != nint.Zero ? s->PipelineMultiply : s->PipelineAlphaBlend,
+            _ => s->PipelineAlphaBlend,
+        };
+    }
+
     private static FrameUniformsGpu BuildFrameUniforms(in RenderCameraSnapshot cam, in RenderPacket packet, uint activeShadowMapSize)
     {
         ref readonly SceneLighting l = ref packet.Lighting;
@@ -2610,6 +3107,48 @@ public static unsafe class BatchRenderer
             else
             {
                 if (i < hi) SortSpriteItems(arr, i, hi);
+                hi = j;
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool LessRig2D(in Rig2DSortItem a, ulong pivotKey, int pivotIdx)
+        => a.SortKey < pivotKey || (a.SortKey == pivotKey && a.OriginalIndex < pivotIdx);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool GreaterRig2D(in Rig2DSortItem a, ulong pivotKey, int pivotIdx)
+        => a.SortKey > pivotKey || (a.SortKey == pivotKey && a.OriginalIndex > pivotIdx);
+
+    private static void SortRig2DItems(Rig2DSortItem* arr, int lo, int hi)
+    {
+        while (lo < hi)
+        {
+            int mid = lo + ((hi - lo) >> 1);
+            ulong pKey = arr[mid].SortKey;
+            int pIdx = arr[mid].OriginalIndex;
+            int i = lo, j = hi;
+            while (i <= j)
+            {
+                while (LessRig2D(in arr[i], pKey, pIdx)) i++;
+                while (GreaterRig2D(in arr[j], pKey, pIdx)) j--;
+                if (i <= j)
+                {
+                    Rig2DSortItem tmp = arr[i];
+                    arr[i] = arr[j];
+                    arr[j] = tmp;
+                    i++;
+                    j--;
+                }
+            }
+            if (j - lo < hi - i)
+            {
+                if (lo < j) SortRig2DItems(arr, lo, j);
+                lo = i;
+            }
+            else
+            {
+                if (i < hi) SortRig2DItems(arr, i, hi);
                 hi = j;
             }
         }

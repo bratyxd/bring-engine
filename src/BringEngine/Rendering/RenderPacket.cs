@@ -7,6 +7,7 @@ using BringEngine.Rendering.Gpu;
 using BringEngine.Simulation.Camera;
 using BringEngine.Simulation.Particles;
 using BringEngine.Simulation.RenderData;
+using BringEngine.Simulation.Rig2D;
 
 namespace BringEngine.Rendering;
 
@@ -19,6 +20,7 @@ public struct RenderShaderDefaults
 {
     public ShaderHandle Pbr;
     public ShaderHandle Sprite;
+    public ShaderHandle Rig2D;
     public ShaderHandle SdfText;
     public ShaderHandle Particle;
 }
@@ -62,6 +64,19 @@ public struct SpriteGpuInstance
     public Vec4 UvRect;
     public ColorF Color;
     public Vec4 CustomParams; // x = alphaCutoff, y = hitFlash, z = time, w = pad
+}
+
+/// <summary>
+/// 32-byte posed 2D skeletal mesh vertex matching rig_2d.hlsl (ShaderVertexLayout.Rig2DMesh).
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct Rig2DVertexGpu
+{
+    public Vec3 Position;       // offset 0  (12B)
+    public Vec2 Uv;             // offset 12 (8B)
+    public Color32 LightColor;  // offset 20 (4B) -> Ubyte4Norm
+    public Color32 DarkColor;   // offset 24 (4B) -> Ubyte4Norm (A = HitFlash)
+    public float AlphaCutoff;   // offset 28 (4B) (< -0.5 signals alpha-safe Multiply blend)
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -122,6 +137,18 @@ public struct SpriteBatchCmd
 }
 
 [StructLayout(LayoutKind.Sequential)]
+public struct Rig2DBatchCmd
+{
+    public int TextureGpuSlot;
+    public uint TextureGpuGen;
+    public ShaderHandle Shader;
+    public Rig2DBlendMode BlendMode;
+    public byte DepthTest;
+    public uint IndexOffset;
+    public uint IndexCount;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 public struct TextBatchCmd
 {
     public int AtlasTexGpuSlot;
@@ -160,6 +187,7 @@ public struct RenderCameraSnapshot
 
     public int Batch3DStart, Batch3DCount;
     public int SpriteBatchStart, SpriteBatchCount;
+    public int Rig2DBatchStart, Rig2DBatchCount;
     public int TextBatchStart, TextBatchCount;
     public int ParticleBatchStart, ParticleBatchCount;
 }
@@ -185,6 +213,9 @@ public struct RenderPacket
     public NativeSlice<Mat4> JointPalette;
     public NativeList<SpriteGpuInstance> Sprites;
     public NativeList<SpriteBatchCmd> SpriteBatches;
+    public NativeList<Rig2DVertexGpu> Rig2DVertices;
+    public NativeList<uint> Rig2DIndices;
+    public NativeList<Rig2DBatchCmd> Rig2DBatches;
     public NativeList<GlyphGpuInstance> Glyphs;
     public NativeList<TextBatchCmd> TextBatches;
     public NativeList<ParticleGpuInstance> Particles;

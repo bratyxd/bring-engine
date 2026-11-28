@@ -37,6 +37,7 @@ public static unsafe class ShaderSystem
 
         ctx.BuiltinPbrShader = CompileFromFile(ref ctx, Path.Combine(baseDir, "pbr_mesh.hlsl"), "builtin_pbr", ShaderVertexLayout.Mesh3D, SDL.GPUCullMode.Back);
         ctx.BuiltinSpriteShader = CompileFromFile(ref ctx, Path.Combine(baseDir, "sprite_3d.hlsl"), "builtin_sprite", ShaderVertexLayout.InstancedQuad, SDL.GPUCullMode.None);
+        ctx.BuiltinRig2DShader = CompileFromFile(ref ctx, Path.Combine(baseDir, "rig_2d.hlsl"), "builtin_rig_2d", ShaderVertexLayout.Rig2DMesh, SDL.GPUCullMode.None);
         ctx.BuiltinSdfTextShader = CompileFromFile(ref ctx, Path.Combine(baseDir, "sdf_text.hlsl"), "builtin_sdf_text", ShaderVertexLayout.InstancedQuad, SDL.GPUCullMode.None);
         ctx.BuiltinParticleShader = CompileFromFile(ref ctx, Path.Combine(baseDir, "particle.hlsl"), "builtin_particle", ShaderVertexLayout.InstancedQuad, SDL.GPUCullMode.None);
 
@@ -239,6 +240,7 @@ public static unsafe class ShaderSystem
         nint vs = nint.Zero, ps = nint.Zero;
         nint pipeOpaque = nint.Zero, pipeAlpha = nint.Zero, pipeAdd = nint.Zero;
         nint pipeOverlay = nint.Zero, pipeAddOverlay = nint.Zero;
+        nint pipeMultiply = nint.Zero, pipeMultiplyOverlay = nint.Zero;
         nint pipeOpaqueCullNone = nint.Zero, pipeAlphaCullNone = nint.Zero;
 
         try
@@ -251,6 +253,12 @@ public static unsafe class ShaderSystem
             pipeAdd = CreatePipeline(ref ctx, vs, ps, layout, cullMode, blendMode: 2, depthTest: true, depthWrite: false);
             pipeOverlay = CreatePipeline(ref ctx, vs, ps, layout, cullMode, blendMode: 1, depthTest: false, depthWrite: false);
             pipeAddOverlay = CreatePipeline(ref ctx, vs, ps, layout, cullMode, blendMode: 2, depthTest: false, depthWrite: false);
+
+            if (layout == ShaderVertexLayout.Rig2DMesh)
+            {
+                pipeMultiply = CreatePipeline(ref ctx, vs, ps, layout, cullMode, blendMode: 3, depthTest: true, depthWrite: false);
+                pipeMultiplyOverlay = CreatePipeline(ref ctx, vs, ps, layout, cullMode, blendMode: 3, depthTest: false, depthWrite: false);
+            }
 
             if (layout == ShaderVertexLayout.Mesh3D && cullMode != SDL.GPUCullMode.None)
             {
@@ -270,6 +278,8 @@ public static unsafe class ShaderSystem
                 PipelineAdditive = pipeAdd,
                 PipelineOverlayNoDepth = pipeOverlay,
                 PipelineAdditiveNoDepth = pipeAddOverlay,
+                PipelineMultiply = pipeMultiply,
+                PipelineMultiplyNoDepth = pipeMultiplyOverlay,
                 PipelineOpaqueCullNone = pipeOpaqueCullNone,
                 PipelineAlphaBlendCullNone = pipeAlphaCullNone,
                 Layout = layout,
@@ -285,6 +295,8 @@ public static unsafe class ShaderSystem
             if (pipeAdd != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, pipeAdd);
             if (pipeOverlay != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, pipeOverlay);
             if (pipeAddOverlay != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, pipeAddOverlay);
+            if (pipeMultiply != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, pipeMultiply);
+            if (pipeMultiplyOverlay != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, pipeMultiplyOverlay);
             if (pipeOpaqueCullNone != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, pipeOpaqueCullNone);
             if (pipeAlphaCullNone != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, pipeAlphaCullNone);
             if (vs != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, vs);
@@ -302,6 +314,7 @@ public static unsafe class ShaderSystem
         if (ctx.Initialized == 0 || ctx.Device == nint.Zero) return false;
         if (handle.IsValid && (handle == ctx.BuiltinPbrShader ||
                                handle == ctx.BuiltinSpriteShader ||
+                               handle == ctx.BuiltinRig2DShader ||
                                handle == ctx.BuiltinSdfTextShader ||
                                handle == ctx.BuiltinParticleShader))
         {
@@ -319,6 +332,8 @@ public static unsafe class ShaderSystem
         if (s->PipelineAdditive != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s->PipelineAdditive);
         if (s->PipelineOverlayNoDepth != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s->PipelineOverlayNoDepth);
         if (s->PipelineAdditiveNoDepth != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s->PipelineAdditiveNoDepth);
+        if (s->PipelineMultiply != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s->PipelineMultiply);
+        if (s->PipelineMultiplyNoDepth != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s->PipelineMultiplyNoDepth);
         if (s->PipelineOpaqueCullNone != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s->PipelineOpaqueCullNone);
         if (s->PipelineAlphaBlendCullNone != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s->PipelineAlphaBlendCullNone);
         if (s->VertexShader != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, s->VertexShader);
@@ -418,6 +433,17 @@ public static unsafe class ShaderSystem
             blend.DstAlphaBlendFactor = SDL.GPUBlendFactor.One;
             blend.AlphaBlendOp = SDL.GPUBlendOp.Add;
         }
+        else if (blendMode == 3)
+        {
+            // Alpha-safe Multiply blend: shader outputs (rgb * alpha, alpha)
+            blend.EnableBlend = true;
+            blend.SrcColorBlendFactor = SDL.GPUBlendFactor.DstColor;
+            blend.DstColorBlendFactor = SDL.GPUBlendFactor.OneMinusSrcAlpha;
+            blend.ColorBlendOp = SDL.GPUBlendOp.Add;
+            blend.SrcAlphaBlendFactor = SDL.GPUBlendFactor.One;
+            blend.DstAlphaBlendFactor = SDL.GPUBlendFactor.OneMinusSrcAlpha;
+            blend.AlphaBlendOp = SDL.GPUBlendOp.Add;
+        }
 
         var colorTarget = new SDL.GPUColorTargetDescription
         {
@@ -451,28 +477,44 @@ public static unsafe class ShaderSystem
         var vBufDesc = new SDL.GPUVertexBufferDescription
         {
             Slot = 0,
-            Pitch = (uint)sizeof(Vertex3D),
+            Pitch = layout == ShaderVertexLayout.Rig2DMesh ? (uint)sizeof(Rig2DVertexGpu) : (uint)sizeof(Vertex3D),
             InputRate = SDL.GPUVertexInputRate.Vertex,
         };
 
         SDL.GPUVertexAttribute* attrs = stackalloc SDL.GPUVertexAttribute[7];
-        attrs[0] = new SDL.GPUVertexAttribute { Location = 0, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float3, Offset = 0 };
-        attrs[1] = new SDL.GPUVertexAttribute { Location = 1, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float3, Offset = 12 };
-        attrs[2] = new SDL.GPUVertexAttribute { Location = 2, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float2, Offset = 24 };
-        attrs[3] = new SDL.GPUVertexAttribute { Location = 3, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Ubyte4Norm, Offset = 32 };
-        attrs[4] = new SDL.GPUVertexAttribute { Location = 4, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Uint, Offset = 36 };
-        attrs[5] = new SDL.GPUVertexAttribute { Location = 5, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float4, Offset = 40 };
-        attrs[6] = new SDL.GPUVertexAttribute { Location = 6, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float2, Offset = 56 };
-
-        var vertInput = layout == ShaderVertexLayout.Mesh3D
-            ? new SDL.GPUVertexInputState
+        SDL.GPUVertexInputState vertInput = default;
+        if (layout == ShaderVertexLayout.Mesh3D)
+        {
+            attrs[0] = new SDL.GPUVertexAttribute { Location = 0, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float3, Offset = 0 };
+            attrs[1] = new SDL.GPUVertexAttribute { Location = 1, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float3, Offset = 12 };
+            attrs[2] = new SDL.GPUVertexAttribute { Location = 2, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float2, Offset = 24 };
+            attrs[3] = new SDL.GPUVertexAttribute { Location = 3, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Ubyte4Norm, Offset = 32 };
+            attrs[4] = new SDL.GPUVertexAttribute { Location = 4, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Uint, Offset = 36 };
+            attrs[5] = new SDL.GPUVertexAttribute { Location = 5, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float4, Offset = 40 };
+            attrs[6] = new SDL.GPUVertexAttribute { Location = 6, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float2, Offset = 56 };
+            vertInput = new SDL.GPUVertexInputState
             {
                 NumVertexBuffers = 1,
                 VertexBufferDescriptions = (nint)(&vBufDesc),
                 NumVertexAttributes = 7,
                 VertexAttributes = (nint)attrs,
-            }
-            : default;
+            };
+        }
+        else if (layout == ShaderVertexLayout.Rig2DMesh)
+        {
+            attrs[0] = new SDL.GPUVertexAttribute { Location = 0, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float3, Offset = 0 };
+            attrs[1] = new SDL.GPUVertexAttribute { Location = 1, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float2, Offset = 12 };
+            attrs[2] = new SDL.GPUVertexAttribute { Location = 2, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Ubyte4Norm, Offset = 20 };
+            attrs[3] = new SDL.GPUVertexAttribute { Location = 3, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Ubyte4Norm, Offset = 24 };
+            attrs[4] = new SDL.GPUVertexAttribute { Location = 4, BufferSlot = 0, Format = SDL.GPUVertexElementFormat.Float, Offset = 28 };
+            vertInput = new SDL.GPUVertexInputState
+            {
+                NumVertexBuffers = 1,
+                VertexBufferDescriptions = (nint)(&vBufDesc),
+                NumVertexAttributes = 5,
+                VertexAttributes = (nint)attrs,
+            };
+        }
 
         var pipeInfo = new SDL.GPUGraphicsPipelineCreateInfo
         {

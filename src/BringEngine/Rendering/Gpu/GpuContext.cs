@@ -19,6 +19,7 @@ public enum ShaderVertexLayout : byte
 {
     Mesh3D = 0,
     InstancedQuad = 1,
+    Rig2DMesh = 2,
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -54,6 +55,8 @@ public struct GpuShaderSlot
     public nint PipelineAdditive;
     public nint PipelineOverlayNoDepth;
     public nint PipelineAdditiveNoDepth;
+    public nint PipelineMultiply;
+    public nint PipelineMultiplyNoDepth;
     public nint PipelineOpaqueCullNone;
     public nint PipelineAlphaBlendCullNone;
     public ShaderVertexLayout Layout;
@@ -76,6 +79,7 @@ public struct RenderStats
     public int CopyPasses;
     public int MeshInstances;
     public int SpriteInstances;
+    public int Rig2DInstances;
     public int GlyphInstances;
     public int ParticleInstances;
     public int Triangles;
@@ -144,6 +148,10 @@ public unsafe struct GpuContext
     public uint TextGlyphBufferBytes;
     public nint ParticleInstanceBuffer;
     public uint ParticleInstanceBufferBytes;
+    public nint Rig2DVertexBuffer;
+    public uint Rig2DVertexBufferBytes;
+    public nint Rig2DIndexBuffer;
+    public uint Rig2DIndexBufferBytes;
 
     public nint UploadTransferBuffer;
     public uint UploadTransferBufferBytes;
@@ -177,6 +185,7 @@ public unsafe struct GpuContext
     // Built-in engine shader handles
     public ShaderHandle BuiltinPbrShader;
     public ShaderHandle BuiltinSpriteShader;
+    public ShaderHandle BuiltinRig2DShader;
     public ShaderHandle BuiltinSdfTextShader;
     public ShaderHandle BuiltinParticleShader;
 
@@ -355,6 +364,8 @@ public static unsafe class GpuSystem
                 if (ctx.SpriteInstanceBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.SpriteInstanceBuffer);
                 if (ctx.TextGlyphBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.TextGlyphBuffer);
                 if (ctx.ParticleInstanceBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.ParticleInstanceBuffer);
+                if (ctx.Rig2DVertexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.Rig2DVertexBuffer);
+                if (ctx.Rig2DIndexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(device, ctx.Rig2DIndexBuffer);
                 if (ctx.UploadTransferBuffer != nint.Zero) SDL.ReleaseGPUTransferBuffer(device, ctx.UploadTransferBuffer);
                 if (windowClaimed && window != nint.Zero) SDL.ReleaseWindowFromGPUDevice(device, window);
                 SDL.DestroyGPUDevice(device);
@@ -368,6 +379,7 @@ public static unsafe class GpuSystem
     {
         Pbr = ctx.BuiltinPbrShader,
         Sprite = ctx.BuiltinSpriteShader,
+        Rig2D = ctx.BuiltinRig2DShader,
         SdfText = ctx.BuiltinSdfTextShader,
         Particle = ctx.BuiltinParticleShader,
     };
@@ -605,12 +617,16 @@ public static unsafe class GpuSystem
         ctx.SpriteInstanceBufferBytes = 2 * 1024 * 1024;   // ~18k sprites
         ctx.TextGlyphBufferBytes = 4 * 1024 * 1024;        // ~29,127 text glyphs
         ctx.ParticleInstanceBufferBytes = 2 * 1024 * 1024; // 32,768 particles
+        ctx.Rig2DVertexBufferBytes = 2 * 1024 * 1024;      // 65,536 Rig2D vertices (32B each)
+        ctx.Rig2DIndexBufferBytes = 1 * 1024 * 1024;       // 262,144 Rig2D indices (4B each)
 
         ctx.Instance3DBuffer = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.GraphicsStorageRead, ctx.Instance3DBufferBytes);
         ctx.JointPaletteBuffer = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.GraphicsStorageRead, ctx.JointPaletteBufferBytes);
         ctx.SpriteInstanceBuffer = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.GraphicsStorageRead, ctx.SpriteInstanceBufferBytes);
         ctx.TextGlyphBuffer = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.GraphicsStorageRead, ctx.TextGlyphBufferBytes);
         ctx.ParticleInstanceBuffer = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.GraphicsStorageRead, ctx.ParticleInstanceBufferBytes);
+        ctx.Rig2DVertexBuffer = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.Vertex, ctx.Rig2DVertexBufferBytes);
+        ctx.Rig2DIndexBuffer = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.Index, ctx.Rig2DIndexBufferBytes);
 
         // Static unit quad index buffer (6 uint32: 0,1,2, 0,2,3)
         ctx.QuadIndexBuffer = CreateBuffer(ctx.Device, SDL.GPUBufferUsageFlags.Index, 6 * sizeof(uint));
@@ -1280,6 +1296,8 @@ public static unsafe class GpuSystem
             if (s.PipelineAdditive != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineAdditive);
             if (s.PipelineOverlayNoDepth != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineOverlayNoDepth);
             if (s.PipelineAdditiveNoDepth != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineAdditiveNoDepth);
+            if (s.PipelineMultiply != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineMultiply);
+            if (s.PipelineMultiplyNoDepth != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineMultiplyNoDepth);
             if (s.PipelineOpaqueCullNone != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineOpaqueCullNone);
             if (s.PipelineAlphaBlendCullNone != nint.Zero) SDL.ReleaseGPUGraphicsPipeline(ctx.Device, s.PipelineAlphaBlendCullNone);
             if (s.VertexShader != nint.Zero) SDL.ReleaseGPUShader(ctx.Device, s.VertexShader);
@@ -1310,6 +1328,8 @@ public static unsafe class GpuSystem
         if (ctx.SpriteInstanceBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.SpriteInstanceBuffer);
         if (ctx.TextGlyphBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.TextGlyphBuffer);
         if (ctx.ParticleInstanceBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.ParticleInstanceBuffer);
+        if (ctx.Rig2DVertexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.Rig2DVertexBuffer);
+        if (ctx.Rig2DIndexBuffer != nint.Zero) SDL.ReleaseGPUBuffer(ctx.Device, ctx.Rig2DIndexBuffer);
         if (ctx.UploadTransferBuffer != nint.Zero) SDL.ReleaseGPUTransferBuffer(ctx.Device, ctx.UploadTransferBuffer);
 
         if (ctx.Window != nint.Zero) SDL.ReleaseWindowFromGPUDevice(ctx.Device, ctx.Window);

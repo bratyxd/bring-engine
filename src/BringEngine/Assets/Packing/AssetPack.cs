@@ -13,6 +13,7 @@ using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
 using BringEngine.Core.Threading;
 using BringEngine.Networking;
+using BringEngine.Simulation.Rig2D;
 using BringEngine.Simulation.World;
 using StbImageSharp;
 
@@ -25,6 +26,7 @@ public enum PackEntryKind : byte
     SdfFont = 3,           // TrueType .ttf bytes + SDF bake parameters, LZ4/Brotli compressed
     StandaloneTexture = 4, // Explicit opt-out standalone compressed BC1/BC3 texture (e.g. tiled 3D floor)
     RawBlob = 5,           // Arbitrary compressed data (JSON, shaders, audio, level tables)
+    Rig2D = 6,             // Compiled binary BRIG 2D skeletal rig asset, LZ4/Brotli compressed
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
@@ -118,6 +120,7 @@ public struct AssetPackBuildSummary
     public int StandaloneTextureCount;
     public int GltfModelCount;
     public int FontCount;
+    public int Rig2DCount;
     public int RawBlobCount;
     public long RawInputBytes;
     public long PackedOutputBytes;
@@ -315,6 +318,21 @@ public static unsafe class AssetPackBuilder
                     UncompressedBytes = payload.Length,
                 });
                 summary.FontCount++;
+            }
+            else if (rel.EndsWith(".rig2d.json", StringComparison.OrdinalIgnoreCase))
+            {
+                summary.RawInputBytes += new FileInfo(file).Length;
+                byte[] brig = Rig2DCompiler.CompileFromFile(file);
+                string rigKey = Rig2DCompiler.StripRig2DExtension(rel);
+                AddEntry(new PreparedEntry
+                {
+                    NameHash = StringId.Hash(rigKey).Value,
+                    Kind = PackEntryKind.Rig2D,
+                    Compression = compression,
+                    CompressedPayload = PackCompressionSystem.Compress(brig, compression),
+                    UncompressedBytes = brig.Length,
+                });
+                summary.Rig2DCount++;
             }
             else if (ext == ".bin" && IsInArray(gltfExternalBuffers, Path.GetFullPath(file)))
             {
@@ -881,7 +899,7 @@ public static unsafe class AssetPackLoader
             return false;
         if (e.UncompressedBytes == 0 && e.CompressedBytes != 0)
             return false;
-        if (e.Kind is not (PackEntryKind.CompressedAtlas or PackEntryKind.GltfModel or PackEntryKind.SdfFont or PackEntryKind.StandaloneTexture or PackEntryKind.RawBlob))
+        if (e.Kind is not (PackEntryKind.CompressedAtlas or PackEntryKind.GltfModel or PackEntryKind.SdfFont or PackEntryKind.StandaloneTexture or PackEntryKind.RawBlob or PackEntryKind.Rig2D))
             return false;
         if (e.Compression is not (PackCompressionMode.None or PackCompressionMode.Lz4 or PackCompressionMode.Brotli))
             return false;
@@ -939,6 +957,11 @@ public static unsafe class AssetPackLoader
 
                     case PackEntryKind.StandaloneTexture:
                         TextureLoader.LoadBrtxFromMemory(rawSpan, ref bundleArena, ref world.Assets, bundle, nameId);
+                        loaded++;
+                        break;
+
+                    case PackEntryKind.Rig2D:
+                        Rig2DLoader.LoadFromMemory(rawSpan, ref bundleArena, ref world.Rigs, bundle, nameId);
                         loaded++;
                         break;
                 }

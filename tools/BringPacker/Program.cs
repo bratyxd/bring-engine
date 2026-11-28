@@ -137,7 +137,7 @@ public static unsafe class Program
             Console.WriteLine(
                 $"[BringPacker] Packed '{inputDir}' -> '{outputPack}' ({compression}, atlas={atlasComp}, gltfTex={gltfTexComp}): " +
                 $"atlases={s.AtlasPageCount} ({s.AtlasedSpriteCount} sprites), standaloneTex={s.StandaloneTextureCount}, " +
-                $"glTF={s.GltfModelCount}, fonts={s.FontCount}, blobs={s.RawBlobCount}, " +
+                $"glTF={s.GltfModelCount}, rigs2d={s.Rig2DCount}, fonts={s.FontCount}, blobs={s.RawBlobCount}, " +
                 $"size={s.PackedOutputBytes / 1024.0:F1}KB ({ratio:F1}% of raw {s.RawInputBytes / 1024.0:F1}KB)");
             return 0;
         }
