@@ -166,10 +166,11 @@ jobs:
           Copy-CleanTree src/BringEngine "$root/src/BringEngine"
           Copy-CleanTree src/ShowcaseGame "$root/src/ShowcaseGame"
           Copy-CleanTree tools/BringPacker "$root/tools/BringPacker"
+          Copy-CleanTree tools/BringRig2D "$root/tools/BringRig2D"
 
           Compress-Archive -Path $root -DestinationPath "dist/$env:SDK_NAME.zip" -Force
           Get-Item "dist/$env:SDK_NAME.zip"
-      - name: Verify standalone CoreCLR game & BringPacker build against extracted SDK archive
+      - name: Verify standalone CoreCLR game, BringPacker & BringRig2D build against extracted SDK archive
         shell: pwsh
         run: |
           $verifyDir = Join-Path $env:RUNNER_TEMP "sdk-verify"
@@ -178,6 +179,8 @@ jobs:
           $sdkDir = Join-Path $verifyDir $env:SDK_NAME
           dotnet publish "$sdkDir/tools/BringPacker/BringPacker.csproj" -c Release -r win-x64 -o "$verifyDir/packer"
           & "$verifyDir/packer/BringPacker.exe" --help
+          dotnet publish "$sdkDir/tools/BringRig2D/BringRig2D.csproj" -c Release -r win-x64 -o "$verifyDir/rig2d"
+          & "$verifyDir/rig2d/BringRig2D.exe" --help
           dotnet publish "$sdkDir/src/ShowcaseGame/ShowcaseGame.csproj" -c Release -r win-x64 -o "$verifyDir/out"
           & "$verifyDir/out/ShowcaseGame.exe" --headless --ticks 600
       - uses: actions/upload-artifact@v4
@@ -204,6 +207,7 @@ jobs:
           rsync -a --exclude='bin/' --exclude='obj/' src/BringEngine/ "${ROOT}/src/BringEngine/"
           rsync -a --exclude='bin/' --exclude='obj/' src/ShowcaseGame/ "${ROOT}/src/ShowcaseGame/"
           rsync -a --exclude='bin/' --exclude='obj/' tools/BringPacker/ "${ROOT}/tools/BringPacker/"
+          rsync -a --exclude='bin/' --exclude='obj/' tools/BringRig2D/ "${ROOT}/tools/BringRig2D/"
           (cd dist && zip -qr "${SDK_NAME}.zip" "${SDK_NAME}")
           unzip -l "dist/${SDK_NAME}.zip" | grep -q "${SDK_NAME}/AGENTS.md"
           unzip -l "dist/${SDK_NAME}.zip" | grep -q "${SDK_NAME}/src/BringEngine/BringEngine.csproj"

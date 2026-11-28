@@ -145,11 +145,13 @@ jobs:
         run: |
           dotnet ./tests/BringEngine.Tests/bin/Release/net10.0/BringEngine.Tests.dll
           dotnet ./tests/BringEngine.Tests/bin/Release/net10.0/BringEngine.Tests.dll --headless-only
-      - name: Publish & smoke-test BringPacker (Self-Contained ReadyToRun)
+      - name: Publish & smoke-test BringPacker & BringRig2D (Self-Contained ReadyToRun)
         shell: pwsh
         run: |
           dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r win-x64
           ./tools/BringPacker/bin/Release/net10.0/win-x64/publish/BringPacker.exe --help
+          dotnet publish tools/BringRig2D/BringRig2D.csproj -c Release -r win-x64
+          ./tools/BringRig2D/bin/Release/net10.0/win-x64/publish/BringRig2D.exe --help
       - name: Publish & verify ShowcaseGame (Self-Contained ReadyToRun + Headless + Render)
         shell: pwsh
         run: |
@@ -165,6 +167,7 @@ jobs:
             build/verify-windows/*.png
             tests/BringEngine.Tests/bin/Release/net10.0/verify_engine_test.png
             tests/BringEngine.Tests/bin/Release/net10.0/verify_nineslice_bc3_test.png
+            tests/BringEngine.Tests/bin/Release/net10.0/verify_rig2d_test.png
           if-no-files-found: ignore
 
   linux-x64:
@@ -188,10 +191,12 @@ jobs:
         run: |
           xvfb-run -a dotnet ./tests/BringEngine.Tests/bin/Release/net10.0/BringEngine.Tests.dll
           dotnet ./tests/BringEngine.Tests/bin/Release/net10.0/BringEngine.Tests.dll --headless-only
-      - name: Publish & smoke-test BringPacker (Self-Contained ReadyToRun)
+      - name: Publish & smoke-test BringPacker & BringRig2D (Self-Contained ReadyToRun)
         run: |
           dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r linux-x64
           ./tools/BringPacker/bin/Release/net10.0/linux-x64/publish/BringPacker --help
+          dotnet publish tools/BringRig2D/BringRig2D.csproj -c Release -r linux-x64
+          ./tools/BringRig2D/bin/Release/net10.0/linux-x64/publish/BringRig2D --help
       - name: Publish & verify ShowcaseGame (Self-Contained ReadyToRun + Headless + Render)
         run: |
           dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r linux-x64
@@ -206,6 +211,7 @@ jobs:
             build/verify-linux/*.png
             tests/BringEngine.Tests/bin/Release/net10.0/verify_engine_test.png
             tests/BringEngine.Tests/bin/Release/net10.0/verify_nineslice_bc3_test.png
+            tests/BringEngine.Tests/bin/Release/net10.0/verify_rig2d_test.png
           if-no-files-found: ignore
 
   macos-arm64:
@@ -221,10 +227,12 @@ jobs:
         run: dotnet build BringEngine.sln -c Release
       - name: Run Engine Tests (Headless)
         run: dotnet ./tests/BringEngine.Tests/bin/Release/net10.0/BringEngine.Tests.dll --headless-only
-      - name: Publish & smoke-test BringPacker (Self-Contained ReadyToRun)
+      - name: Publish & smoke-test BringPacker & BringRig2D (Self-Contained ReadyToRun)
         run: |
           dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r osx-arm64
           ./tools/BringPacker/bin/Release/net10.0/osx-arm64/publish/BringPacker --help
+          dotnet publish tools/BringRig2D/BringRig2D.csproj -c Release -r osx-arm64
+          ./tools/BringRig2D/bin/Release/net10.0/osx-arm64/publish/BringRig2D --help
       - name: Publish & verify ShowcaseGame (Self-Contained ReadyToRun Headless)
         run: |
           dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r osx-arm64
@@ -256,6 +264,7 @@ jobs:
           rsync -a --exclude='bin/' --exclude='obj/' src/BringEngine/ "${ROOT}/src/BringEngine/"
           rsync -a --exclude='bin/' --exclude='obj/' src/ShowcaseGame/ "${ROOT}/src/ShowcaseGame/"
           rsync -a --exclude='bin/' --exclude='obj/' tools/BringPacker/ "${ROOT}/tools/BringPacker/"
+          rsync -a --exclude='bin/' --exclude='obj/' tools/BringRig2D/ "${ROOT}/tools/BringRig2D/"
           (cd dist && zip -qr "${SDK_NAME}.zip" "${SDK_NAME}")
           unzip -l "dist/${SDK_NAME}.zip" | grep -q "${SDK_NAME}/AGENTS.md"
           unzip -l "dist/${SDK_NAME}.zip" | grep -q "${SDK_NAME}/src/BringEngine/BringEngine.csproj"
