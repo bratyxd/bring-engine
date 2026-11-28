@@ -450,6 +450,7 @@ public struct Rig2DTrackState
     public float Speed;
     public float Alpha;
     public byte Loop;
+    public byte FromLoop;
     public byte Additive;
     public byte Active;
     public byte JustStarted;
@@ -457,6 +458,9 @@ public struct Rig2DTrackState
     public float FromTime;
     public float MixElapsed;
     public float MixDuration;
+    public float FadeOutElapsed;
+    public float FadeOutDuration;
+    public float FadeOutStartAlpha;
 }
 
 [InlineArray(8)]

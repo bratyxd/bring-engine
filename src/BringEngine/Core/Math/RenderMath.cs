@@ -568,6 +568,9 @@ public struct Quat : IEquatable<Quat>
         return new Quat(X * inv, Y * inv, Z * inv, W * inv);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly Quat Conjugate() => new Quat(-X, -Y, -Z, W);
+
     public static Quat Slerp(Quat a, Quat b, float t)
     {
         float dot = a.X * b.X + a.Y * b.Y + a.Z * b.Z + a.W * b.W;

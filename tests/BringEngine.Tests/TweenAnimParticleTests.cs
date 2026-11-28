@@ -1,8 +1,10 @@
 using System;
+using BringEngine.Assets;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
 using BringEngine.Core.Threading;
+using BringEngine.Rendering;
 using BringEngine.Simulation.Animation;
 using BringEngine.Simulation.Camera;
 using BringEngine.Simulation.Particles;
@@ -33,9 +35,12 @@ public static unsafe class TweenAnimParticleTests
         Assert.Run("AnimationSystem_SkeletalCrossfadeAndSpriteFrames", &TestAnimationSystem);
         Assert.Run("AnimationSystem_CubicSplineCrossfadeNonTopoJointsAndHandles", &TestAnimationEdgeCases);
         Assert.Run("AnimationSystem_SkeletonGuardsScratchOomSpriteClipHandlesOverflowCrossfadeAndBounds", &TestAnimationAuditRegressions);
+        Assert.Run("AnimationSystem_MultiTrackBlending_MasksAdditiveBlendTwoClipsFadeOutAndZeroGc", &TestAnimationMultiTrackBlending);
+        Assert.Run("AnimationSystem_AtlasSpriteFlipbooks_PingPongAndDirectSpriteBinding", &TestAtlasSpriteFlipbooks);
         Assert.Run("ParticleSystem_SoADeterministicZeroGc", &TestParticleSystem);
         Assert.Run("ParticleSystem_ParallelParityShapesOverflowHoldPosAndMaxEmitters", &TestParticleParallelAndEdgeCases);
         Assert.Run("ParticleSystem_ManualLocalMoveBadDtOverflowAndHighAtlasClamp", &TestParticleAuditRegressions);
+        Assert.Run("ParticleSystem_AtlasFlipbooks_AllModesDeterminismBlendAndZeroGc", &TestParticleAtlasFlipbooks);
     }
 
     private static void OnTweenDone(uint userData) => s_completedUserData = userData;
@@ -1043,5 +1048,629 @@ public static unsafe class TweenAnimParticleTests
 
         alloc.Dispose();
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero leak");
+    }
+
+    private static void TestAnimationMultiTrackBlending()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(2 * 1024 * 1024, 128 * 1024, 256 * 1024, 64 * 1024);
+        var anims = AnimationTable.Create(ref alloc.Persistent, 16, 32, 32, 16, 32);
+
+        try
+        {
+            // 3-joint skeleton: j0=root/lower, j1=lower child, j2=upper arm (parents: -1, 0, 0)
+            int* parents = alloc.Persistent.Alloc<int>(3);
+            parents[0] = -1; parents[1] = 0; parents[2] = 0;
+            Mat4* ibm = alloc.Persistent.Alloc<Mat4>(3);
+            ibm[0] = Mat4.Identity; ibm[1] = Mat4.Identity; ibm[2] = Mat4.Identity;
+            Vec3* bp = alloc.Persistent.Alloc<Vec3>(3);
+            bp[0] = Vec3.Zero; bp[1] = new Vec3(0f, 1f, 0f); bp[2] = new Vec3(0f, 2f, 0f);
+            Quat* br = alloc.Persistent.Alloc<Quat>(3);
+            br[0] = Quat.Identity; br[1] = Quat.Identity; br[2] = Quat.Identity;
+            Vec3* bs = alloc.Persistent.Alloc<Vec3>(3);
+            bs[0] = Vec3.One; bs[1] = Vec3.One; bs[2] = Vec3.One;
+
+            var skel = AnimationSystem.RegisterSkeleton(ref anims, new SkeletonData
+            {
+                JointCount = 3,
+                ParentIndices = parents,
+                InverseBindMatrices = ibm,
+                BindPositions = bp,
+                BindRotations = br,
+                BindScales = bs,
+            });
+
+            static AnimClipHandle MakeConstPos3Clip(ref LinearArena arena, ref AnimationTable tbl, string name, float dur, Vec3 j0, Vec3 j1, Vec3 j2)
+            {
+                float* t = arena.Alloc<float>(2);
+                t[0] = 0f; t[1] = dur;
+                var samps = arena.Alloc<AnimSamplerData>(3);
+                var chans = arena.Alloc<AnimChannelData>(3);
+                Vec3* pts = stackalloc Vec3[3] { j0, j1, j2 };
+                for (int k = 0; k < 3; k++)
+                {
+                    float* v = arena.Alloc<float>(6);
+                    v[0] = pts[k].X; v[1] = pts[k].Y; v[2] = pts[k].Z;
+                    v[3] = pts[k].X; v[4] = pts[k].Y; v[5] = pts[k].Z;
+                    samps[k] = new AnimSamplerData { Times = t, Values = v, KeyframeCount = 2, ComponentsPerValue = 3, Interpolation = AnimInterpolation.Linear };
+                    chans[k] = new AnimChannelData { SamplerIndex = k, TargetJointIndex = k, Path = AnimTargetPath.Translation };
+                }
+                return AnimationSystem.RegisterClip(ref tbl, new AnimClipData
+                {
+                    Name = StringId.Hash(name), Duration = dur, Samplers = samps, SamplerCount = 3, Channels = chans, ChannelCount = 3,
+                });
+            }
+
+            static AnimClipHandle MakeLinearXClip(ref LinearArena arena, ref AnimationTable tbl, string name, float dur, float x0, float x1)
+            {
+                float* t = arena.Alloc<float>(2);
+                t[0] = 0f; t[1] = dur;
+                float* v = arena.Alloc<float>(6);
+                v[0] = x0; v[1] = 0f; v[2] = 0f;
+                v[3] = x1; v[4] = 0f; v[5] = 0f;
+                var samp = arena.Alloc<AnimSamplerData>(1);
+                samp[0] = new AnimSamplerData { Times = t, Values = v, KeyframeCount = 2, ComponentsPerValue = 3, Interpolation = AnimInterpolation.Linear };
+                var chan = arena.Alloc<AnimChannelData>(1);
+                chan[0] = new AnimChannelData { SamplerIndex = 0, TargetJointIndex = 0, Path = AnimTargetPath.Translation };
+                return AnimationSystem.RegisterClip(ref tbl, new AnimClipData
+                {
+                    Name = StringId.Hash(name), Duration = dur, Samplers = samp, SamplerCount = 1, Channels = chan, ChannelCount = 1,
+                });
+            }
+
+            var clipWalk = MakeConstPos3Clip(ref alloc.Persistent, ref anims, "walk", 1.0f, new Vec3(2f, 0f, 0f), new Vec3(0f, 3f, 0f), new Vec3(0f, 2f, 0f));
+            var clipAttack = MakeConstPos3Clip(ref alloc.Persistent, ref anims, "attack", 0.5f, new Vec3(99f, 0f, 0f), new Vec3(0f, 99f, 0f), new Vec3(5f, 2f, 0f));
+            var clipOneShot = MakeLinearXClip(ref alloc.Persistent, ref anims, "oneshot", 0.15f, 8f, 8f);
+            var clipIdleTime = MakeLinearXClip(ref alloc.Persistent, ref anims, "idle_t", 1.0f, 0f, 10f);
+            var clipRunTime = MakeLinearXClip(ref alloc.Persistent, ref anims, "run_t", 1.0f, 10f, 20f);
+
+            // Additive recoil clip on j2: pos=(0, 2.5, 0) [+0.5 Y delta], rot=+30 deg Z, scale=(2, 1, 1)
+            float* aTimes = alloc.Persistent.Alloc<float>(2);
+            aTimes[0] = 0f; aTimes[1] = 1f;
+            float* aPos = alloc.Persistent.Alloc<float>(6);
+            aPos[0] = 0f; aPos[1] = 2.5f; aPos[2] = 0f; aPos[3] = 0f; aPos[4] = 2.5f; aPos[5] = 0f;
+            Quat q30 = Quat.FromAxisAngle(Vec3.UnitZ, 30f * DetMath.Deg2Rad);
+            float* aRot = alloc.Persistent.Alloc<float>(8);
+            aRot[0] = q30.X; aRot[1] = q30.Y; aRot[2] = q30.Z; aRot[3] = q30.W;
+            aRot[4] = q30.X; aRot[5] = q30.Y; aRot[6] = q30.Z; aRot[7] = q30.W;
+            float* aScl = alloc.Persistent.Alloc<float>(6);
+            aScl[0] = 2f; aScl[1] = 1f; aScl[2] = 1f; aScl[3] = 2f; aScl[4] = 1f; aScl[5] = 1f;
+            var aSamps = alloc.Persistent.Alloc<AnimSamplerData>(3);
+            aSamps[0] = new AnimSamplerData { Times = aTimes, Values = aPos, KeyframeCount = 2, ComponentsPerValue = 3, Interpolation = AnimInterpolation.Linear };
+            aSamps[1] = new AnimSamplerData { Times = aTimes, Values = aRot, KeyframeCount = 2, ComponentsPerValue = 4, Interpolation = AnimInterpolation.Linear };
+            aSamps[2] = new AnimSamplerData { Times = aTimes, Values = aScl, KeyframeCount = 2, ComponentsPerValue = 3, Interpolation = AnimInterpolation.Linear };
+            var aChans = alloc.Persistent.Alloc<AnimChannelData>(3);
+            aChans[0] = new AnimChannelData { SamplerIndex = 0, TargetJointIndex = 2, Path = AnimTargetPath.Translation };
+            aChans[1] = new AnimChannelData { SamplerIndex = 1, TargetJointIndex = 2, Path = AnimTargetPath.Rotation };
+            aChans[2] = new AnimChannelData { SamplerIndex = 2, TargetJointIndex = 2, Path = AnimTargetPath.Scale };
+            var clipAdditive = AnimationSystem.RegisterClip(ref anims, new AnimClipData
+            {
+                Name = StringId.Hash("add_recoil"), Duration = 1f, Samplers = aSamps, SamplerCount = 3, Channels = aChans, ChannelCount = 3,
+            });
+
+            var pH = AnimationSystem.AddPlayer(ref anims, EntityId.Create(1, 1), skel, clipWalk);
+
+            // Guard checks for invalid track/clip/handle
+            Assert.True(!AnimationSystem.SetTrack(ref anims, pH, -1, clipAttack), "Negative track rejected");
+            Assert.True(!AnimationSystem.SetTrack(ref anims, pH, AnimationSystem.TrackCount, clipAttack), "Out-of-range track rejected");
+            Assert.True(!AnimationSystem.SetTrack(ref anims, pH, 1, AnimClipHandle.Invalid), "Invalid clip rejected");
+
+            // 1. Multi-track override with JointMask (upper body j2 only; j0 & j1 strictly equal to Track 0!)
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 1, clipAttack, loop: false, crossfadeDuration: 0f, speed: 1f, weight: 1f), "SetTrack 1 attack");
+            AnimationSystem.SetTrackJointMask(ref anims, pH, track: 1, maskLo: 1UL << 2);
+
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.25f, ref alloc.Frame, ref alloc.Scratch);
+            AnimPlayerData* pPtr = AnimationSystem.TryGetPlayer(in anims, pH);
+            Mat4 m0 = anims.FrameJointPalette[pPtr->FrameJointOffset + 0];
+            Mat4 m1 = anims.FrameJointPalette[pPtr->FrameJointOffset + 1];
+            Mat4 m2 = anims.FrameJointPalette[pPtr->FrameJointOffset + 2];
+            Assert.Near(2f, m0.C3.X, 1e-4f, "Masked Track 1 leaves j0 strictly equal to Track 0 (X=2, not 99)");
+            Assert.Near(3f, m1.C3.Y, 1e-4f, "Masked Track 1 leaves j1 strictly equal to Track 0 (Y=3, not 99)");
+            Assert.Near(7f, m2.C3.X, 1e-4f, "Masked Track 1 overrides j2 local X=5 on top of parent j0 X=2 => 7");
+
+            // 2. Additive 3D layer on Track 2 (delta pos + delta rot + scale ratio at weight=0.5)
+            AnimationSystem.ClearTrack(ref anims, pH, track: 1, fadeOutDuration: 0f);
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 2, clipAdditive, loop: true, crossfadeDuration: 0f, speed: 1f, weight: 0.5f, additive: true), "SetTrack 2 additive");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+            m2 = anims.FrameJointPalette[pPtr->FrameJointOffset + 2];
+            Assert.Near(2.25f, m2.C3.Y, 1e-3f, "Additive translation delta (+0.5 * 0.5 = +0.25 -> Y=2.25)");
+            Assert.Near(DetMath.Cos(15f * DetMath.Deg2Rad) * 1.5f, m2.C0.X, 1e-3f, "Additive rot (+15 deg Z) * scale (1.5x) C0.X");
+            Assert.Near(DetMath.Sin(15f * DetMath.Deg2Rad) * 1.5f, m2.C0.Y, 1e-3f, "Additive rot (+15 deg Z) * scale (1.5x) C0.Y");
+            AnimationSystem.ClearTrack(ref anims, pH, track: 2, fadeOutDuration: 0f);
+
+            // 3. Continuous 2-clip BlendTwoClips sweep (0.0 -> 0.5 -> 1.0) preserving both clip clocks
+            Assert.True(AnimationSystem.BlendTwoClips(ref anims, pH, clipIdleTime, clipRunTime, 0.0f), "BlendTwoClips w=0");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.2f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(0.2f, pPtr->Time, 1e-4f, "BlendTwoClips Track 0 clock advanced to 0.2");
+            Assert.Near(0.2f, pPtr->ExtraTracks[0].Time, 1e-4f, "BlendTwoClips Track 1 clock advanced to 0.2");
+            Assert.Near(2.0f, anims.FrameJointPalette[pPtr->FrameJointOffset].C3.X, 1e-3f, "BlendTwoClips w=0.0 matches clipA (2.0)");
+
+            Assert.True(AnimationSystem.BlendTwoClips(ref anims, pH, clipIdleTime, clipRunTime, 0.5f), "BlendTwoClips w=0.5");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.2f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(0.4f, pPtr->Time, 1e-4f, "BlendTwoClips preserved Track 0 clock (0.4)");
+            Assert.Near(0.4f, pPtr->ExtraTracks[0].Time, 1e-4f, "BlendTwoClips preserved Track 1 clock (0.4)");
+            Assert.Near(9.0f, anims.FrameJointPalette[pPtr->FrameJointOffset].C3.X, 1e-3f, "BlendTwoClips w=0.5 == Lerp(4, 14, 0.5) == 9.0");
+
+            Assert.True(AnimationSystem.BlendTwoClips(ref anims, pH, clipIdleTime, clipRunTime, 1.0f), "BlendTwoClips w=1.0");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(0.5f, pPtr->Time, 1e-4f, "BlendTwoClips preserved Track 0 clock (0.5)");
+            Assert.Near(15.0f, anims.FrameJointPalette[pPtr->FrameJointOffset].C3.X, 1e-3f, "BlendTwoClips w=1.0 matches clipB (15.0)");
+            AnimationSystem.ClearTrack(ref anims, pH, track: 1, fadeOutDuration: 0f);
+
+            // 4. Independent FromLoop (true) vs Loop (false) crossfade + smooth ClearTrack fade-out
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 0, clipWalk, loop: true, crossfadeDuration: 0f), "Reset Track 0 to looping clipWalk");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.9f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(0.9f, pPtr->Time, 1e-4f, "Looping Track 0 at t=0.9");
+
+            AnimationSystem.Crossfade(ref anims, pH, clipOneShot, duration: 0.4f, nextLoop: false);
+            Assert.Equal((byte)1, pPtr->Track0FromLoop, "Track0FromLoop preserved looping source (1)");
+            Assert.Equal((byte)0, pPtr->Loop, "Track0 target Loop set to non-looping (0)");
+
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.2f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(0.1f, pPtr->Time, 1e-3f, "Source looping clip wrapped 0.9+0.2 -> 0.1 during crossfade");
+            Assert.Near(0.15f, pPtr->NextTime, 1e-4f, "Target non-looping clip clamped to Duration=0.15 during crossfade");
+            Assert.Near(5.0f, anims.FrameJointPalette[pPtr->FrameJointOffset].C3.X, 1e-3f, "Crossfade midpoint Lerp(2, 8, 0.5) == 5.0");
+
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.25f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Equal(clipOneShot, pPtr->Clip, "Crossfade promoted clipOneShot");
+            Assert.Equal((byte)0, pPtr->Loop, "Promoted Track 0 stays non-looping");
+            Assert.Near(8.0f, anims.FrameJointPalette[pPtr->FrameJointOffset].C3.X, 1e-3f, "Completed crossfade reaches clipOneShot X=8.0");
+
+            // Smooth fade-out on Track 1 & Track 0
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 1, clipAttack, loop: true, crossfadeDuration: 0f, weight: 1f), "Activate Track 1 for fade-out");
+            AnimationSystem.SetTrackJointMask(ref anims, pH, track: 1, maskLo: 1UL << 2);
+            AnimationSystem.SetTrackSpeed(ref anims, pH, track: 1, 2.0f);
+            AnimationSystem.SetTrackWeight(ref anims, pH, track: 1, 0.8f);
+            AnimationSystem.ClearTrack(ref anims, pH, track: 1, fadeOutDuration: 0.2f);
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Equal((byte)1, pPtr->ExtraTracks[0].Active, "Track 1 still active halfway through fade-out");
+            Assert.Near(0.4f, pPtr->ExtraTracks[0].Weight, 1e-4f, "Track 1 weight decayed to 0.4 at halfway");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Equal((byte)0, pPtr->ExtraTracks[0].Active, "Track 1 deactivated cleanly at fade-out completion");
+            Assert.Near(0f, pPtr->ExtraTracks[0].Weight, 1e-5f, "Track 1 weight reached exact 0.0");
+
+            // Track 0 smooth fade-out returns to bind pose
+            AnimationSystem.ClearTrack(ref anims, pH, track: 0, fadeOutDuration: 0.2f);
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(4.0f, anims.FrameJointPalette[pPtr->FrameJointOffset].C3.X, 1e-3f, "Track 0 fade-out halfway blends to bind pose (4.0)");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Equal((byte)0, pPtr->Track0Active, "Track 0 deactivated after fade-out");
+            Assert.Near(0f, anims.FrameJointPalette[pPtr->FrameJointOffset].C3.X, 1e-4f, "Track 0 deactivated returns cleanly to bind pose (0.0)");
+
+            // 4b. Regression (F1): Masked rotation-only Track 1 preserves Track 0 Translation on joint 2
+            float* trTimes = alloc.Persistent.Alloc<float>(2);
+            trTimes[0] = 0f; trTimes[1] = 1f;
+            float* baseJ2Pos = alloc.Persistent.Alloc<float>(6);
+            baseJ2Pos[0] = 3f; baseJ2Pos[1] = 4f; baseJ2Pos[2] = 0f;
+            baseJ2Pos[3] = 3f; baseJ2Pos[4] = 4f; baseJ2Pos[5] = 0f;
+            float* baseJ2Rot = alloc.Persistent.Alloc<float>(8);
+            baseJ2Rot[0] = 0f; baseJ2Rot[1] = 0f; baseJ2Rot[2] = 0f; baseJ2Rot[3] = 1f;
+            baseJ2Rot[4] = 0f; baseJ2Rot[5] = 0f; baseJ2Rot[6] = 0f; baseJ2Rot[7] = 1f;
+            var baseSamps = alloc.Persistent.Alloc<AnimSamplerData>(2);
+            baseSamps[0] = new AnimSamplerData { Times = trTimes, Values = baseJ2Pos, KeyframeCount = 2, ComponentsPerValue = 3, Interpolation = AnimInterpolation.Linear };
+            baseSamps[1] = new AnimSamplerData { Times = trTimes, Values = baseJ2Rot, KeyframeCount = 2, ComponentsPerValue = 4, Interpolation = AnimInterpolation.Linear };
+            var baseChans = alloc.Persistent.Alloc<AnimChannelData>(2);
+            baseChans[0] = new AnimChannelData { SamplerIndex = 0, TargetJointIndex = 2, Path = AnimTargetPath.Translation };
+            baseChans[1] = new AnimChannelData { SamplerIndex = 1, TargetJointIndex = 2, Path = AnimTargetPath.Rotation };
+            var clipBaseTR = AnimationSystem.RegisterClip(ref anims, new AnimClipData
+            {
+                Name = StringId.Hash("base_j2_tr"), Duration = 1f, Samplers = baseSamps, SamplerCount = 2, Channels = baseChans, ChannelCount = 2,
+            });
+
+            Quat q90 = Quat.FromAxisAngle(Vec3.UnitZ, 90f * DetMath.Deg2Rad);
+            float* maskJ2Rot = alloc.Persistent.Alloc<float>(8);
+            maskJ2Rot[0] = q90.X; maskJ2Rot[1] = q90.Y; maskJ2Rot[2] = q90.Z; maskJ2Rot[3] = q90.W;
+            maskJ2Rot[4] = q90.X; maskJ2Rot[5] = q90.Y; maskJ2Rot[6] = q90.Z; maskJ2Rot[7] = q90.W;
+            var maskSamps = alloc.Persistent.Alloc<AnimSamplerData>(1);
+            maskSamps[0] = new AnimSamplerData { Times = trTimes, Values = maskJ2Rot, KeyframeCount = 2, ComponentsPerValue = 4, Interpolation = AnimInterpolation.Linear };
+            var maskChans = alloc.Persistent.Alloc<AnimChannelData>(1);
+            maskChans[0] = new AnimChannelData { SamplerIndex = 0, TargetJointIndex = 2, Path = AnimTargetPath.Rotation };
+            var clipMaskRotOnly = AnimationSystem.RegisterClip(ref anims, new AnimClipData
+            {
+                Name = StringId.Hash("mask_j2_rot_only"), Duration = 1f, Samplers = maskSamps, SamplerCount = 1, Channels = maskChans, ChannelCount = 1,
+            });
+
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 0, clipBaseTR, loop: true, crossfadeDuration: 0f), "F1: SetTrack 0 T+R");
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 1, clipMaskRotOnly, loop: true, crossfadeDuration: 0f, weight: 1f), "F1: SetTrack 1 R-only");
+            AnimationSystem.SetTrackJointMask(ref anims, pH, track: 1, maskLo: 1UL << 2);
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+            m2 = anims.FrameJointPalette[pPtr->FrameJointOffset + 2];
+            Assert.Near(3f, m2.C3.X, 1e-4f, "F1: Masked R-only Track 1 keeps Track 0 Translation X (3, not bind 0)");
+            Assert.Near(4f, m2.C3.Y, 1e-4f, "F1: Masked R-only Track 1 keeps Track 0 Translation Y (4, not bind 2)");
+            Assert.Near(0f, m2.C0.X, 1e-3f, "F1: Masked R-only Track 1 applies +90 deg Z Rotation C0.X");
+            Assert.Near(1f, m2.C0.Y, 1e-3f, "F1: Masked R-only Track 1 applies +90 deg Z Rotation C0.Y");
+            AnimationSystem.ClearTrack(ref anims, pH, track: 1, fadeOutDuration: 0f);
+
+            // 4c. Regression (F2 & F5): Track 0 smooth fade-out clears mask, additive & clocks; zero-weight ClearTrack deactivates immediately
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 0, clipWalk, loop: true, crossfadeDuration: 0f, weight: 1f, additive: true), "F2: SetTrack 0 additive");
+            AnimationSystem.SetTrackJointMask(ref anims, pH, track: 0, maskLo: 1UL << 2, maskHi: 1UL << 3);
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.25f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.True(pPtr->Time > 0.1f, "F2: Track 0 clock advanced before fade-out");
+            AnimationSystem.ClearTrack(ref anims, pH, track: 0, fadeOutDuration: 0.1f);
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.15f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Equal((byte)0, pPtr->Track0Active, "F2: Track0Active cleared on fade-out completion");
+            Assert.Equal((byte)0, pPtr->Track0UseJointMask, "F2: Track0UseJointMask cleared on fade-out completion");
+            Assert.Equal(0UL, pPtr->Track0JointMaskLo, "F2: Track0JointMaskLo cleared on fade-out completion");
+            Assert.Equal(0UL, pPtr->Track0JointMaskHi, "F2: Track0JointMaskHi cleared on fade-out completion");
+            Assert.Equal((byte)0, pPtr->Track0Additive, "F2: Track0Additive cleared on fade-out completion");
+            Assert.Near(0f, pPtr->Time, 1e-5f, "F2: Track 0 Time reset to 0 on fade-out completion");
+            Assert.Near(0f, pPtr->NextTime, 1e-5f, "F2: Track 0 NextTime reset to 0 on fade-out completion");
+
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 1, clipAttack, loop: true, crossfadeDuration: 0f, weight: 1f), "F5: SetTrack 1");
+            AnimationSystem.SetTrackWeight(ref anims, pH, track: 1, 0f);
+            AnimationSystem.ClearTrack(ref anims, pH, track: 1, fadeOutDuration: 0.25f);
+            Assert.Equal((byte)0, pPtr->ExtraTracks[0].Active, "F5: Zero-weight Track 1 deactivates immediately on ClearTrack(fadeOutDuration > 0)");
+            Assert.Near(0f, pPtr->ExtraTracks[0].Weight, 1e-5f, "F5: Zero-weight Track 1 Weight == 0");
+
+            // 4d. Regression (F3): BlendTwoClips clears pre-existing masks on both Track 0 and Track 1 (even when Track 1 already plays clipB)
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 0, clipIdleTime, loop: true, crossfadeDuration: 0f), "F3: SetTrack 0 clipIdleTime");
+            AnimationSystem.SetTrackJointMask(ref anims, pH, track: 0, maskLo: 1UL << 2);
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 1, clipRunTime, loop: true, crossfadeDuration: 0f, weight: 1f), "F3: SetTrack 1 clipRunTime");
+            AnimationSystem.SetTrackJointMask(ref anims, pH, track: 1, maskLo: 1UL << 2);
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+
+            Assert.True(AnimationSystem.BlendTwoClips(ref anims, pH, clipIdleTime, clipRunTime, 0.5f), "F3: BlendTwoClips with pre-masked tracks");
+            Assert.Equal((byte)0, pPtr->Track0UseJointMask, "F3: BlendTwoClips cleared Track0UseJointMask");
+            Assert.Equal(0UL, pPtr->Track0JointMaskLo, "F3: BlendTwoClips cleared Track0JointMaskLo");
+            Assert.Equal((byte)0, pPtr->ExtraTracks[0].UseJointMask, "F3: BlendTwoClips cleared Track 1 UseJointMask");
+            Assert.Equal(0UL, pPtr->ExtraTracks[0].JointMaskLo, "F3: BlendTwoClips cleared Track 1 JointMaskLo");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(7.0f, anims.FrameJointPalette[pPtr->FrameJointOffset].C3.X, 1e-3f, "F3: Unmasked j0 blends Lerp(2, 12, 0.5) == 7.0");
+            AnimationSystem.ClearTrack(ref anims, pH, track: 1, fadeOutDuration: 0f);
+
+            // 4e. Regression (F4): Track 0 re-crossfade back to clipA mid-transition blends smoothly instead of snapping + dead NextClip cleanup
+            var clipReA = MakeLinearXClip(ref alloc.Persistent, ref anims, "recf_a", 1.0f, 2f, 2f);
+            var clipReB = MakeLinearXClip(ref alloc.Persistent, ref anims, "recf_b", 1.0f, 10f, 10f);
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 0, clipReA, loop: true, crossfadeDuration: 0f), "F4: Start clipReA");
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 0, clipReB, loop: true, crossfadeDuration: 0.4f), "F4: Crossfade clipReA -> clipReB");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.3f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(8.0f, anims.FrameJointPalette[pPtr->FrameJointOffset].C3.X, 1e-3f, "F4: 75% into clipReA->clipReB == 8.0");
+
+            Assert.True(AnimationSystem.SetTrack(ref anims, pH, track: 0, clipReA, loop: true, crossfadeDuration: 0.2f), "F4: Re-crossfade back to clipReA");
+            Assert.Equal(clipReB, pPtr->Clip, "F4: Promoted clipReB to source Clip");
+            Assert.Equal(clipReA, pPtr->NextClip, "F4: Queued clipReA as NextClip");
+            Assert.Near(0.2f, pPtr->CrossfadeDuration, 1e-5f, "F4: CrossfadeDuration == 0.2f");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(6.0f, anims.FrameJointPalette[pPtr->FrameJointOffset].C3.X, 1e-3f, "F4: Mid-re-crossfade Lerp(10, 2, 0.5) == 6.0 (no snap!)");
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.15f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Equal(clipReA, pPtr->Clip, "F4: Completed re-crossfade to clipReA");
+            Assert.True(!pPtr->NextClip.IsValid, "F4: NextClip cleared after re-crossfade");
+
+            var deadBundle = BundleId.Create(77, 1);
+            var deadClip = AnimationSystem.RegisterClip(ref anims, new AnimClipData
+            {
+                Name = StringId.Hash("dead_next"), OwnerBundle = deadBundle, Duration = 1f,
+            });
+            AnimationSystem.Crossfade(ref anims, pH, deadClip, 0.5f);
+            AnimationSystem.UnregisterByBundle(ref anims, deadBundle);
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 0.05f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.True(!pPtr->NextClip.IsValid, "F4: Dead unloaded NextClip cleared in StepAll");
+            Assert.Near(0f, pPtr->CrossfadeDuration, 1e-5f, "F4: CrossfadeDuration cleared when NextClip unloaded");
+
+            // 5. 60-tick hot-loop 0 GC check with active multi-track crossfade + mask + additive
+            AnimationSystem.SetTrack(ref anims, pH, track: 0, clipWalk, loop: true, crossfadeDuration: 0f);
+            AnimationSystem.Crossfade(ref anims, pH, clipRunTime, duration: 5.0f, nextLoop: true);
+            AnimationSystem.SetTrack(ref anims, pH, track: 1, clipAttack, loop: true, crossfadeDuration: 0f, weight: 0.7f);
+            AnimationSystem.SetTrackJointMask(ref anims, pH, track: 1, maskLo: 1UL << 2);
+            AnimationSystem.SetTrack(ref anims, pH, track: 2, clipAdditive, loop: true, crossfadeDuration: 0f, weight: 0.4f, additive: true);
+            AnimationSystem.ClearTrackJointMask(ref anims, pH, track: 2);
+
+            alloc.BeginFrame();
+            AnimationSystem.StepAll(ref anims, 1f / 60f, ref alloc.Frame, ref alloc.Scratch);
+            long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int f = 0; f < 60; f++)
+            {
+                alloc.BeginFrame();
+                AnimationSystem.StepAll(ref anims, 1f / 60f, ref alloc.Frame, ref alloc.Scratch);
+            }
+            long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+            Assert.Equal(0L, gcAfter - gcBefore, "60 ticks of multi-track 3D skeletal blending allocate 0 GC bytes");
+        }
+        finally
+        {
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after 3D multi-track blending tests");
+    }
+
+    private static void TestAtlasSpriteFlipbooks()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 128 * 1024, 256 * 1024, 64 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 64, 32);
+
+        try
+        {
+            var region = new SpriteRegionData
+            {
+                Name = StringId.Hash("fx/coin_2x2"),
+                AtlasTexture = TextureHandle.Create(1, 1),
+                UvRect = new Vec4(0.25f, 0.50f, 0.50f, 0.25f),
+                PixelSize = new Vec2(128f, 128f),
+                Pivot = new Vec2(0.5f, 0.5f),
+                Valid = 1,
+            };
+
+            SpriteAnimClipHandle ppClip = AnimationSystem.RegisterSpriteClipFromRegion(
+                ref world.Animations, StringId.Hash("coin_pp"), in region,
+                columns: 2, rows: 2, fps: 4f, loopMode: SpriteAnimLoopMode.PingPong);
+            SpriteAnimClipHandle ppDup = AnimationSystem.RegisterSpriteClipFromRegion(
+                ref world.Animations, StringId.Hash("coin_pp"), in region,
+                columns: 2, rows: 2, fps: 4f, loopMode: SpriteAnimLoopMode.PingPong);
+            Assert.Equal(ppClip, ppDup, "RegisterSpriteClipFromRegion deduplicates identical clip");
+
+            var altRegion = region;
+            altRegion.UvRect = new Vec4(0f, 0f, 0.5f, 0.5f);
+            SpriteAnimClipHandle diffUvClip = AnimationSystem.RegisterSpriteClipFromRegion(
+                ref world.Animations, StringId.Hash("coin_pp"), in altRegion,
+                columns: 2, rows: 2, fps: 4f, loopMode: SpriteAnimLoopMode.PingPong);
+            Assert.True(diffUvClip != ppClip, "Distinct BaseUvRect gets distinct SpriteAnimClipHandle");
+
+            // Regression (F6): same-name sprite clips with different Fps get distinct handles
+            SpriteAnimClipHandle diffFpsClip = AnimationSystem.RegisterSpriteClipFromRegion(
+                ref world.Animations, StringId.Hash("coin_pp"), in region,
+                columns: 2, rows: 2, fps: 12f, loopMode: SpriteAnimLoopMode.PingPong);
+            Assert.True(diffFpsClip != ppClip, "F6: Distinct Fps gets distinct SpriteAnimClipHandle");
+
+            SpriteAnimClipHandle holdClip = AnimationSystem.RegisterSpriteClipFromRegion(
+                ref world.Animations, StringId.Hash("coin_hold"), in region,
+                columns: 2, rows: 2, fps: 4f, startFrame: 0, frameCount: 4, loopMode: SpriteAnimLoopMode.Hold);
+
+            EntityId ent = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, ent, Vec3.Zero);
+            SpriteHandle spriteH = RenderComponentSystem.AddSprite(
+                ref world.RenderComponents,
+                RenderComponentSystem.SpriteFromRegion(ent, in region, Vec2.One));
+
+            SpriteAnimPlayerHandle spH = AnimationSystem.AddSpritePlayer(
+                ref world.Animations, ent, ppClip, targetSprite: spriteH);
+
+            // Regression (F6): AddSpritePlayer immediately initializes CurrentFrame & CurrentUvRect inside BaseUvRect before first StepAll
+            SpriteAnimPlayerData* spInit = AnimationSystem.TryGetSpritePlayer(in world.Animations, spH);
+            Assert.Equal(0, spInit->CurrentFrame, "F6: AddSpritePlayer initializes CurrentFrame == startFrame (0)");
+            Assert.Near(0.25f, spInit->CurrentUvRect.X, 1e-4f, "F6: Initial frame-0 u0 inside BaseUvRect before StepAll");
+            Assert.Near(0.50f, spInit->CurrentUvRect.Y, 1e-4f, "F6: Initial frame-0 v0 inside BaseUvRect before StepAll");
+            Assert.Near(0.25f, spInit->CurrentUvRect.Z, 1e-4f, "F6: Initial cell uW before StepAll");
+            Assert.Near(0.125f, spInit->CurrentUvRect.W, 1e-4f, "F6: Initial cell vH before StepAll");
+
+            SpriteAnimClipHandle start2Clip = AnimationSystem.RegisterSpriteClipFromRegion(
+                ref world.Animations, StringId.Hash("coin_start2"), in region,
+                columns: 2, rows: 2, fps: 4f, startFrame: 2, frameCount: 2, loopMode: SpriteAnimLoopMode.Loop);
+            SpriteAnimPlayerHandle spStart2 = AnimationSystem.AddSpritePlayer(ref world.Animations, ent, start2Clip);
+            SpriteAnimPlayerData* spStart2Ptr = AnimationSystem.TryGetSpritePlayer(in world.Animations, spStart2);
+            Assert.Equal(2, spStart2Ptr->CurrentFrame, "F6: AddSpritePlayer initializes non-zero startFrame == 2");
+            Assert.Near(0.25f, spStart2Ptr->CurrentUvRect.X, 1e-4f, "F6: startFrame=2 initial u0 == 0.25");
+            Assert.Near(0.625f, spStart2Ptr->CurrentUvRect.Y, 1e-4f, "F6: startFrame=2 initial v0 == 0.625");
+            AnimationSystem.RemoveSpritePlayer(ref world.Animations, spStart2);
+
+            int[] expectedFrames = { 0, 1, 2, 3, 2, 1, 0 };
+            float[] expectedU = { 0.25f, 0.50f, 0.25f, 0.50f, 0.25f, 0.50f, 0.25f };
+            float[] expectedV = { 0.50f, 0.50f, 0.625f, 0.625f, 0.625f, 0.50f, 0.50f };
+
+            for (int step = 0; step < expectedFrames.Length; step++)
+            {
+                alloc.BeginFrame();
+                EngineWorldSystem.StepCoreSystems(ref world, ref alloc, step == 0 ? 0f : 0.25f);
+                SpriteAnimPlayerData* sp = AnimationSystem.TryGetSpritePlayer(in world.Animations, spH);
+                SpriteData* target = RenderComponentSystem.TryGetSprite(in world.RenderComponents, spriteH);
+                Assert.Equal(expectedFrames[step], sp->CurrentFrame, $"PingPong step {step} frame == {expectedFrames[step]}");
+                Assert.Near(expectedU[step], sp->CurrentUvRect.X, 1e-4f, $"PingPong step {step} u0 inside BaseUvRect");
+                Assert.Near(expectedV[step], sp->CurrentUvRect.Y, 1e-4f, $"PingPong step {step} v0 inside BaseUvRect");
+                Assert.Near(0.25f, sp->CurrentUvRect.Z, 1e-4f, "Atlas sub-cell uW == 0.25");
+                Assert.Near(0.125f, sp->CurrentUvRect.W, 1e-4f, "Atlas sub-cell vH == 0.125");
+                Assert.True(target->UvRect.Equals(sp->CurrentUvRect), "EngineWorldSystem.StepCoreSystems auto-updated bound SpriteData.UvRect");
+            }
+
+            // SetSpriteClip + Hold mode clamping + BindSpritePlayer + removed SpriteHandle safety
+            AnimationSystem.SetSpriteClip(ref world.Animations, spH, holdClip, resetTime: true);
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 5.0f);
+            Assert.Equal(3, AnimationSystem.TryGetSpritePlayer(in world.Animations, spH)->CurrentFrame, "Hold mode clamped at frame 3");
+            Assert.Near(0.50f, RenderComponentSystem.TryGetSprite(in world.RenderComponents, spriteH)->UvRect.X, 1e-4f, "Bound sprite updated to Hold last frame U");
+
+            // Zero-GC 60-tick check via EngineWorldSystem.StepCoreSystems
+            AnimationSystem.SetSpriteClip(ref world.Animations, spH, ppClip, resetTime: true);
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 1f / 60f);
+            long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int f = 0; f < 60; f++)
+            {
+                alloc.BeginFrame();
+                EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 1f / 60f);
+            }
+            long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+            Assert.Equal(0L, gcAfter - gcBefore, "60 ticks of bound atlas sprite flipbook StepCoreSystems allocate 0 GC bytes");
+
+            // Removing bound sprite does not crash or corrupt
+            Assert.True(RenderComponentSystem.RemoveSprite(ref world.RenderComponents, spriteH), "Remove bound sprite");
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 0.25f);
+            AnimationSystem.BindSpritePlayer(ref world.Animations, spH, SpriteHandle.Invalid);
+        }
+        finally
+        {
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after atlas sprite flipbook tests");
+    }
+
+    private static void TestParticleAtlasFlipbooks()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 256 * 1024, 256 * 1024, 64 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 64, 512);
+
+        try
+        {
+            var region = new SpriteRegionData
+            {
+                Name = StringId.Hash("fx/smoke_sheet"),
+                AtlasTexture = TextureHandle.Create(1, 1),
+                UvRect = new Vec4(0.5f, 0.25f, 0.5f, 0.5f),
+                PixelSize = new Vec2(128f, 128f),
+                Valid = 1,
+            };
+
+            // 1. OverLifetime with FlipbookFrameCount=3 on 2x2 grid (excludes empty cell 3) + Blend=1
+            var cfgOver = ParticleSystem.DefaultEmitter(Vec3.Zero, seed: 1001);
+            cfgOver.EmitRate = 0f;
+            cfgOver.SpeedMin = 0f; cfgOver.SpeedMax = 0f;
+            cfgOver.Gravity = Vec3.Zero; cfgOver.Turbulence = 0f;
+            cfgOver.LifetimeMin = 2.0f; cfgOver.LifetimeMax = 2.0f;
+            ParticleSystem.SetFlipbookRegion(ref cfgOver, in region, columns: 2, rows: 2, frameCount: 3, mode: ParticleFlipbookMode.OverLifetime, blendFrames: true);
+            Assert.Equal(region.AtlasTexture, cfgOver.Texture, "SetFlipbookRegion wired AtlasTexture");
+            Assert.True(cfgOver.BaseUvRect.Equals(region.UvRect), "SetFlipbookRegion wired BaseUvRect");
+
+            var emOver = ParticleSystem.CreateEmitter(ref world.Particles, in cfgOver);
+            ParticleSystem.Burst(ref world.Particles, emOver, 1);
+
+            // age=0.5 / life=2.0 -> norm=0.25 -> scaled = 0.25 * (3-1) = 0.5 -> f0=0, f1=1, blend=0.5!
+            ParticleSystem.Step(ref world.Particles, in world.Transforms, 0.5f);
+            Assert.Equal((byte)0, world.Particles.FrameIndex[0], "OverLifetime FrameIndex == 0 at scaled=0.5");
+            Assert.Equal((byte)1, world.Particles.NextFrameIndex[0], "OverLifetime NextFrameIndex == 1 at scaled=0.5");
+            Assert.Near(0.5f, world.Particles.FrameBlend[0], 1e-4f, "OverLifetime FrameBlend == 0.5");
+
+            // Extract RenderPacket and verify atlas sub-rect UV slicing + UvRectNext + RotExtra.Z
+            CameraSystem.CreatePerspective(ref world.Cameras, new Vec3(0f, 0f, 5f), Vec3.Zero);
+            TransformSystem.PropagateHierarchy(ref world.Transforms);
+            CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, 1f / 60f, 640, 360);
+            var shaders = new RenderShaderDefaults { Particle = ShaderHandle.Create(1, 1) };
+            alloc.BeginFrame();
+            BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref alloc.Frame, ref alloc.Scratch, out RenderPacket pkt);
+            Assert.Equal(1, pkt.Particles.Count, "1 flipbook particle extracted");
+            ParticleGpuInstance gp = pkt.Particles[0];
+            Assert.Near(0.50f, gp.UvRect.X, 1e-4f, "Particle frame 0 u0 == 0.50");
+            Assert.Near(0.25f, gp.UvRect.Y, 1e-4f, "Particle frame 0 v0 == 0.25");
+            Assert.Near(0.25f, gp.UvRect.Z, 1e-4f, "Particle cell uW == 0.25");
+            Assert.Near(0.25f, gp.UvRect.W, 1e-4f, "Particle cell vH == 0.25");
+            Assert.Near(0.75f, gp.UvRectNext.X, 1e-4f, "Particle next frame 1 u0 == 0.75");
+            Assert.Near(0.25f, gp.UvRectNext.Y, 1e-4f, "Particle next frame 1 v0 == 0.25");
+            Assert.Near(0.50f, gp.RotExtra.Z, 1e-4f, "Particle RotExtra.Z carries FrameBlend == 0.5");
+
+            // Near end of life (age=1.9): frame must stay <= 2 (cell 3 strictly excluded!)
+            ParticleSystem.Step(ref world.Particles, in world.Transforms, 1.4f);
+            Assert.True(world.Particles.FrameIndex[0] <= 2 && world.Particles.NextFrameIndex[0] <= 2,
+                $"FlipbookFrameCount=3 excludes empty cell 3 (got {world.Particles.FrameIndex[0]}->{world.Particles.NextFrameIndex[0]})");
+            ParticleSystem.DestroyEmitter(ref world.Particles, emOver);
+
+            // 2. Loop (seam wrap blend 3->0), Hold (clamp at 3), PingPong (reverse blend 3->2)
+            var cfgLoop = cfgOver;
+            ParticleSystem.SetFlipbookRegion(ref cfgLoop, in region, 2, 2, 4, ParticleFlipbookMode.Loop, fps: 4f, blendFrames: true);
+            var emLoop = ParticleSystem.CreateEmitter(ref world.Particles, in cfgLoop);
+            ParticleSystem.Burst(ref world.Particles, emLoop, 1);
+            ParticleSystem.Step(ref world.Particles, in world.Transforms, 0.875f); // raw = 3.5 -> f0=3, f1=0, blend=0.5
+            Assert.Equal((byte)3, world.Particles.FrameIndex[0], "Loop f0 == 3 at raw=3.5");
+            Assert.Equal((byte)0, world.Particles.NextFrameIndex[0], "Loop f1 wraps cleanly to 0 across seam");
+            Assert.Near(0.5f, world.Particles.FrameBlend[0], 1e-4f, "Loop seam FrameBlend == 0.5");
+            ParticleSystem.DestroyEmitter(ref world.Particles, emLoop);
+
+            var cfgHold = cfgOver;
+            ParticleSystem.SetFlipbookRegion(ref cfgHold, in region, 2, 2, 4, ParticleFlipbookMode.Hold, fps: 4f, blendFrames: true);
+            var emHold = ParticleSystem.CreateEmitter(ref world.Particles, in cfgHold);
+            ParticleSystem.Burst(ref world.Particles, emHold, 1);
+            ParticleSystem.Step(ref world.Particles, in world.Transforms, 1.5f); // raw = 6.0 >= 3 -> clamp
+            Assert.Equal((byte)3, world.Particles.FrameIndex[0], "Hold clamped f0 == 3");
+            Assert.Equal((byte)3, world.Particles.NextFrameIndex[0], "Hold clamped f1 == 3");
+            Assert.Near(0f, world.Particles.FrameBlend[0], 1e-4f, "Hold clamped FrameBlend == 0");
+
+            // Regression (F8): directly mutated non-finite Lifetime with fallback FPS stays finite
+            ParticleSystem.TryGetEmitter(in world.Particles, emHold)->FlipbookFps = 0f;
+            world.Particles.Lifetime[0] = float.NaN;
+            ParticleSystem.Step(ref world.Particles, in world.Transforms, 0.05f);
+            Assert.True(float.IsFinite(world.Particles.Size[0]) && float.IsFinite(world.Particles.FrameBlend[0]), "F8: Non-finite Lifetime guarded by safeLife");
+            ParticleSystem.DestroyEmitter(ref world.Particles, emHold);
+
+            var cfgPp = cfgOver;
+            ParticleSystem.SetFlipbookRegion(ref cfgPp, in region, 2, 2, 4, ParticleFlipbookMode.PingPong, fps: 4f, blendFrames: true);
+            var emPp = ParticleSystem.CreateEmitter(ref world.Particles, in cfgPp);
+            ParticleSystem.Burst(ref world.Particles, emPp, 1);
+            ParticleSystem.Step(ref world.Particles, in world.Transforms, 0.875f); // raw = 3.5 -> idx0=3(f=3), idx1=4(f=2), blend=0.5
+            Assert.Equal((byte)3, world.Particles.FrameIndex[0], "PingPong f0 == 3 at raw=3.5");
+            Assert.Equal((byte)2, world.Particles.NextFrameIndex[0], "PingPong f1 reverses cleanly to 2");
+            Assert.Near(0.5f, world.Particles.FrameBlend[0], 1e-4f, "PingPong reverse FrameBlend == 0.5");
+            ParticleSystem.DestroyEmitter(ref world.Particles, emPp);
+
+            // 3. RandomStatic + FlipbookRandomStart determinism & SwapRemoveParticle SoA preservation
+            var pA = ParticleTable.Create(ref alloc.Persistent, 128, 8);
+            var pB = ParticleTable.Create(ref alloc.Persistent, 128, 8);
+            var cfgRand = cfgOver;
+            cfgRand.LifetimeMin = 0.5f; cfgRand.LifetimeMax = 1.5f;
+            ParticleSystem.SetFlipbookRegion(ref cfgRand, in region, 4, 4, 16, ParticleFlipbookMode.RandomStatic, randomStart: true);
+            var hA = ParticleSystem.CreateEmitter(ref pA, in cfgRand);
+            var hB = ParticleSystem.CreateEmitter(ref pB, in cfgRand);
+            ParticleSystem.Burst(ref pA, hA, 32);
+            ParticleSystem.Burst(ref pB, hB, 32);
+
+            ParticleSystem.Step(ref pA, in world.Transforms, 0.1f);
+            ParticleSystem.Step(ref pB, in world.Transforms, 0.1f);
+            Assert.Equal(32, pA.ParticleCount, "32 RandomStatic particles spawned");
+            byte firstFrame = pA.FrameIndex[0];
+            bool anyDifferent = false;
+            for (int k = 0; k < 32; k++)
+            {
+                Assert.Equal(pA.StartFrameOffset[k], pB.StartFrameOffset[k], "Deterministic RandomStatic StartFrameOffset");
+                Assert.Equal(pA.FrameIndex[k], pB.FrameIndex[k], "Deterministic RandomStatic FrameIndex");
+                Assert.Equal((byte)pA.StartFrameOffset[k], pA.FrameIndex[k], "RandomStatic FrameIndex stays fixed at StartFrameOffset");
+                Assert.Near(0f, pA.FrameBlend[k], 1e-5f, "RandomStatic FrameBlend == 0");
+                if (pA.FrameIndex[k] != firstFrame) anyDifferent = true;
+            }
+            Assert.True(anyDifferent, "RandomStatic distributed across multiple frames");
+
+            // Expire short-lived particles (triggers SwapRemoveParticle) and verify surviving SoA parity
+            ParticleSystem.Step(ref pA, in world.Transforms, 0.8f);
+            ParticleSystem.Step(ref pB, in world.Transforms, 0.8f);
+            Assert.True(pA.ParticleCount > 0 && pA.ParticleCount < 32, "Some particles expired triggering SwapRemoveParticle");
+            Assert.Equal(pA.ParticleCount, pB.ParticleCount, "Deterministic survivor count after SwapRemove");
+            for (int k = 0; k < pA.ParticleCount; k++)
+            {
+                Assert.Equal((byte)pA.StartFrameOffset[k], pA.FrameIndex[k], "SwapRemoveParticle preserved StartFrameOffset & FrameIndex");
+                Assert.Equal(pA.FrameIndex[k], pB.FrameIndex[k], "Bit-identical survivor FrameIndex");
+            }
+
+            // 4. 60-tick hot-loop 0 GC check (Step + ExtractRenderPacket)
+            var cfgGc = cfgOver;
+            cfgGc.EmitRate = 40f;
+            ParticleSystem.SetFlipbookRegion(ref cfgGc, in region, 4, 4, 12, ParticleFlipbookMode.Loop, fps: 12f, blendFrames: true, randomStart: true);
+            ParticleSystem.CreateEmitter(ref world.Particles, in cfgGc);
+            alloc.BeginFrame();
+            ParticleSystem.Step(ref world.Particles, in world.Transforms, 1f / 60f);
+            BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref alloc.Frame, ref alloc.Scratch, out _);
+
+            long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int f = 0; f < 60; f++)
+            {
+                alloc.BeginFrame();
+                ParticleSystem.Step(ref world.Particles, in world.Transforms, 1f / 60f);
+                BatchRenderer.ExtractRenderPacket(in shaders, in world, SceneLighting.Default, ref alloc.Frame, ref alloc.Scratch, out _);
+            }
+            long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+            Assert.Equal(0L, gcAfter - gcBefore, "60 ticks of atlas-flipbook ParticleSystem.Step + ExtractRenderPacket allocate 0 GC bytes");
+        }
+        finally
+        {
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after particle atlas flipbook tests");
     }
 }

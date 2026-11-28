@@ -303,6 +303,7 @@ public static unsafe class Rig2DSystem
                 Speed = 1f,
                 Alpha = 1f,
                 Loop = 1,
+                FromLoop = 1,
                 Active = 0,
             };
         }
@@ -450,11 +451,12 @@ public static unsafe class Rig2DSystem
         if (asset == null || (uint)clipIndex >= (uint)asset->ClipCount) return false;
 
         ref Rig2DTrackState tr = ref inst->Tracks[track];
-        bool canMix = tr.Active != 0 && tr.ClipIndex >= 0 && tr.ClipIndex != clipIndex && mixDuration > 1e-5f;
+        bool canMix = tr.Active != 0 && tr.ClipIndex >= 0 && tr.ClipIndex != clipIndex && float.IsFinite(mixDuration) && mixDuration > 1e-5f;
         if (canMix)
         {
             tr.FromClipIndex = tr.ClipIndex;
             tr.FromTime = tr.Time;
+            tr.FromLoop = tr.Loop;
             tr.MixElapsed = 0f;
             tr.MixDuration = mixDuration;
         }
@@ -462,9 +464,14 @@ public static unsafe class Rig2DSystem
         {
             tr.FromClipIndex = -1;
             tr.FromTime = 0f;
+            tr.FromLoop = (byte)(loop ? 1 : 0);
             tr.MixElapsed = 0f;
             tr.MixDuration = 0f;
         }
+
+        tr.FadeOutElapsed = 0f;
+        tr.FadeOutDuration = 0f;
+        tr.FadeOutStartAlpha = 0f;
 
         tr.ClipIndex = clipIndex;
         tr.Time = 0f;
@@ -477,20 +484,50 @@ public static unsafe class Rig2DSystem
         return true;
     }
 
-    public static void ClearTrack(ref Rig2DTable table, Rig2DInstanceHandle handle, int track)
+    public static void ClearTrack(ref Rig2DTable table, Rig2DInstanceHandle handle, int track, float fadeOutDuration = 0f)
     {
         if ((uint)track >= TrackCount) return;
         Rig2DInstanceData* inst = TryGetInstance(in table, handle);
         if (inst == null) return;
-        inst->Tracks[track] = new Rig2DTrackState
+        ref Rig2DTrackState tr = ref inst->Tracks[track];
+        if (tr.Active == 0 || !float.IsFinite(fadeOutDuration) || fadeOutDuration <= 1e-5f || !float.IsFinite(tr.Alpha) || tr.Alpha <= 1e-5f)
         {
-            ClipIndex = -1,
-            FromClipIndex = -1,
-            Speed = 1f,
-            Alpha = 1f,
-            Loop = 1,
-            Active = 0,
-        };
+            tr = new Rig2DTrackState
+            {
+                ClipIndex = -1,
+                FromClipIndex = -1,
+                Speed = 1f,
+                Alpha = 0f,
+                Loop = 1,
+                FromLoop = 1,
+                Active = 0,
+            };
+            return;
+        }
+
+        tr.FadeOutStartAlpha = DetMath.Clamp01(tr.Alpha);
+        tr.FadeOutElapsed = 0f;
+        tr.FadeOutDuration = fadeOutDuration;
+    }
+
+    public static void SetTrackAlpha(ref Rig2DTable table, Rig2DInstanceHandle handle, int track, float alpha)
+    {
+        if ((uint)track >= TrackCount) return;
+        Rig2DInstanceData* inst = TryGetInstance(in table, handle);
+        if (inst == null) return;
+        ref Rig2DTrackState tr = ref inst->Tracks[track];
+        tr.Alpha = DetMath.Clamp01(float.IsFinite(alpha) ? alpha : 0f);
+        tr.FadeOutElapsed = 0f;
+        tr.FadeOutDuration = 0f;
+        tr.FadeOutStartAlpha = 0f;
+    }
+
+    public static void SetTrackSpeed(ref Rig2DTable table, Rig2DInstanceHandle handle, int track, float speed)
+    {
+        if ((uint)track >= TrackCount) return;
+        Rig2DInstanceData* inst = TryGetInstance(in table, handle);
+        if (inst == null) return;
+        inst->Tracks[track].Speed = float.IsFinite(speed) ? speed : 1f;
     }
 
     public static bool SetSkin(ref Rig2DTable table, Rig2DInstanceHandle handle, ReadOnlySpan<char> skinName)
@@ -897,6 +934,30 @@ public static unsafe class Rig2DSystem
                     continue;
                 }
 
+                if (tr.FadeOutDuration > 1e-5f)
+                {
+                    if (!float.IsFinite(tr.FadeOutElapsed) || tr.FadeOutElapsed < 0f) tr.FadeOutElapsed = 0f;
+                    if (!float.IsFinite(tr.FadeOutStartAlpha)) tr.FadeOutStartAlpha = DetMath.Clamp01(tr.Alpha);
+                    if (dt > 0f)
+                        tr.FadeOutElapsed += dt;
+                    if (tr.FadeOutElapsed >= tr.FadeOutDuration)
+                    {
+                        tr = new Rig2DTrackState
+                        {
+                            ClipIndex = -1,
+                            FromClipIndex = -1,
+                            Speed = 1f,
+                            Alpha = 0f,
+                            Loop = 1,
+                            FromLoop = 1,
+                            Active = 0,
+                        };
+                        continue;
+                    }
+                    float fade = 1f - DetMath.Clamp01(tr.FadeOutElapsed / tr.FadeOutDuration);
+                    tr.Alpha = tr.FadeOutStartAlpha * fade;
+                }
+
                 ref readonly Rig2DAnimClipData clip = ref asset->Clips[tr.ClipIndex];
                 if (!float.IsFinite(tr.Time)) tr.Time = 0f;
                 if (!float.IsFinite(tr.FromTime)) tr.FromTime = 0f;
@@ -925,7 +986,7 @@ public static unsafe class Rig2DSystem
                         {
                             tr.FromTime += dt * tr.Speed;
                             if (!float.IsFinite(tr.FromTime)) tr.FromTime = 0f;
-                            if (tr.Loop != 0)
+                            if (tr.FromLoop != 0)
                             {
                                 tr.FromTime %= fromClip.Duration;
                                 if (tr.FromTime < 0f) tr.FromTime += fromClip.Duration;

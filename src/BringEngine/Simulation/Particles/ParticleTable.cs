@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using BringEngine.Assets;
 using BringEngine.Core.Handles;
 using BringEngine.Core.Math;
 using BringEngine.Core.Memory;
@@ -22,6 +23,15 @@ public enum ParticleBlendMode : byte
 {
     Alpha = 0,
     Additive = 1,
+}
+
+public enum ParticleFlipbookMode : byte
+{
+    OverLifetime = 0,
+    Loop = 1,
+    Hold = 2,
+    PingPong = 3,
+    RandomStatic = 4,
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -70,6 +80,14 @@ public struct ParticleEmitterData
     public ColorF EndColor;
     public uint LayerMask;
     public DetRng Rng;
+
+    // Atlas-aware flipbook parameters (all zero defaults preserve exact v0.11 OverLifetime behavior)
+    public Vec4 BaseUvRect;            // (u0, v0, uWidth, vHeight); Z <= 0 or W <= 0 treated as (0, 0, 1, 1)
+    public ParticleFlipbookMode FlipbookMode;
+    public byte FlipbookRandomStart;   // 1 = random initial frame offset via em.Rng on spawn
+    public byte FlipbookBlend;         // 1 = compute NextFrameIndex & FrameBlend for smooth GPU cross-frame blend
+    public ushort FlipbookFrameCount;  // 0 = AtlasColumns * AtlasRows; > 0 clamped to <= AtlasColumns * AtlasRows
+    public float FlipbookFps;          // Used by Loop/Hold/PingPong; <= 0 falls back to frameCount / lifetime
 }
 
 /// <summary>
@@ -99,6 +117,9 @@ public unsafe struct ParticleTable
     public ColorF* EndColor;
     public ushort* EmitterSlot;
     public byte* FrameIndex;
+    public byte* NextFrameIndex;
+    public float* FrameBlend;
+    public ushort* StartFrameOffset;
     public int ParticleCount;
     public int ParticleCapacity;
 
@@ -138,6 +159,9 @@ public unsafe struct ParticleTable
             EndColor = arena.AllocUninitialized<ColorF>(maxParticles, 64),
             EmitterSlot = arena.AllocUninitialized<ushort>(maxParticles, 64),
             FrameIndex = arena.AllocUninitialized<byte>(maxParticles, 64),
+            NextFrameIndex = arena.AllocUninitialized<byte>(maxParticles, 64),
+            FrameBlend = arena.AllocUninitialized<float>(maxParticles, 64),
+            StartFrameOffset = arena.AllocUninitialized<ushort>(maxParticles, 64),
             ParticleCount = 0,
             ParticleCapacity = maxParticles,
 
@@ -183,6 +207,32 @@ public static unsafe class ParticleSystem
         LayerMask = 1u,
         Rng = DetRng.Create(seed),
     };
+
+    /// <summary>
+    /// Configures an emitter to slice a flipbook grid inside a packed atlas SpriteRegionData sub-rectangle.
+    /// Zero GC allocations.
+    /// </summary>
+    public static void SetFlipbookRegion(
+        ref ParticleEmitterData cfg,
+        in SpriteRegionData region,
+        byte columns,
+        byte rows,
+        ushort frameCount = 0,
+        ParticleFlipbookMode mode = ParticleFlipbookMode.OverLifetime,
+        float fps = 0f,
+        bool blendFrames = false,
+        bool randomStart = false)
+    {
+        cfg.Texture = region.AtlasTexture;
+        cfg.BaseUvRect = region.UvRect;
+        cfg.AtlasColumns = columns > 0 ? columns : (byte)1;
+        cfg.AtlasRows = rows > 0 ? rows : (byte)1;
+        cfg.FlipbookFrameCount = frameCount;
+        cfg.FlipbookMode = mode;
+        cfg.FlipbookFps = (float.IsFinite(fps) && fps > 0f) ? fps : 0f;
+        cfg.FlipbookBlend = (byte)(blendFrames ? 1 : 0);
+        cfg.FlipbookRandomStart = (byte)(randomStart ? 1 : 0);
+    }
 
     public static EmitterHandle CreateEmitter(ref ParticleTable table, in ParticleEmitterData config, SceneId scene = default)
     {
@@ -273,6 +323,20 @@ public static unsafe class ParticleSystem
         t.EndColor[idx] = t.EndColor[last];
         t.EmitterSlot[idx] = t.EmitterSlot[last];
         t.FrameIndex[idx] = t.FrameIndex[last];
+        t.NextFrameIndex[idx] = t.NextFrameIndex[last];
+        t.FrameBlend[idx] = t.FrameBlend[last];
+        t.StartFrameOffset[idx] = t.StartFrameOffset[last];
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ResolveActiveFlipbookFrames(in ParticleEmitterData em)
+    {
+        int cols = em.AtlasColumns > 0 ? em.AtlasColumns : 1;
+        int rows = em.AtlasRows > 0 ? em.AtlasRows : 1;
+        int gridFrames = cols * rows;
+        return (em.FlipbookFrameCount > 0 && em.FlipbookFrameCount < gridFrames)
+            ? em.FlipbookFrameCount
+            : gridFrames;
     }
 
     private static void SpawnParticle(ref ParticleTable t, ushort emitterSlot, ref ParticleEmitterData em)
@@ -334,7 +398,17 @@ public static unsafe class ParticleSystem
         t.EndColor[idx] = em.EndColor;
         t.Color[idx] = em.StartColor;
         t.EmitterSlot[idx] = emitterSlot;
-        t.FrameIndex[idx] = 0;
+
+        int activeFrames = ResolveActiveFlipbookFrames(in em);
+        int usableFrames = activeFrames > 256 ? 256 : activeFrames;
+        ushort startOff = 0;
+        if (usableFrames > 1 && (em.FlipbookMode == ParticleFlipbookMode.RandomStatic || em.FlipbookRandomStart != 0))
+            startOff = (ushort)em.Rng.NextInt(0, usableFrames);
+        byte startByte = (byte)startOff;
+        t.FrameIndex[idx] = startByte;
+        t.NextFrameIndex[idx] = startByte;
+        t.FrameBlend[idx] = 0f;
+        t.StartFrameOffset[idx] = startOff;
     }
 
     /// <summary>
@@ -386,19 +460,147 @@ public static unsafe class ParticleSystem
             t.PosZ[i] += vz * dt;
             t.Rotation[i] += t.AngularVel[i] * dt;
 
-            float norm = DetMath.Clamp01(age / life);
+            float safeLife = (float.IsFinite(life) && life > 1e-6f) ? life : 1f;
+            float norm = DetMath.Clamp01(age / safeLife);
             t.Size[i] = DetMath.Lerp(t.StartSize[i], t.EndSize[i], norm);
             t.Color[i] = ColorF.Lerp(t.StartColor[i], t.EndColor[i], norm);
 
-            int totalFrames = em.AtlasColumns * em.AtlasRows;
-            if (totalFrames > 1)
+            int activeFrames = ResolveActiveFlipbookFrames(in em);
+            if (activeFrames > 1)
             {
-                int maxFrame = totalFrames - 1;
-                if (maxFrame > 255) maxFrame = 255;
-                int frame = (int)(norm * totalFrames);
-                if (frame < 0) frame = 0;
-                else if (frame > maxFrame) frame = maxFrame;
-                t.FrameIndex[i] = (byte)frame;
+                bool doBlend = em.FlipbookBlend != 0;
+                int startOff = t.StartFrameOffset[i];
+                int f0 = 0;
+                int f1 = 0;
+                float blend = 0f;
+
+                switch (em.FlipbookMode)
+                {
+                    case ParticleFlipbookMode.RandomStatic:
+                    {
+                        int usable = activeFrames > 256 ? 256 : activeFrames;
+                        f0 = startOff < usable ? startOff : (usable - 1);
+                        f1 = f0;
+                        blend = 0f;
+                        break;
+                    }
+                    case ParticleFlipbookMode.Hold:
+                    {
+                        int usable = activeFrames > 256 ? 256 : activeFrames;
+                        int maxF = usable - 1;
+                        float fps = (float.IsFinite(em.FlipbookFps) && em.FlipbookFps > 0f)
+                            ? em.FlipbookFps
+                            : (usable / safeLife);
+                        double rawD = (double)startOff + (double)age * (double)fps;
+                        if (!double.IsFinite(rawD) || rawD <= 0.0)
+                        {
+                            f0 = 0;
+                            f1 = 0;
+                            blend = 0f;
+                        }
+                        else if (rawD >= (double)maxF)
+                        {
+                            f0 = maxF;
+                            f1 = maxF;
+                            blend = 0f;
+                        }
+                        else
+                        {
+                            double fl = Math.Floor(rawD);
+                            f0 = (int)fl;
+                            f1 = f0 + 1;
+                            blend = doBlend ? (float)(rawD - fl) : 0f;
+                        }
+                        break;
+                    }
+                    case ParticleFlipbookMode.Loop:
+                    {
+                        int usable = activeFrames > 256 ? 256 : activeFrames;
+                        float fps = (float.IsFinite(em.FlipbookFps) && em.FlipbookFps > 0f)
+                            ? em.FlipbookFps
+                            : (usable / safeLife);
+                        double rawD = (double)startOff + (double)age * (double)fps;
+                        if (!double.IsFinite(rawD)) rawD = 0.0;
+                        double fl = Math.Floor(rawD);
+                        double mod = fl % usable;
+                        if (mod < 0.0) mod += usable;
+                        f0 = (int)mod;
+                        if (f0 < 0) f0 = 0;
+                        else if (f0 >= usable) f0 = usable - 1;
+                        f1 = (f0 + 1) % usable;
+                        blend = doBlend ? (float)(rawD - fl) : 0f;
+                        break;
+                    }
+                    case ParticleFlipbookMode.PingPong:
+                    {
+                        int usable = activeFrames > 256 ? 256 : activeFrames;
+                        int period = 2 * (usable - 1);
+                        float fps = (float.IsFinite(em.FlipbookFps) && em.FlipbookFps > 0f)
+                            ? em.FlipbookFps
+                            : (usable / safeLife);
+                        double rawD = (double)startOff + (double)age * (double)fps;
+                        if (!double.IsFinite(rawD)) rawD = 0.0;
+                        double fl = Math.Floor(rawD);
+                        double mod = fl % period;
+                        if (mod < 0.0) mod += period;
+                        int idx0 = (int)mod;
+                        if (idx0 < 0) idx0 = 0;
+                        else if (idx0 >= period) idx0 = period - 1;
+                        int idx1 = (idx0 + 1) % period;
+                        f0 = idx0 < usable ? idx0 : (period - idx0);
+                        f1 = idx1 < usable ? idx1 : (period - idx1);
+                        blend = doBlend ? (float)(rawD - fl) : 0f;
+                        break;
+                    }
+                    default: // ParticleFlipbookMode.OverLifetime
+                    {
+                        if (!doBlend && em.FlipbookRandomStart == 0)
+                        {
+                            int maxFrame = activeFrames - 1;
+                            if (maxFrame > 255) maxFrame = 255;
+                            int frame = (int)(norm * activeFrames);
+                            if (frame < 0) frame = 0;
+                            else if (frame > maxFrame) frame = maxFrame;
+                            f0 = frame;
+                            f1 = frame;
+                            blend = 0f;
+                        }
+                        else
+                        {
+                            int usable = activeFrames > 256 ? 256 : activeFrames;
+                            int maxF = usable - 1;
+                            if (em.FlipbookRandomStart != 0)
+                            {
+                                float scaled = startOff + norm * usable;
+                                float fl = MathF.Floor(scaled);
+                                int i0 = (int)fl;
+                                f0 = ((i0 % usable) + usable) % usable;
+                                f1 = (f0 + 1) % usable;
+                                blend = doBlend ? (scaled - fl) : 0f;
+                            }
+                            else
+                            {
+                                float scaled = norm * maxF;
+                                f0 = (int)scaled;
+                                if (f0 < 0) f0 = 0;
+                                else if (f0 > maxF) f0 = maxF;
+                                f1 = f0 < maxF ? f0 + 1 : maxF;
+                                blend = f0 < maxF ? (scaled - f0) : 0f;
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                t.FrameIndex[i] = (byte)f0;
+                t.NextFrameIndex[i] = (byte)f1;
+                t.FrameBlend[i] = doBlend ? DetMath.Clamp01(blend) : 0f;
+            }
+            else
+            {
+                t.FrameIndex[i] = 0;
+                t.NextFrameIndex[i] = 0;
+                t.FrameBlend[i] = 0f;
             }
         }
     }

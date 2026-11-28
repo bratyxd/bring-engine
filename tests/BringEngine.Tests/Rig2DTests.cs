@@ -33,6 +33,7 @@ public static unsafe class Rig2DTests
         Assert.Run("Rig2D_WeightedMeshSkinning_FfdDeform_AndSequenceSlots", &TestMeshSkinningFfdAndSequence);
         Assert.Run("Rig2D_Skins_Overrides_DrawOrder_Tracks_Crossfade_Additive_Curves_Events_Sockets", &TestPlaybackSkinsCurvesEventsAndSockets);
         Assert.Run("Rig2D_CrossfadeNonBoneNoSetupBleed_MultiTrackDeform_AndZeroGc", &TestCrossfadeNoBleedAndMultiTrackDeform);
+        Assert.Run("Rig2D_SmoothTrackFadeOut_FromLoopCrossfade_SetTrackAlphaSpeed_ZeroGc", &TestTrackFadeOutAndFromLoopCrossfade);
         Assert.Run("Rig2D_DrawOrderCollision_Top4Weights_AndRangePoolDoubleFree", &TestDrawOrderCollisionTop4WeightsAndRangePool);
         Assert.Run("Rig2D_BpackRoundTrip_BundleUnloadRollback_PoolReuse_ZeroGc_ZeroLeak", &TestBpackBundleZeroGcAndLeaks);
         Assert.Run("Rig2D_CorruptBrigAndCycles_RejectedSafely", &TestCorruptBrigAndCycles);
@@ -917,6 +918,152 @@ public static unsafe class Rig2DTests
             alloc.Dispose();
         }
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after crossfade/deform regression tests");
+    }
+
+    private static void TestTrackFadeOutAndFromLoopCrossfade()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 256 * 1024, 512 * 1024, 64 * 1024);
+        var bundleArena = LinearArena.Create(256 * 1024);
+        var bundleId = BundleId.Create(8, 1);
+
+        try
+        {
+            var world = EngineWorld.Create(ref alloc.Persistent, 64, 32);
+            const string json = """
+            {
+              "name": "fade_fromloop_test",
+              "bones": [
+                { "name": "root", "x": 0, "y": 0 },
+                { "name": "arm", "parent": "root", "x": 0, "y": 0, "length": 50 }
+              ],
+              "slots": [],
+              "skins": { "default": {} },
+              "events": {
+                "muted_hit": { "int": 77 }
+              },
+              "animations": {
+                "walk_loop": {
+                  "duration": 0.4,
+                  "bones": {
+                    "arm": { "rotate": [{ "time": 0.0, "value": 0 }, { "time": 0.4, "value": 80 }] }
+                  }
+                },
+                "attack_oneshot": {
+                  "duration": 0.2,
+                  "bones": {
+                    "arm": { "rotate": [{ "time": 0.0, "value": 0 }, { "time": 0.2, "value": 0 }] }
+                  }
+                },
+                "overlay_raise": {
+                  "duration": 1.0,
+                  "bones": {
+                    "arm": { "rotate": [{ "time": 0.0, "value": 60 }, { "time": 1.0, "value": 60 }] }
+                  }
+                },
+                "overlay_event": {
+                  "duration": 0.5,
+                  "bones": {
+                    "arm": { "rotate": [{ "time": 0.0, "value": 45 }, { "time": 0.5, "value": 45 }] }
+                  },
+                  "events": [
+                    { "time": 0.05, "name": "muted_hit" }
+                  ]
+                }
+              }
+            }
+            """;
+
+            byte[] brig = Rig2DCompiler.CompileFromJsonBytes(Encoding.UTF8.GetBytes(json));
+            Rig2DAssetHandle aH = Rig2DLoader.LoadFromMemory(brig, ref bundleArena, ref world.Rigs, bundleId);
+            EntityId e = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, e, Vec3.Zero);
+            TransformSystem.PropagateHierarchy(ref world.Transforms);
+            Rig2DInstanceHandle iH = Rig2DSystem.AddInstance(ref world.Rigs, e, aH);
+            Rig2DInstanceData* inst = Rig2DSystem.TryGetInstance(in world.Rigs, iH);
+
+            // 1. Crossfade FromLoop preservation: looping walk_loop -> non-looping attack_oneshot
+            Assert.True(Rig2DSystem.SetAnimation(ref world.Rigs, iH, "walk_loop", track: 0, loop: true, mixDuration: 0f), "Start walk_loop");
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0.35f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(0.35f, inst->Tracks[0].Time, 1e-4f, "walk_loop at t=0.35");
+
+            Assert.True(Rig2DSystem.SetAnimation(ref world.Rigs, iH, "attack_oneshot", track: 0, loop: false, mixDuration: 0.4f), "Crossfade to non-looping attack_oneshot");
+            Assert.Equal((byte)1, inst->Tracks[0].FromLoop, "FromLoop captured source loop=1");
+            Assert.Equal((byte)0, inst->Tracks[0].Loop, "Target Loop set to 0");
+
+            // Step 0.20s (mixT=0.5): FromTime wraps (0.35+0.20)%0.40 = 0.15s (30 deg), NOT clamped to 0.40s (80 deg)!
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0.20f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(0.15f, inst->Tracks[0].FromTime, 1e-3f, "FromTime looped cleanly via FromLoop=1");
+            Assert.Near(0.20f, inst->Tracks[0].Time, 1e-4f, "Target non-looping clip clamped at Duration=0.20");
+            float midDeg = world.Rigs.BoneWorld[inst->BoneSliceStart + 1].WorldRotationRad * DetMath.Rad2Deg;
+            Assert.Near(15.0f, midDeg, 0.5f, $"Crossfade midpoint Lerp(30, 0, 0.5) == 15 deg (got {midDeg:F2})");
+
+            // Finish crossfade to attack_oneshot (0 deg)
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0.25f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Near(0f, world.Rigs.BoneWorld[inst->BoneSliceStart + 1].WorldRotationRad * DetMath.Rad2Deg, 0.2f, "Crossfade finished at 0 deg");
+
+            // 2. Smooth Track 1 fade-out + SetTrackAlpha / SetTrackSpeed
+            Assert.True(Rig2DSystem.SetAnimation(ref world.Rigs, iH, "overlay_raise", track: 1, loop: true, mixDuration: 0f, speed: 1f, alpha: 1f), "Start Track 1 overlay_raise");
+            Rig2DSystem.SetTrackSpeed(ref world.Rigs, iH, track: 1, speed: 2.0f);
+            Rig2DSystem.SetTrackAlpha(ref world.Rigs, iH, track: 1, alpha: 0.8f);
+            Assert.Near(2.0f, inst->Tracks[1].Speed, 1e-5f, "SetTrackSpeed updated Track 1 speed");
+            Assert.Near(0.8f, inst->Tracks[1].Alpha, 1e-5f, "SetTrackAlpha updated Track 1 alpha");
+
+            Rig2DSystem.ClearTrack(ref world.Rigs, iH, track: 1, fadeOutDuration: 0.25f);
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0.125f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Equal((byte)1, inst->Tracks[1].Active, "Track 1 stays active halfway through fade-out");
+            Assert.Near(0.4f, inst->Tracks[1].Alpha, 1e-3f, "Track 1 Alpha decayed smoothly to 0.4");
+            float fadeMidDeg = world.Rigs.BoneWorld[inst->BoneSliceStart + 1].WorldRotationRad * DetMath.Rad2Deg;
+            Assert.Near(24.0f, fadeMidDeg, 0.5f, $"Track 1 fade-out halfway blends arm to 0.4 * 60 = 24 deg (got {fadeMidDeg:F2})");
+
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0.125f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Equal((byte)0, inst->Tracks[1].Active, "Track 1 deactivated cleanly after fade-out");
+            Assert.Near(0f, inst->Tracks[1].Alpha, 1e-5f, "Track 1 Alpha reached exact 0.0");
+            float postFadeDeg = world.Rigs.BoneWorld[inst->BoneSliceStart + 1].WorldRotationRad * DetMath.Rad2Deg;
+            Assert.Near(0f, postFadeDeg, 0.2f, $"Bone pose returned seamlessly to Track 0 (got {postFadeDeg:F2})");
+
+            // 2b. Regression (F5): ClearTrack fade-out on a zero-alpha track deactivates immediately & fires zero events
+            Assert.True(Rig2DSystem.SetAnimation(ref world.Rigs, iH, "overlay_event", track: 1, loop: true, mixDuration: 0f, alpha: 1f), "Start Track 1 overlay_event");
+            Rig2DSystem.SetTrackAlpha(ref world.Rigs, iH, track: 1, alpha: 0f);
+            Rig2DSystem.ClearTrack(ref world.Rigs, iH, track: 1, fadeOutDuration: 0.25f);
+            Assert.Equal((byte)0, inst->Tracks[1].Active, "F5: Zero-alpha track deactivated immediately on ClearTrack(fadeOutDuration > 0)");
+            Assert.Near(0f, inst->Tracks[1].Alpha, 1e-5f, "F5: Zero-alpha track cleared with Alpha == 0f");
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0.1f, ref alloc.Frame, ref alloc.Scratch);
+            Assert.Equal(0, Rig2DSystem.GetFiredEvents(in world.Rigs).Length, "F5: Deactivated zero-alpha track fires zero events");
+
+            // Immediate ClearTrack(0f) also resets Alpha == 0f consistently
+            Assert.True(Rig2DSystem.SetAnimation(ref world.Rigs, iH, "overlay_raise", track: 1, loop: true, mixDuration: 0f, alpha: 0.9f), "Start Track 1 for immediate clear");
+            Rig2DSystem.ClearTrack(ref world.Rigs, iH, track: 1, fadeOutDuration: 0f);
+            Assert.Equal((byte)0, inst->Tracks[1].Active, "F5: Immediate ClearTrack deactivated Track 1");
+            Assert.Near(0f, inst->Tracks[1].Alpha, 1e-5f, "F5: Immediate ClearTrack set Alpha == 0f");
+
+            // 3. 60-tick hot-loop 0 GC check during active smooth fade-out
+            Rig2DSystem.SetAnimation(ref world.Rigs, iH, "overlay_raise", track: 1, loop: true, mixDuration: 0f, alpha: 1f);
+            Rig2DSystem.ClearTrack(ref world.Rigs, iH, track: 1, fadeOutDuration: 5.0f);
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 1f / 60f, ref alloc.Frame, ref alloc.Scratch);
+
+            long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int f = 0; f < 60; f++)
+            {
+                alloc.BeginFrame();
+                Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 1f / 60f, ref alloc.Frame, ref alloc.Scratch);
+            }
+            long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+            Assert.Equal(0L, gcAfter - gcBefore, "60 ticks of Rig2D smooth track fade-out allocate 0 GC bytes");
+        }
+        finally
+        {
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after Rig2D track fade-out & FromLoop tests");
     }
 
     private static void TestDrawOrderCollisionTop4WeightsAndRangePool()

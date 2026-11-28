@@ -1,12 +1,13 @@
 #pragma pack_matrix(column_major)
 
-// Bring Engine — GPU-Instanced SoA Billboard Particle Shader
+// Bring Engine — GPU-Instanced SoA Billboard Particle Shader (with Atlas Flipbook Cross-Frame Blending)
 struct ParticleGpuInstance
 {
-    float4 PosSize;   // xyz = world position, w = quad size
-    float4 Color;     // rgba
-    float4 UvRect;    // (u0, v0, uW, vH)
-    float4 RotExtra;  // x = rotation rad, y = stretchX, z = unused, w = unused
+    float4 PosSize;    // xyz = world position, w = quad size
+    float4 Color;      // rgba
+    float4 UvRect;     // (u0, v0, uW, vH) current frame
+    float4 RotExtra;   // x = rotation rad, y = stretchX, z = frameBlend [0..1], w = unused
+    float4 UvRectNext; // (u0, v0, uW, vH) next frame for cross-frame blend
 };
 
 StructuredBuffer<ParticleGpuInstance> Particles : register(t0, space0);
@@ -26,9 +27,11 @@ cbuffer BatchUniformsVS : register(b1, space1)
 
 struct PSInput
 {
-    float4 ClipPos : SV_Position;
-    float2 Uv      : TEXCOORD0;
-    float4 Color   : TEXCOORD1;
+    float4 ClipPos    : SV_Position;
+    float2 Uv         : TEXCOORD0;
+    float4 Color      : TEXCOORD1;
+    float2 UvNext     : TEXCOORD2;
+    float  FrameBlend : TEXCOORD3;
 };
 
 static const float2 QuadOffsets[4] = {
@@ -68,6 +71,8 @@ PSInput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     outV.ClipPos = mul(ViewProj, float4(worldPos, 1.0));
     outV.Uv = p.UvRect.xy + qUv * p.UvRect.zw;
     outV.Color = p.Color;
+    outV.UvNext = p.UvRectNext.xy + qUv * p.UvRectNext.zw;
+    outV.FrameBlend = saturate(p.RotExtra.z);
     return outV;
 }
 
@@ -77,6 +82,11 @@ Texture2D PartTex : register(t0, space2);
 float4 PSMain(PSInput input) : SV_Target0
 {
     float4 tex = PartTex.Sample(PartSamp, input.Uv);
+    if (input.FrameBlend > 0.001)
+    {
+        float4 texNext = PartTex.Sample(PartSamp, input.UvNext);
+        tex = lerp(tex, texNext, input.FrameBlend);
+    }
     float4 col = tex * input.Color;
     if (col.a <= 0.004)
         discard;

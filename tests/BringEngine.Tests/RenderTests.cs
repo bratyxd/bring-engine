@@ -58,6 +58,7 @@ public static unsafe class RenderTests
             Assert.Run("GpuSdfText_TranslucentFillNoOutlineDarkening_And_ZeroAlphaOutlineNoFringe", &TestGpuSdfTextTranslucentCompositing);
             Assert.Run("PlatformSystem_ShutdownDoesNotKillAudioSubsystem", &TestPlatformShutdownPreservesAudio);
             Assert.Run("GpuShaders_RefuseReleaseBuiltins_And_ViewportClampingScissor", &TestBuiltinShaderProtectionAndViewportScissor);
+            Assert.Run("GpuFlipbooks_AtlasSubrectParticleCrossFrameBlend_And_BoundAtlasSpriteFlipbook", &TestGpuAtlasFlipbooksAndCrossFrameBlend);
         }
     }
 
@@ -1235,7 +1236,7 @@ public static unsafe class RenderTests
         uint szJ = (uint)sizeof(Mat4);                 // 64
         uint szS = (uint)sizeof(SpriteGpuInstance);    // 112
         uint szG = (uint)sizeof(GlyphGpuInstance);     // 144
-        uint szP = (uint)sizeof(ParticleGpuInstance);  // 64
+        uint szP = (uint)sizeof(ParticleGpuInstance);  // 80
 
         // Transfer buffer fits 3 Instance3D (384 B), 2 Mat4 (128 B, off=384), and 1 Sprite (112 B, off=512 -> end=624)
         // with 40 extra bytes (< 1 sprite, < 1 glyph) -> trailing glyphs & particles must clamp to 0!
@@ -1972,5 +1973,155 @@ public static unsafe class RenderTests
             alloc.Dispose();
         }
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after RENDER-07 / RENDER-10 GPU test");
+    }
+
+    private static void TestGpuAtlasFlipbooksAndCrossFrameBlend()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 256 * 1024);
+        var world = EngineWorld.Create(ref alloc.Persistent, 64, 64);
+        var bundleArena = LinearArena.Create(1 * 1024 * 1024);
+        var bundleId = BundleId.Create(1, 1);
+
+        const int W = 320, H = 180;
+        var window = PlatformSystem.InitWindow("Atlas Flipbook & Cross-Frame Particle Blend Test", W, H, hidden: true);
+        GpuContext* gpu = alloc.Persistent.Alloc<GpuContext>(1, 64);
+        GpuSystem.Init(gpu, window.Window, ref alloc.Persistent, ref world.Assets, debugMode: true);
+
+        try
+        {
+            ShaderSystem.CompileBuiltinShaders(ref *gpu);
+
+            // Build 64x64 RGBA8 atlas:
+            // - Outside bottom-right quadrant: solid Magenta (255, 0, 255, 255) decoy
+            // - Bottom-right sub-rect BaseUvRect = (0.5, 0.5, 0.5, 0.5) holds a 2x2 flipbook:
+            //   Cell 0 (TL): Red (255,0,0), Cell 1 (TR): Green (0,255,0), Cell 2 (BL): Blue (0,0,255), Cell 3 (BR): Yellow (255,255,0)
+            const int texSz = 64;
+            byte* pix = bundleArena.AllocUninitialized<byte>(texSz * texSz * 4, 16);
+            for (int y = 0; y < texSz; y++)
+            {
+                for (int x = 0; x < texSz; x++)
+                {
+                    int o = (y * texSz + x) * 4;
+                    if (x >= 32 && y >= 32)
+                    {
+                        bool rightCell = x >= 48;
+                        bool bottomCell = y >= 48;
+                        if (!bottomCell && !rightCell) { pix[o] = 255; pix[o + 1] = 0; pix[o + 2] = 0; pix[o + 3] = 255; }       // Red
+                        else if (!bottomCell && rightCell) { pix[o] = 0; pix[o + 1] = 255; pix[o + 2] = 0; pix[o + 3] = 255; }   // Green
+                        else if (bottomCell && !rightCell) { pix[o] = 0; pix[o + 1] = 0; pix[o + 2] = 255; pix[o + 3] = 255; }   // Blue
+                        else { pix[o] = 255; pix[o + 1] = 255; pix[o + 2] = 0; pix[o + 3] = 255; }                               // Yellow
+                    }
+                    else
+                    {
+                        pix[o] = 255; pix[o + 1] = 0; pix[o + 2] = 255; pix[o + 3] = 255; // Magenta decoy outside BaseUvRect
+                    }
+                }
+            }
+
+            TextureHandle atlasTex = AssetSystem.RegisterTexture(ref world.Assets, new TextureAssetData
+            {
+                OwnerBundle = bundleId,
+                Name = StringId.Hash("flipbook_atlas_64"),
+                Pixels = pix,
+                Width = texSz,
+                Height = texSz,
+                DataBytes = texSz * texSz * 4,
+                Format = TexturePixelFormat.Rgba8,
+                Channels = 4,
+                Srgb = 0,
+                ClampEdge = 1,
+                NearestFilter = 1,
+            });
+
+            var region = new SpriteRegionData
+            {
+                Name = StringId.Hash("fx/quad_flipbook"),
+                OwnerBundle = bundleId,
+                AtlasTexture = atlasTex,
+                UvRect = new Vec4(0.5f, 0.5f, 0.5f, 0.5f),
+                PixelSize = new Vec2(32f, 32f),
+                Pivot = new Vec2(0.5f, 0.5f),
+                Valid = 1,
+            };
+
+            CameraHandle camH = CameraSystem.CreateOrthographicUI(ref world.Cameras, W, H);
+            CameraData* cam = CameraSystem.TryGetPtr(in world.Cameras, camH);
+            cam->ClearFlags = CameraClearFlags.SolidColor;
+            cam->ClearColor = new ColorF(0f, 0f, 0f, 1f);
+
+            // Left half (80, 90): Atlas sub-rect particle with FlipbookBlend=1 (OverLifetime, life=3.0s)
+            var emCfg = ParticleSystem.DefaultEmitter(new Vec3(80f, 90f, 0f), seed: 404);
+            emCfg.Shape = ParticleShape.Point;
+            emCfg.BlendMode = ParticleBlendMode.Alpha;
+            emCfg.EmitRate = 0f;
+            emCfg.SpeedMin = 0f; emCfg.SpeedMax = 0f;
+            emCfg.Gravity = Vec3.Zero; emCfg.Turbulence = 0f;
+            emCfg.AngularVelMin = 0f; emCfg.AngularVelMax = 0f;
+            emCfg.StartSizeMin = 64f; emCfg.StartSizeMax = 64f;
+            emCfg.EndSizeMin = 64f; emCfg.EndSizeMax = 64f;
+            emCfg.LifetimeMin = 3.0f; emCfg.LifetimeMax = 3.0f;
+            emCfg.StartColor = ColorF.White;
+            emCfg.EndColor = ColorF.White;
+            emCfg.LayerMask = 1u << 31;
+            ParticleSystem.SetFlipbookRegion(ref emCfg, in region, columns: 2, rows: 2, frameCount: 4, mode: ParticleFlipbookMode.OverLifetime, blendFrames: true);
+            EmitterHandle emH = ParticleSystem.CreateEmitter(ref world.Particles, in emCfg);
+            ParticleSystem.Burst(ref world.Particles, emH, 1);
+
+            // Right half (240, 90): Bound atlas 2D sprite flipbook (4 fps PingPong)
+            EntityId spEnt = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, spEnt, new Vec3(240f, 90f, 0f));
+            SpriteHandle spH = RenderComponentSystem.AddSprite(
+                ref world.RenderComponents,
+                RenderComponentSystem.SpriteFromRegion(spEnt, in region, new Vec2(64f, 64f), layerMask: 1u << 31, depthTest: 0));
+            SpriteAnimClipHandle spClip = AnimationSystem.RegisterSpriteClipFromRegion(
+                ref world.Animations, StringId.Hash("gpu_quad_pp"), in region, columns: 2, rows: 2, fps: 4f, loopMode: SpriteAnimLoopMode.PingPong);
+            AnimationSystem.AddSpritePlayer(ref world.Animations, spEnt, spClip, targetSprite: spH);
+
+            // Tick 1: dt = 0.5f
+            // - Particle age=0.5 / life=3.0 => scaled = 0.5 => lerp(Red, Green, 0.5) => equal R & G, B ~ 0!
+            // - Bound Sprite t=0.5 at 4fps => Frame 2 (Blue: R~0, G~0, B~255)!
+            byte[] rgba = new byte[W * H * 4];
+            GpuSystem.EnsureCaptureTarget(ref *gpu, W, H);
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 0.5f, W, H);
+            BatchRenderer.RenderFrame(ref *gpu, ref world, ref alloc, SceneLighting.Default, captureToOffscreen: true);
+            Assert.True(GpuSystem.ReadCaptureTextureRgba(ref *gpu, rgba), "Read flipbook frame 1 capture");
+
+            int pOff = (90 * W + 80) * 4;
+            int pR1 = rgba[pOff + 0], pG1 = rgba[pOff + 1], pB1 = rgba[pOff + 2];
+            Assert.True(pR1 >= 95 && pR1 <= 215 && pG1 >= 95 && pG1 <= 215 && pB1 <= 20 && Math.Abs(pR1 - pG1) <= 20,
+                $"Cross-frame blended particle (Red<->Green 50%) rendered cleanly with zero Magenta bleed, got ({pR1},{pG1},{pB1})");
+
+            int sOff = (90 * W + 240) * 4;
+            int sR1 = rgba[sOff + 0], sG1 = rgba[sOff + 1], sB1 = rgba[sOff + 2];
+            Assert.True(sB1 >= 210 && sR1 <= 20 && sG1 <= 20,
+                $"Bound atlas sprite flipbook frame 2 rendered pure Blue, got ({sR1},{sG1},{sB1})");
+
+            // Tick 2: dt = 0.25f (total t = 0.75f)
+            // - Particle age=0.75 / life=3.0 => scaled = 0.75 => lerp(Red, Green, 0.75) => G significantly > R, B ~ 0!
+            // - Bound Sprite t=0.75 at 4fps => Frame 3 (Yellow: R~255, G~255, B~0)!
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 0.25f, W, H);
+            BatchRenderer.RenderFrame(ref *gpu, ref world, ref alloc, SceneLighting.Default, captureToOffscreen: true);
+            Assert.True(GpuSystem.ReadCaptureTextureRgba(ref *gpu, rgba), "Read flipbook frame 2 capture");
+
+            int pR2 = rgba[pOff + 0], pG2 = rgba[pOff + 1], pB2 = rgba[pOff + 2];
+            Assert.True(pG2 > pR2 + 35 && pB2 <= 20,
+                $"Cross-frame blended particle at blend=0.75 shifted strongly toward Green, got ({pR2},{pG2},{pB2})");
+
+            int sR2 = rgba[sOff + 0], sG2 = rgba[sOff + 1], sB2 = rgba[sOff + 2];
+            Assert.True(sR2 >= 210 && sG2 >= 210 && sB2 <= 20,
+                $"Bound atlas sprite flipbook frame 3 rendered pure Yellow, got ({sR2},{sG2},{sB2})");
+        }
+        finally
+        {
+            AssetSystem.UnloadByBundle(ref world.Assets, bundleId);
+            GpuSystem.Dispose(ref *gpu, ref world.Assets);
+            PlatformSystem.Shutdown(ref window);
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after GPU atlas flipbook & cross-frame blend test");
     }
 }

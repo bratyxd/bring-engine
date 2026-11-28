@@ -85,7 +85,8 @@ public struct ParticleGpuInstance
     public Vec4 PosSize;
     public ColorF Color;
     public Vec4 UvRect;
-    public Vec4 RotExtra;
+    public Vec4 RotExtra;   // x = rotation rad, y = stretchX, z = frameBlend [0..1], w = unused
+    public Vec4 UvRectNext; // (u0, v0, uW, vH) next flipbook frame for cross-frame blend
 }
 
 [StructLayout(LayoutKind.Sequential)]

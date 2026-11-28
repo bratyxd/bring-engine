@@ -143,7 +143,10 @@ public static unsafe class EngineWorldSystem
     {
         TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, ref world.RenderComponents, dt);
         TransformSystem.PropagateHierarchy(ref world.Transforms, jobs);
-        AnimationSystem.StepAll(ref world.Animations, dt, ref alloc.Frame, ref alloc.Scratch);
+        fixed (RenderComponentTables* rcPtr = &world.RenderComponents)
+        {
+            AnimationSystem.StepAll(ref world.Animations, dt, ref alloc.Frame, ref alloc.Scratch, rcPtr);
+        }
         Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, dt, ref alloc.Frame, ref alloc.Scratch);
         ParticleSystem.Step(ref world.Particles, in world.Transforms, dt, jobs);
         CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, dt, viewportWidth, viewportHeight);

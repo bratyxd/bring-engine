@@ -2513,6 +2513,9 @@ public static unsafe class BatchRenderer
             int* starts = scratchArena.AllocUninitialized<int>(emCap, 16);
             int* cursors = scratchArena.AllocUninitialized<int>(emCap, 16);
             int* emitCounts = scratchArena.Alloc<int>(emCap, 16);
+            Vec4* emBaseCellUv = scratchArena.AllocUninitialized<Vec4>(emCap, 16);
+            int* emCols = scratchArena.AllocUninitialized<int>(emCap, 16);
+            int* emRows = scratchArena.AllocUninitialized<int>(emCap, 16);
 
             bool anyVisible = false;
             for (int es = 0; es < emCap; es++)
@@ -2521,6 +2524,18 @@ public static unsafe class BatchRenderer
                 {
                     visibleEmitter[es] = 1;
                     anyVisible = true;
+
+                    ref readonly ParticleEmitterData em = ref pt.Emitters[es];
+                    int cols = em.AtlasColumns > 0 ? em.AtlasColumns : 1;
+                    int rows = em.AtlasRows > 0 ? em.AtlasRows : 1;
+                    Vec4 baseUv = (float.IsFinite(em.BaseUvRect.X) && float.IsFinite(em.BaseUvRect.Y) &&
+                                   float.IsFinite(em.BaseUvRect.Z) && float.IsFinite(em.BaseUvRect.W) &&
+                                   em.BaseUvRect.Z > 0f && em.BaseUvRect.W > 0f)
+                        ? em.BaseUvRect
+                        : new Vec4(0f, 0f, 1f, 1f);
+                    emCols[es] = cols;
+                    emRows[es] = rows;
+                    emBaseCellUv[es] = new Vec4(baseUv.X, baseUv.Y, baseUv.Z / cols, baseUv.W / rows);
                 }
             }
             if (!anyVisible) return;
@@ -2573,20 +2588,31 @@ public static unsafe class BatchRenderer
                 if (writeAt >= starts[es] + emitCounts[es]) continue;
                 cursors[es] = writeAt + 1;
 
-                ref readonly ParticleEmitterData em = ref pt.Emitters[es];
-                int cols = em.AtlasColumns > 0 ? em.AtlasColumns : 1;
-                int rows = em.AtlasRows > 0 ? em.AtlasRows : 1;
-                float uW = 1f / cols;
-                float vH = 1f / rows;
-                int f = pt.FrameIndex[p];
-                Vec4 uv = new Vec4((f % cols) * uW, (f / cols) * vH, uW, vH);
+                int cols = emCols[es];
+                int rows = emRows[es];
+                Vec4 bcUv = emBaseCellUv[es];
+
+                int f0 = pt.FrameIndex[p];
+                int col0 = f0 % cols;
+                int row0 = f0 / cols;
+                if (row0 >= rows) row0 = rows - 1;
+                Vec4 uv0 = new Vec4(bcUv.X + col0 * bcUv.Z, bcUv.Y + row0 * bcUv.W, bcUv.Z, bcUv.W);
+
+                int f1 = pt.NextFrameIndex[p];
+                int col1 = f1 % cols;
+                int row1 = f1 / cols;
+                if (row1 >= rows) row1 = rows - 1;
+                Vec4 uv1 = new Vec4(bcUv.X + col1 * bcUv.Z, bcUv.Y + row1 * bcUv.W, bcUv.Z, bcUv.W);
+
+                float blend = DetMath.Clamp01(pt.FrameBlend[p]);
 
                 outParticles.Data[writeAt] = new ParticleGpuInstance
                 {
                     PosSize = new Vec4(pt.PosX[p], pt.PosY[p], pt.PosZ[p], pt.Size[p]),
                     Color = pt.Color[p],
-                    UvRect = uv,
-                    RotExtra = new Vec4(pt.Rotation[p], em.StretchedBillboard, 0f, 0f),
+                    UvRect = uv0,
+                    RotExtra = new Vec4(pt.Rotation[p], pt.Emitters[es].StretchedBillboard, blend, 0f),
+                    UvRectNext = uv1,
                 };
             }
 

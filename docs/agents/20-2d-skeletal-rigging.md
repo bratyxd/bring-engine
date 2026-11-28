@@ -41,7 +41,7 @@ Every runtime piece of `Rig2D` strictly follows Bring Engine's data-oriented des
   - **1-Bone & 2-Bone Analytic IK**: `bendDirection` (`+1`/`-1`), `softness` knee easing, `stretch`, `compress`, animated `mix`.
   - **Transform Constraints**: world or local, absolute or relative, per-channel mixes & offsets.
   - **Deterministic Spring / Cloth Physics**: fixed-substepped damped harmonic oscillator driven by bone/entity motion inertia, `gravity`, and `wind`, clamped to `maxAngle` (bit-identical across runs).
-- **8-Track Animation Mixer**: tracks `0..7` supporting smooth crossfade (`mixDuration`), additive layering (`additive: true`), `Linear` / `Step` / `CubicBezier` curves, `DrawOrder` swaps, and per-frame `Rig2DFiredEvent` notifications (`GetFiredEvents`).
+- **8-Track Animation Mixer**: tracks `0..7` supporting smooth crossfade (`mixDuration`, preserving source `FromLoop` independently of target `Loop`), smooth track fade-out (`ClearTrack(ref rigs, inst, track, fadeOutDuration)`), runtime weight/speed tuning (`SetTrackAlpha`, `SetTrackSpeed`), additive layering (`additive: true`), `Linear` / `Step` / `CubicBezier` curves, `DrawOrder` swaps, and per-frame `Rig2DFiredEvent` notifications (`GetFiredEvents`).
 - **Gameplay Interop**: `TryGetBoneWorldPose` (weapon/VFX sockets) and `SetIkTargetWorld` / `SetBoneOverride` (live aim/foot planting).
 
 ### Canonical Game Code Example

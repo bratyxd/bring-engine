@@ -82,8 +82,8 @@
 | 05 | [`05-gltf-and-3d-rendering.md`](docs/agents/05-gltf-and-3d-rendering.md) | `GltfLoader` (`.glb`/`.gltf`), `GlbBuilder`, instanced PBR batching, skeletal skinning, **directional sun shadow mapping (3×3 PCF)** |
 | 06 | [`06-2d-sprites-in-3d-and-batching.md`](docs/agents/06-2d-sprites-in-3d-and-batching.md) | 2D sprites in 3D/HUD, GPU batching rules, custom HLSL conventions |
 | 07 | [`07-text-fonts-and-text-effects.md`](docs/agents/07-text-fonts-and-text-effects.md) | `SdfFontLoader`, world & HUD SDF `TextData` (**static `TextAnimFlags.None` by default**; optional effects only when requested) |
-| 08 | [`08-tweening-and-animation.md`](docs/agents/08-tweening-and-animation.md) | `TweenSystem` (31 curves — smooth `OutCubic`/`InOutSine` defaults, pointer binding, chaining), skeletal & sprite animation |
-| 09 | [`09-particles-and-shaders.md`](docs/agents/09-particles-and-shaders.md) | SoA `ParticleSystem`, bursts, custom HLSL shaders via `SDL_shadercross` |
+| 08 | [`08-tweening-and-animation.md`](docs/agents/08-tweening-and-animation.md) | `TweenSystem` (31 curves — smooth `OutCubic`/`InOutSine` defaults, pointer binding, chaining), 4-track 3D skeletal blending (masks/additive/fade-out/`BlendTwoClips`) & atlas-aware 2D sprite flipbooks (`PingPong`, `TargetSprite`) |
+| 09 | [`09-particles-and-shaders.md`](docs/agents/09-particles-and-shaders.md) | SoA `ParticleSystem`, bursts, atlas-aware flipbooks (`OverLifetime`/`Loop`/`Hold`/`PingPong`/`RandomStatic` + GPU cross-frame blending), custom HLSL shaders via `SDL_shadercross` |
 | 10 | [`10-camera-and-headless-testing.md`](docs/agents/10-camera-and-headless-testing.md) | Multi-camera, `AddTrauma`, picking, deterministic headless verification |
 | 11 | [`11-vsync-fps-cap-and-profiling.md`](docs/agents/11-vsync-fps-cap-and-profiling.md) | Borderless fullscreen default, 2-thread loop, VSync/FPS cap, `FrameProfiler`, `ProfilerOverlay` |
 | 12 | [`12-multithreading-and-jobs.md`](docs/agents/12-multithreading-and-jobs.md) | Data-oriented `JobSystem` (`ParallelFor`, async DAGs, cancel, worker scratch, when NOT to parallelize) |
