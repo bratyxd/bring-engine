@@ -1,11 +1,11 @@
 # Bring Engine — Master AI Agent Guide (Hub)
 
 > **Audience**: AI coding agents building games on **Bring Engine** or maintaining engine subsystems.
-> **How to navigate these docs**: This file is the **master guide and index**. Read the 5 core rules below, then open only the specific topic guide you need under [`docs/agents/`](docs/agents/) or [`src/ShowcaseGame/AGENT_README.md`](src/ShowcaseGame/AGENT_README.md) so you don't load unrelated details into context.
+> **How to navigate these docs**: This file is the **master guide and index**. Read the 6 core rules below, then open only the specific topic guide you need under [`docs/agents/`](docs/agents/) or [`src/ShowcaseGame/AGENT_README.md`](src/ShowcaseGame/AGENT_README.md) so you don't load unrelated details into context.
 
 ---
 
-## 1. Non-Negotiable Architecture Rules
+## 1. Non-Negotiable Architecture & Workflow Rules
 
 1. **NO OOP — Pure Data + Static Systems**
    - NEVER use class inheritance, `virtual`, `override`, `abstract`, or interface dispatch in engine or game code.
@@ -37,6 +37,12 @@
    - Pack all raw `.png`/`.jpg`/`.glb`/`.ttf` source assets into **BC1/BC3 GPU-compressed atlased `.bpack` bundles** (Brotli/LZ4) via `BringPacker`, and ship **ZERO loose PNG/JPG textures** in `dist/` (`BringPacker --verify-no-loose-textures dist`).
    - Use 9-slice `SpriteDrawMode.Sliced` / `SlicedNoCenter` for scalable UI panels in a single instanced draw call. See [`docs/agents/13-asset-compression-atlases-and-9slice.md`](docs/agents/13-asset-compression-atlases-and-9slice.md).
 
+6. **Mandatory PR Review & Fix Phase for Engine Code Updates (Every Agent)**
+   - Whenever **engine code** is updated (any change under `src/BringEngine/`, `tools/BringPacker/`, `src/ShowcaseGame/`, shaders, project files, or `tests/BringEngine.Tests/`), work is **NOT** done when the implementor agent finishes.
+   - **PR Review Plan (`Neon xhigh`)**: After the implementor agent is done, use **`Neon xhigh`** to perform a fresh PR code review directly against the actual diff and affected files and **create a review plan from scratch**.
+   - **Fix Phase (`Neon high`)**: Hand that review plan to **`Neon high`** to **apply the review plan and run a fix phase** (fixes, regression tests, doc sync, clean build — with `Neon xhigh` re-verifying blocking fixes) before pushing to GitHub Actions CI or tagging a release.
+   - Pure docs/README-only updates (`*.md`, `docs/**`) are exempt. See [`docs/agents/15-engine-ci-and-releasing.md`](docs/agents/15-engine-ci-and-releasing.md).
+
 ---
 
 ## 2. Solution Layout
@@ -63,7 +69,7 @@
 |---|---|
 | **New Game Blueprint & Golden Rules** | [`src/ShowcaseGame/AGENT_README.md`](src/ShowcaseGame/AGENT_README.md) |
 | **Cross-OS Building, Publishing, Signing (incl. macOS without a Mac) & Sizes** | [`docs/agents/14-publishing-and-distribution.md`](docs/agents/14-publishing-and-distribution.md) |
-| **Working on Bring Engine: CI-Only Tests & Code vs. Docs-Only Releases** | [`docs/agents/15-engine-ci-and-releasing.md`](docs/agents/15-engine-ci-and-releasing.md) |
+| **Working on Bring Engine: Mandatory PR Review, CI-Only Tests & Releases** | [`docs/agents/15-engine-ci-and-releasing.md`](docs/agents/15-engine-ci-and-releasing.md) |
 
 ### Engine Subsystems (`docs/agents/`)
 | # | Guide | Covers |
@@ -104,4 +110,5 @@ dotnet publish src/<Game>.csproj -c Release -r osx-arm64 -o dist/osx-arm64
 ```
 
 - **Full cross-OS publishing, Linux `+x`/symlink notes, macOS signing/notarization without a Mac, and shipped size baselines**: [`docs/agents/14-publishing-and-distribution.md`](docs/agents/14-publishing-and-distribution.md).
-- **Engine testing & releasing**: Code changes require tests in `tests/BringEngine.Tests/` and a tagged release (`vX.Y.Z` matching `EngineInfo.Version`). **Docs / README-only pushes to `main`** (zero code changes since the latest tag) automatically skip all tests, bump the patch tag (`vX.Y.Z` → `vX.Y.(Z+1)`), and publish a new SDK release. See [`docs/agents/15-engine-ci-and-releasing.md`](docs/agents/15-engine-ci-and-releasing.md).
+- **Git identity & GitHub account**: When committing or pushing to `bratyxd/bring-engine`, always use the **`bratyxd`** git identity (`git config user.name` = `bratyxd`) and GitHub CLI account (`gh auth switch --user bratyxd`).
+- **Engine PR review, testing & releasing**: Every engine code update MUST run a post-implementation PR review (**`Neon xhigh`** creates a review plan from scratch → **`Neon high`** applies it in a fix phase), include tests in `tests/BringEngine.Tests/`, and ship via a tagged release (`vX.Y.Z` matching `EngineInfo.Version`). **Docs / README-only pushes to `main`** (zero code changes since the latest tag) skip the code review & test cycle, bump the patch tag (`vX.Y.Z` → `vX.Y.(Z+1)`), and publish a new SDK release. See [`docs/agents/15-engine-ci-and-releasing.md`](docs/agents/15-engine-ci-and-releasing.md).

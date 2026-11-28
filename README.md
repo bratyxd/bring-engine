@@ -21,11 +21,11 @@ Documentation is organized around a slim master hub ([`AGENTS.md`](AGENTS.md)) t
 
 | Guide | Purpose |
 |---|---|
-| [`AGENTS.md`](AGENTS.md) | Master hub: 5 core architecture rules, solution layout, and full index of all guides |
+| [`AGENTS.md`](AGENTS.md) | Master hub: 6 core rules (architecture + mandatory engine PR review), solution layout, and full index of all guides |
 | [`src/ShowcaseGame/AGENT_README.md`](src/ShowcaseGame/AGENT_README.md) | Canonical game folder blueprint and golden rules checklist |
 | [`docs/agents/01`–`13`, `16`–`19`](docs/agents/) | Focused per-subsystem technical guides (memory, math, ECS/input/gamepads, scenes, glTF/3D/shadows, sprites, SDF text, tweens, shaders, profiling, jobs, `.bpack`/9-slice, networking & multiplayer, logging, save system, core audio) |
 | [`docs/agents/14-publishing-and-distribution.md`](docs/agents/14-publishing-and-distribution.md) | Cross-OS publishing (`win-x64`, `linux-x64`, `osx-arm64`, `osx-x64`) from one PC, Linux packaging, macOS signing/notarization without a Mac, and build sizes |
-| [`docs/agents/15-engine-ci-and-releasing.md`](docs/agents/15-engine-ci-and-releasing.md) | Engine development rules, CI-only test matrix, code releases, and automatic docs-only patch releases |
+| [`docs/agents/15-engine-ci-and-releasing.md`](docs/agents/15-engine-ci-and-releasing.md) | Engine development rules, mandatory post-implementation PR review (`Neon xhigh` review plan → `Neon high` fix phase), CI-only test matrix, code releases, and automatic docs-only patch releases |
 
 ## Quick Start
 ```bash
@@ -43,6 +43,7 @@ dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r osx-arm64 -o d
 See [`docs/agents/14-publishing-and-distribution.md`](docs/agents/14-publishing-and-distribution.md) for Linux executable/symlink packaging, macOS `.app` bundling and signing/notarization without a Mac, and baseline release sizes.
 
 ## Releases & CI
+- **Mandatory Engine PR Review & Fix Phase**: Whenever engine code is updated, after the implementor agent finishes, every agent MUST use **`Neon xhigh`** to create a PR review plan from scratch and **`Neon high`** to apply that review plan in a dedicated fix phase before pushing to CI or releasing.
 - **Engine tests run on GitHub Actions CI only** (do not tie up the local machine running engine test suites).
 - **Code changes** pushed to `main` or PRs run the full 3-OS CoreCLR matrix (`windows-x64`, `linux-x64`, `macos-arm64`) in `.github/workflows/build.yml`. Tagged code releases (`vX.Y.Z`) run the full test matrix plus standalone SDK verification in `.github/workflows/release.yml` before publishing `bring-sdk-vX.Y.Z.zip`.
 - **Docs / README-only updates** pushed to `main` (with zero code changes since the latest tag) **skip the test suite** and automatically bump the patch version (`vX.Y.Z` → `vX.Y.(Z+1)`) and publish a new `bring-sdk-vX.Y.(Z+1).zip` GitHub Release.

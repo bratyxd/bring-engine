@@ -2,6 +2,7 @@
 
 > Use `src/ShowcaseGame/` as your **canonical template** whenever creating a new game with Bring Engine.
 > For the full subsystem index see [`AGENTS.md`](../../AGENTS.md); for cross-OS publishing, packaging, macOS signing without a Mac, and shipped build sizes see [`docs/agents/14-publishing-and-distribution.md`](../../docs/agents/14-publishing-and-distribution.md).
+> **Modifying Bring Engine itself**: Whenever engine code is updated, every agent MUST follow the mandatory post-implementation PR review & fix workflow (**`Neon xhigh`** creates a review plan from scratch → **`Neon high`** applies that review plan in a fix phase), CI-only testing, and SDK release process in [`docs/agents/15-engine-ci-and-releasing.md`](../../docs/agents/15-engine-ci-and-releasing.md).
 
 ## 1. Folder Structure (Strict Simulation vs. View Separation)
 ```text
