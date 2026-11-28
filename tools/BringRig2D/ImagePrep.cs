@@ -21,6 +21,7 @@ public static class ImagePrep
         public float Tolerance;
         public float Feather;
         public bool Despill;
+        public bool GlobalKey; // Legacy global chroma key mode (default false = border flood-fill + tight interior pockets)
         public bool Trim;
         public int Pad;
         public bool SplitIslands;
@@ -120,7 +121,7 @@ public static class ImagePrep
 
         if (doKey)
         {
-            ApplyChromaKeyAndDespill(rgba, w, h, kr, kg, kb, opts.Tolerance, opts.Feather, opts.Despill, isGreenKey, isMagentaKey);
+            ApplyChromaKeyAndDespill(rgba, w, h, kr, kg, kb, opts.Tolerance, opts.Feather, opts.Despill, opts.GlobalKey, isGreenKey, isMagentaKey);
             RemoveSpeckles(rgba, w, h);
         }
 
@@ -220,87 +221,251 @@ public static class ImagePrep
         kb = bs[bs.Count / 2];
     }
 
+    private static float ComputeRgbDist(int r, int g, int b, byte kr, byte kg, byte kb)
+    {
+        float dr = r - kr;
+        float dg = g - kg;
+        float db = b - kb;
+        return MathF.Sqrt(dr * dr + dg * dg + db * db);
+    }
+
+    private static float ComputeChromaDist(int r, int g, int b, byte kr, byte kg, byte kb, bool isGreen, bool isMagenta, out float rgbDist)
+    {
+        rgbDist = ComputeRgbDist(r, g, b, kr, kg, kb);
+        float dist = rgbDist;
+
+        // Strengthen chroma distance for bright green/magenta fringes so dark/neutral shades are preserved
+        if (isGreen)
+        {
+            float greenDom = g - Math.Max(r, b);
+            if (greenDom > 24f && g > 80)
+                dist = MathF.Min(dist, MathF.Max(0f, 160f - greenDom * 1.35f));
+        }
+        else if (isMagenta)
+        {
+            float magDom = Math.Min(r, b) - g;
+            if (magDom > 24f && Math.Min(r, b) > 80)
+                dist = MathF.Min(dist, MathF.Max(0f, 160f - magDom * 1.35f));
+        }
+        return dist;
+    }
+
+    private static void ApplyDespillPixel(
+        byte[] rgba, int o,
+        int r, int g, int b, int newA,
+        byte kr, byte kg, byte kb,
+        float dist, float tol, float fea,
+        bool isGreen, bool isMagenta)
+    {
+        float spillWeight = Math.Clamp(1f - (dist - tol) / (fea * 2.5f), 0f, 1f);
+        if (isGreen)
+        {
+            int cap = (r + b) / 2;
+            if (g > cap)
+                rgba[o + 1] = (byte)Math.Clamp((int)MathF.Round(g - (g - cap) * Math.Max(spillWeight, 0.75f)), 0, 255);
+        }
+        else if (isMagenta)
+        {
+            int cap = g;
+            int minRB = Math.Min(r, b);
+            if (minRB > cap)
+            {
+                float excess = (minRB - cap) * Math.Max(spillWeight, 0.75f);
+                rgba[o + 0] = (byte)Math.Clamp((int)MathF.Round(r - excess), 0, 255);
+                rgba[o + 2] = (byte)Math.Clamp((int)MathF.Round(b - excess), 0, 255);
+            }
+        }
+        else if (newA > 0 && newA < 250)
+        {
+            // General matte decontamination: un-premultiply estimated key background color
+            float fa = newA / 255f;
+            float bg = (1f - fa) * spillWeight * 0.5f;
+            rgba[o + 0] = (byte)Math.Clamp((int)MathF.Round((r - kr * bg) / MathF.Max(0.25f, 1f - bg)), 0, 255);
+            rgba[o + 1] = (byte)Math.Clamp((int)MathF.Round((g - kg * bg) / MathF.Max(0.25f, 1f - bg)), 0, 255);
+            rgba[o + 2] = (byte)Math.Clamp((int)MathF.Round((b - kb * bg) / MathF.Max(0.25f, 1f - bg)), 0, 255);
+        }
+    }
+
     private static void ApplyChromaKeyAndDespill(
         byte[] rgba, int w, int h,
         byte kr, byte kg, byte kb,
         float tolerance, float feather,
-        bool despill, bool isGreen, bool isMagenta)
+        bool despill, bool globalKey,
+        bool isGreen, bool isMagenta)
     {
         float tol = Math.Max(1f, tolerance);
         float fea = Math.Max(1f, feather);
         float invFea = 1f / fea;
+        int n = w * h;
 
-        for (int i = 0; i < w * h; i++)
+        if (globalKey)
         {
+            // Legacy global chroma key mode (--global-key)
+            for (int i = 0; i < n; i++)
+            {
+                int o = i * 4;
+                int a = rgba[o + 3];
+                if (a == 0) continue;
+                int r = rgba[o + 0], g = rgba[o + 1], b = rgba[o + 2];
+
+                float dist = ComputeChromaDist(r, g, b, kr, kg, kb, isGreen, isMagenta, out _);
+                if (dist <= tol)
+                {
+                    rgba[o + 0] = rgba[o + 1] = rgba[o + 2] = rgba[o + 3] = 0;
+                    continue;
+                }
+
+                float newAlphaFactor = dist < tol + fea ? Math.Clamp((dist - tol) * invFea, 0f, 1f) : 1f;
+                int newA = (int)MathF.Round(a * newAlphaFactor);
+                rgba[o + 3] = (byte)Math.Clamp(newA, 0, 255);
+
+                if (despill && (newA < 252 || dist < tol + fea * 2.5f))
+                    ApplyDespillPixel(rgba, o, r, g, b, newA, kr, kg, kb, dist, tol, fea, isGreen, isMagenta);
+            }
+            return;
+        }
+
+        // Default smart keying:
+        // 1. Border flood-fill BFS (strict RGB distance <= tol) removes outer background without eating interior painted hues.
+        bool[] isBg = new bool[n];
+        var queue = new Queue<int>();
+
+        void TrySeedBorder(int x, int y)
+        {
+            int idx = y * w + x;
+            if (isBg[idx]) return;
+            int o = idx * 4;
+            if (rgba[o + 3] == 0 || ComputeRgbDist(rgba[o + 0], rgba[o + 1], rgba[o + 2], kr, kg, kb) <= tol)
+            {
+                isBg[idx] = true;
+                queue.Enqueue(idx);
+            }
+        }
+
+        for (int x = 0; x < w; x++) { TrySeedBorder(x, 0); TrySeedBorder(x, h - 1); }
+        for (int y = 1; y < h - 1; y++) { TrySeedBorder(0, y); TrySeedBorder(w - 1, y); }
+
+        while (queue.Count > 0)
+        {
+            int cur = queue.Dequeue();
+            int cx = cur % w;
+            int cy = cur / w;
+
+            void CheckNeighbor(int nx, int ny)
+            {
+                if ((uint)nx >= (uint)w || (uint)ny >= (uint)h) return;
+                int nIdx = ny * w + nx;
+                if (isBg[nIdx]) return;
+                int o = nIdx * 4;
+                if (rgba[o + 3] == 0 || ComputeRgbDist(rgba[o + 0], rgba[o + 1], rgba[o + 2], kr, kg, kb) <= tol)
+                {
+                    isBg[nIdx] = true;
+                    queue.Enqueue(nIdx);
+                }
+            }
+
+            CheckNeighbor(cx - 1, cy);
+            CheckNeighbor(cx + 1, cy);
+            CheckNeighbor(cx, cy - 1);
+            CheckNeighbor(cx, cy + 1);
+        }
+
+        // 2. Remove enclosed interior background pockets strictly within tight key RGB distance (<= tol * 0.65)
+        float tightTol = tol * 0.65f;
+        for (int i = 0; i < n; i++)
+        {
+            if (isBg[i]) continue;
             int o = i * 4;
-            int r = rgba[o + 0];
-            int g = rgba[o + 1];
-            int b = rgba[o + 2];
+            if (rgba[o + 3] == 0) continue;
+            if (ComputeRgbDist(rgba[o + 0], rgba[o + 1], rgba[o + 2], kr, kg, kb) <= tightTol)
+                isBg[i] = true;
+        }
+
+        for (int i = 0; i < n; i++)
+        {
+            if (!isBg[i]) continue;
+            int o = i * 4;
+            rgba[o + 0] = rgba[o + 1] = rgba[o + 2] = rgba[o + 3] = 0;
+        }
+
+        // 3. Compute 3px edge band around keyed background (outer border + enclosed holes)
+        const int edgeBandPx = 3;
+        byte[] bandDist = new byte[n];
+        Array.Fill(bandDist, (byte)255);
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                int idx = y * w + x;
+                if (!isBg[idx]) continue;
+                bandDist[idx] = 0;
+                bool touchesFg = false;
+                for (int dy = -1; dy <= 1 && !touchesFg; dy++)
+                {
+                    int ny = y + dy;
+                    if ((uint)ny >= (uint)h) continue;
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        int nx = x + dx;
+                        if ((uint)nx >= (uint)w) continue;
+                        if (!isBg[ny * w + nx]) { touchesFg = true; break; }
+                    }
+                }
+                if (touchesFg) queue.Enqueue(idx);
+            }
+        }
+
+        while (queue.Count > 0)
+        {
+            int cur = queue.Dequeue();
+            byte d = bandDist[cur];
+            if (d >= edgeBandPx) continue;
+            int cx = cur % w;
+            int cy = cur / w;
+            byte nd = (byte)(d + 1);
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                int ny = cy + dy;
+                if ((uint)ny >= (uint)h) continue;
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = cx + dx;
+                    if ((uint)nx >= (uint)w) continue;
+                    int nIdx = ny * w + nx;
+                    if (bandDist[nIdx] == 255)
+                    {
+                        bandDist[nIdx] = nd;
+                        if (nd < edgeBandPx) queue.Enqueue(nIdx);
+                    }
+                }
+            }
+        }
+
+        // 4. Apply soft feather + greenDom/magDom despill ONLY within the 3px edge band (protects interior artwork!)
+        for (int i = 0; i < n; i++)
+        {
+            byte bd = bandDist[i];
+            if (bd == 0 || bd > edgeBandPx) continue;
+            int o = i * 4;
             int a = rgba[o + 3];
             if (a == 0) continue;
+            int r = rgba[o + 0], g = rgba[o + 1], b = rgba[o + 2];
 
-            float dr = r - kr;
-            float dg = g - kg;
-            float db = b - kb;
-            float dist = MathF.Sqrt(dr * dr + dg * dg + db * db);
-
-            // Strengthen chroma distance for bright green/magenta screens so dark/neutral shades are preserved
-            if (isGreen)
+            float dist = ComputeChromaDist(r, g, b, kr, kg, kb, isGreen, isMagenta, out float rgbDist);
+            float alphaDist = bd == 1 ? dist : rgbDist;
+            if (alphaDist <= tol)
             {
-                float greenDom = g - Math.Max(r, b);
-                if (greenDom > 24f && g > 80)
-                    dist = MathF.Min(dist, MathF.Max(0f, 160f - greenDom * 1.35f));
-            }
-            else if (isMagenta)
-            {
-                float magDom = Math.Min(r, b) - g;
-                if (magDom > 24f && Math.Min(r, b) > 80)
-                    dist = MathF.Min(dist, MathF.Max(0f, 160f - magDom * 1.35f));
-            }
-
-            if (dist <= tol)
-            {
-                rgba[o + 0] = 0;
-                rgba[o + 1] = 0;
-                rgba[o + 2] = 0;
-                rgba[o + 3] = 0;
+                rgba[o + 0] = rgba[o + 1] = rgba[o + 2] = rgba[o + 3] = 0;
                 continue;
             }
 
-            float newAlphaFactor = dist < tol + fea ? Math.Clamp((dist - tol) * invFea, 0f, 1f) : 1f;
+            float newAlphaFactor = alphaDist < tol + fea ? Math.Clamp((alphaDist - tol) * invFea, 0f, 1f) : 1f;
             int newA = (int)MathF.Round(a * newAlphaFactor);
             rgba[o + 3] = (byte)Math.Clamp(newA, 0, 255);
 
             if (despill && (newA < 252 || dist < tol + fea * 2.5f))
-            {
-                float spillWeight = Math.Clamp(1f - (dist - tol) / (fea * 2.5f), 0f, 1f);
-                if (isGreen)
-                {
-                    int cap = (r + b) / 2;
-                    if (g > cap)
-                        rgba[o + 1] = (byte)Math.Clamp((int)MathF.Round(g - (g - cap) * Math.Max(spillWeight, 0.75f)), 0, 255);
-                }
-                else if (isMagenta)
-                {
-                    int cap = g;
-                    int minRB = Math.Min(r, b);
-                    if (minRB > cap)
-                    {
-                        float excess = (minRB - cap) * Math.Max(spillWeight, 0.75f);
-                        rgba[o + 0] = (byte)Math.Clamp((int)MathF.Round(r - excess), 0, 255);
-                        rgba[o + 2] = (byte)Math.Clamp((int)MathF.Round(b - excess), 0, 255);
-                    }
-                }
-                else if (newA > 0 && newA < 250)
-                {
-                    // General matte decontamination: un-premultiply estimated key background color
-                    float fa = newA / 255f;
-                    float bg = (1f - fa) * spillWeight * 0.5f;
-                    rgba[o + 0] = (byte)Math.Clamp((int)MathF.Round((r - kr * bg) / MathF.Max(0.25f, 1f - bg)), 0, 255);
-                    rgba[o + 1] = (byte)Math.Clamp((int)MathF.Round((g - kg * bg) / MathF.Max(0.25f, 1f - bg)), 0, 255);
-                    rgba[o + 2] = (byte)Math.Clamp((int)MathF.Round((b - kb * bg) / MathF.Max(0.25f, 1f - bg)), 0, 255);
-                }
-            }
+                ApplyDespillPixel(rgba, o, r, g, b, newA, kr, kg, kb, dist, tol, fea, isGreen, isMagenta);
         }
     }
 

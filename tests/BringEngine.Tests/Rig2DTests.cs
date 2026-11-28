@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using BringEngine.Assets;
 using BringEngine.Assets.Bundles;
@@ -31,6 +32,8 @@ public static unsafe class Rig2DTests
         Assert.Run("Rig2D_SpringPhysics_DeterministicBitExactAndClamped", &TestSpringPhysicsDeterminism);
         Assert.Run("Rig2D_WeightedMeshSkinning_FfdDeform_AndSequenceSlots", &TestMeshSkinningFfdAndSequence);
         Assert.Run("Rig2D_Skins_Overrides_DrawOrder_Tracks_Crossfade_Additive_Curves_Events_Sockets", &TestPlaybackSkinsCurvesEventsAndSockets);
+        Assert.Run("Rig2D_CrossfadeNonBoneNoSetupBleed_MultiTrackDeform_AndZeroGc", &TestCrossfadeNoBleedAndMultiTrackDeform);
+        Assert.Run("Rig2D_DrawOrderCollision_Top4Weights_AndRangePoolDoubleFree", &TestDrawOrderCollisionTop4WeightsAndRangePool);
         Assert.Run("Rig2D_BpackRoundTrip_BundleUnloadRollback_PoolReuse_ZeroGc_ZeroLeak", &TestBpackBundleZeroGcAndLeaks);
         Assert.Run("Rig2D_CorruptBrigAndCycles_RejectedSafely", &TestCorruptBrigAndCycles);
         if (!headlessOnly)
@@ -324,6 +327,50 @@ public static unsafe class Rig2DTests
         Rig2DAffine2D r1 = RunSim();
         Rig2DAffine2D r2 = RunSim();
         Assert.Equal(r1, r2, "Spring physics produces bit-exact identical Rig2DAffine2D across runs");
+
+        // Regression test (P0-1): large dt=2.0f hitch spike + non-unit Scale must stay finite and bounded (never NaN/Inf)
+        {
+            var alloc = EngineAllocators.Create(4 * 1024 * 1024, 256 * 1024, 512 * 1024, 64 * 1024);
+            var bundleArena = LinearArena.Create(256 * 1024);
+            try
+            {
+                var world = EngineWorld.Create(ref alloc.Persistent, 64, 32);
+                Rig2DAssetHandle aH = Rig2DLoader.LoadFromMemory(brig, ref bundleArena, ref world.Rigs, BundleId.Create(2, 1));
+                EntityId e = EntitySystem.Spawn(ref world.Entities);
+                TransformSystem.Add(ref world.Transforms, e, Vec3.Zero);
+                Rig2DInstanceHandle iH = Rig2DSystem.AddInstance(ref world.Rigs, e, aH);
+                Rig2DInstanceData* inst = Rig2DSystem.TryGetInstance(in world.Rigs, iH);
+                inst->Scale = new Vec2(2f, 2f);
+
+                // Initialize spring on frame 0, then trigger extreme dt=2.0f tab-out/hitch spikes with rapid displacement
+                alloc.BeginFrame();
+                EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 1f / 60f);
+
+                for (int s = 1; s <= 5; s++)
+                {
+                    TransformSystem.SetLocalPosition(ref world.Transforms, e, new Vec3(s * 5f, 0f, 0f));
+                    alloc.BeginFrame();
+                    EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 2.0f);
+                }
+
+                Rig2DSpringRuntimeState st = world.Rigs.SpringStates[inst->SpringSliceStart];
+                Rig2DAffine2D bw = world.Rigs.BoneWorld[inst->BoneSliceStart + 1];
+                Assert.True(float.IsFinite(st.AngleOffsetDeg) && DetMath.Abs(st.AngleOffsetDeg) <= 30.001f,
+                    $"Spring angle remains finite and bounded <= 30 after dt=2.0f hitch (got {st.AngleOffsetDeg})");
+                Assert.True(float.IsFinite(st.AngleVelDeg) && DetMath.Abs(st.AngleVelDeg) <= 10000f,
+                    $"Spring angular velocity remains finite and bounded after dt=2.0f hitch (got {st.AngleVelDeg})");
+                Assert.True(float.IsFinite(st.PosOffsetX) && float.IsFinite(st.PosOffsetY) &&
+                            float.IsFinite(st.VelX) && float.IsFinite(st.VelY),
+                    "Spring positional state remains finite after dt=2.0f hitch");
+                Assert.True(float.IsFinite(bw.A) && float.IsFinite(bw.B) && float.IsFinite(bw.Tx) && float.IsFinite(bw.Ty),
+                    "Spring bone world matrix remains finite after dt=2.0f hitch");
+            }
+            finally
+            {
+                bundleArena.Dispose();
+                alloc.Dispose();
+            }
+        }
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after spring tests");
     }
 
@@ -696,6 +743,333 @@ public static unsafe class Rig2DTests
         Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after .bpack/bundle/0-GC tests");
     }
 
+    private static void TestCrossfadeNoBleedAndMultiTrackDeform()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 256 * 1024, 512 * 1024, 64 * 1024);
+        var bundleArena = LinearArena.Create(256 * 1024);
+        var bundleId = BundleId.Create(6, 1);
+
+        try
+        {
+            var world = EngineWorld.Create(ref alloc.Persistent, 64, 32);
+            const string json = """
+            {
+              "name": "crossfade_deform_test",
+              "bones": [
+                { "name": "root", "x": 0, "y": 0 },
+                { "name": "aim", "parent": "root", "x": 0, "y": 0, "length": 50 },
+                { "name": "aim_tgt", "parent": "root", "x": 0, "y": 100 }
+              ],
+              "slots": [
+                { "name": "cloth", "bone": "root", "attachment": "cloth_m", "color": [1, 1, 1, 1], "darkColor": [0, 0, 0, 0] }
+              ],
+              "skins": {
+                "default": {
+                  "cloth": {
+                    "cloth_m": {
+                      "type": "mesh",
+                      "image": "parts/cloth",
+                      "vertices": [[0, 0], [50, 0], [50, 50]],
+                      "uvs": [[0, 0], [1, 0], [1, 1]],
+                      "triangles": [0, 1, 2],
+                      "weights": [[["root", 1.0]], [["root", 1.0]], [["root", 1.0]]]
+                    }
+                  }
+                }
+              },
+              "constraints": {
+                "ik": [
+                  { "name": "aim_ik", "order": 0, "bones": ["aim"], "target": "aim_tgt", "mix": 1.0 }
+                ]
+              },
+              "animations": {
+                "clip_red": {
+                  "duration": 1.0,
+                  "slots": {
+                    "cloth": {
+                      "color": [{ "time": 0, "color": [1, 0, 0, 1] }],
+                      "darkColor": [{ "time": 0, "color": [0.8, 0.2, 0, 0] }]
+                    }
+                  },
+                  "constraints": {
+                    "aim_ik": [{ "time": 0, "mix": 0.0 }]
+                  },
+                  "deform": {
+                    "default": {
+                      "cloth": {
+                        "cloth_m": [{ "time": 0, "vertices": [[10, 0], [10, 0], [10, 0]] }]
+                      }
+                    }
+                  }
+                },
+                "clip_blue": {
+                  "duration": 1.0,
+                  "slots": {
+                    "cloth": {
+                      "color": [{ "time": 0, "color": [0, 0, 1, 1] }],
+                      "darkColor": [{ "time": 0, "color": [0.2, 0.8, 0, 0] }]
+                    }
+                  },
+                  "constraints": {
+                    "aim_ik": [{ "time": 0, "mix": 0.6 }]
+                  },
+                  "deform": {
+                    "default": {
+                      "cloth": {
+                        "cloth_m": [{ "time": 0, "vertices": [[0, 20], [0, 20], [0, 20]] }]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """;
+
+            byte[] brig = Rig2DCompiler.CompileFromJsonBytes(Encoding.UTF8.GetBytes(json));
+            Rig2DAssetHandle aH = Rig2DLoader.LoadFromMemory(brig, ref bundleArena, ref world.Rigs, bundleId);
+            EntityId e = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, e, Vec3.Zero);
+            TransformSystem.PropagateHierarchy(ref world.Transforms);
+            Rig2DInstanceHandle iH = Rig2DSystem.AddInstance(ref world.Rigs, e, aH);
+            Rig2DInstanceData* inst = Rig2DSystem.TryGetInstance(in world.Rigs, iH);
+
+            // (a) Crossfade red -> blue at mixT=0.5, alpha=1.0 must have ZERO white setup bleed on color/darkColor/constraintMix/deform
+            Rig2DSystem.SetAnimation(ref world.Rigs, iH, "clip_red", track: 0, loop: true, mixDuration: 0f, alpha: 1f);
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0f, ref alloc.Frame, ref alloc.Scratch);
+
+            Rig2DSystem.SetAnimation(ref world.Rigs, iH, "clip_blue", track: 0, loop: true, mixDuration: 1.0f, alpha: 1f);
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0.5f, ref alloc.Frame, ref alloc.Scratch);
+
+            Rig2DRuntimeSlotState slot0 = world.Rigs.SlotStates[inst->SlotSliceStart];
+            Assert.Near(0.5f, slot0.LightColor.R, 1e-3f, "Crossfade SlotColor R == 0.5");
+            Assert.Near(0.0f, slot0.LightColor.G, 1e-3f, "Crossfade SlotColor G == 0.0 (zero white setup bleed)");
+            Assert.Near(0.5f, slot0.LightColor.B, 1e-3f, "Crossfade SlotColor B == 0.5");
+            Assert.Near(1.0f, slot0.LightColor.A, 1e-3f, "Crossfade SlotColor A == 1.0");
+
+            Assert.Near(0.5f, slot0.DarkColor.R, 1e-3f, "Crossfade SlotDarkColor R == 0.5");
+            Assert.Near(0.5f, slot0.DarkColor.G, 1e-3f, "Crossfade SlotDarkColor G == 0.5");
+            Assert.Near(0.0f, slot0.DarkColor.B, 1e-3f, "Crossfade SlotDarkColor B == 0.0");
+
+            // ConstraintMix crossfade: Lerp(0.0, 0.6, 0.5) = 0.3 -> 1-bone aim rotates 90 * 0.3 = 27 deg (no setup mix=1.0 bleed!)
+            float aimDeg = world.Rigs.BoneWorld[inst->BoneSliceStart + 1].WorldRotationRad * DetMath.Rad2Deg;
+            Assert.Near(27.0f, aimDeg, 0.5f, $"Crossfade ConstraintMix has zero setup bleed (got {aimDeg:F2} deg)");
+
+            Assert.Equal(3, slot0.DeformVertexCount, "Crossfade deform allocated 3 vertices");
+            Vec2* def = world.Rigs.FrameDeformDeltas.Ptr + slot0.DeformVertexOffset;
+            Assert.Near(5.0f, def[0].X, 1e-2f, "Crossfade MeshDeform X == 5.0");
+            Assert.Near(10.0f, def[0].Y, 1e-2f, "Crossfade MeshDeform Y == 10.0");
+
+            // (b) Non-additive Track 1 MeshDeform overrides Track 0 rather than summing; additive Track 1 sums
+            Rig2DSystem.ClearTrack(ref world.Rigs, iH, 0);
+            Rig2DSystem.ClearTrack(ref world.Rigs, iH, 1);
+            Rig2DSystem.SetAnimation(ref world.Rigs, iH, "clip_red", track: 0, loop: true, mixDuration: 0f, alpha: 1f, additive: false);
+            Rig2DSystem.SetAnimation(ref world.Rigs, iH, "clip_blue", track: 1, loop: true, mixDuration: 0f, alpha: 1f, additive: false);
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0f, ref alloc.Frame, ref alloc.Scratch);
+            slot0 = world.Rigs.SlotStates[inst->SlotSliceStart];
+            def = world.Rigs.FrameDeformDeltas.Ptr + slot0.DeformVertexOffset;
+            Assert.Near(0.0f, def[0].X, 1e-2f, "Non-additive Track 1 deform overrides Track 0 X (0, not 10)");
+            Assert.Near(20.0f, def[0].Y, 1e-2f, "Non-additive Track 1 deform overrides Track 0 Y (20)");
+
+            // Partial alpha (0.5) non-additive Track 1 lerps cleanly between Track 0 and Track 1
+            Rig2DSystem.SetAnimation(ref world.Rigs, iH, "clip_blue", track: 1, loop: true, mixDuration: 0f, alpha: 0.5f, additive: false);
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0f, ref alloc.Frame, ref alloc.Scratch);
+            slot0 = world.Rigs.SlotStates[inst->SlotSliceStart];
+            def = world.Rigs.FrameDeformDeltas.Ptr + slot0.DeformVertexOffset;
+            Assert.Near(5.0f, def[0].X, 1e-2f, "Non-additive Track 1 alpha=0.5 lerps X to 5.0");
+            Assert.Near(10.0f, def[0].Y, 1e-2f, "Non-additive Track 1 alpha=0.5 lerps Y to 10.0");
+
+            // Additive Track 1 accumulates cleanly onto Track 0
+            Rig2DSystem.SetAnimation(ref world.Rigs, iH, "clip_blue", track: 1, loop: true, mixDuration: 0f, alpha: 1f, additive: true);
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0f, ref alloc.Frame, ref alloc.Scratch);
+            slot0 = world.Rigs.SlotStates[inst->SlotSliceStart];
+            def = world.Rigs.FrameDeformDeltas.Ptr + slot0.DeformVertexOffset;
+            Assert.Near(10.0f, def[0].X, 1e-2f, "Additive Track 1 sums onto Track 0 X (10)");
+            Assert.Near(20.0f, def[0].Y, 1e-2f, "Additive Track 1 sums onto Track 0 Y (20)");
+
+            // (c) Verify 0 GC bytes/frame during active crossfade + deform + SlotColor + ConstraintMix
+            Rig2DSystem.ClearTrack(ref world.Rigs, iH, 1);
+            Rig2DSystem.SetAnimation(ref world.Rigs, iH, "clip_red", track: 0, loop: true, mixDuration: 0f, alpha: 1f);
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 1f / 60f, ref alloc.Frame, ref alloc.Scratch);
+            Rig2DSystem.SetAnimation(ref world.Rigs, iH, "clip_blue", track: 0, loop: true, mixDuration: 5.0f, alpha: 1f);
+            // Warmup JIT on crossfade path
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 1f / 60f, ref alloc.Frame, ref alloc.Scratch);
+
+            long gcBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int f = 0; f < 60; f++)
+            {
+                alloc.BeginFrame();
+                Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 1f / 60f, ref alloc.Frame, ref alloc.Scratch);
+            }
+            long gcAfter = GC.GetAllocatedBytesForCurrentThread();
+            Assert.Equal(0L, gcAfter - gcBefore, "60 ticks of active crossfade (SlotColor + ConstraintMix + MeshDeform) allocate 0 GC bytes");
+        }
+        finally
+        {
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after crossfade/deform regression tests");
+    }
+
+    private static void TestDrawOrderCollisionTop4WeightsAndRangePool()
+    {
+        NativeMemoryTracker.ResetStatsForTest();
+        var alloc = EngineAllocators.Create(4 * 1024 * 1024, 256 * 1024, 512 * 1024, 64 * 1024);
+        var bundleArena = LinearArena.Create(256 * 1024);
+        var bundleId = BundleId.Create(7, 1);
+
+        try
+        {
+            var world = EngineWorld.Create(ref alloc.Persistent, 64, 32);
+            const string json = """
+            {
+              "name": "collision_weights_test",
+              "bones": [
+                { "name": "b0", "x": 0, "y": 0 },
+                { "name": "b1", "parent": "b0", "x": 10, "y": 0 },
+                { "name": "b2", "parent": "b1", "x": 10, "y": 0 },
+                { "name": "b3", "parent": "b2", "x": 10, "y": 0 },
+                { "name": "b4", "parent": "b3", "x": 10, "y": 0 }
+              ],
+              "slots": [
+                { "name": "s0", "bone": "b0", "attachment": "m0" },
+                { "name": "s1", "bone": "b1" },
+                { "name": "s2", "bone": "b2" },
+                { "name": "s3", "bone": "b3" }
+              ],
+              "skins": {
+                "default": {
+                  "s0": {
+                    "m0": {
+                      "type": "mesh",
+                      "image": "parts/m0",
+                      "vertices": [[0, 0], [40, 0], [20, 40]],
+                      "uvs": [[0, 0], [1, 0], [0.5, 1]],
+                      "triangles": [0, 1, 2],
+                      "weights": [
+                        [["b0", 0.05], ["b1", 0.10], ["b2", 0.15], ["b3", 0.20], ["b4", 0.80]],
+                        [["b0", 0.20], ["b4", 0.30], ["b4", 0.50]],
+                        [["b0", 1.0]]
+                      ]
+                    }
+                  }
+                }
+              },
+              "animations": {
+                "collide_order": {
+                  "duration": 1.0,
+                  "drawOrder": [
+                    {
+                      "time": 0.0,
+                      "offsets": [
+                        { "slot": "s0", "offset": 2 },
+                        { "slot": "s3", "offset": -1 },
+                        { "slot": "s1", "offset": 1 }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+            """;
+
+            byte[] brig = Rig2DCompiler.CompileFromJsonBytes(Encoding.UTF8.GetBytes(json));
+            Rig2DAssetHandle aH = Rig2DLoader.LoadFromMemory(brig, ref bundleArena, ref world.Rigs, bundleId);
+            Rig2DAssetData* asset = Rig2DSystem.TryGetAsset(in world.Rigs, aH);
+            Assert.True(asset != null && asset->MeshVertexCount == 3, "Compiled 5-weight mesh asset valid");
+
+            // (a) P0-5: Verify 5-weight vertex kept top-4 highest weights (b4=0.80 kept, b0=0.05 dropped) & normalized to 1.0
+            Rig2DMeshVertex v0 = asset->MeshVertices[0];
+            int idx0 = (int)(v0.PackedBoneIndices & 0xFFu);
+            int idx1 = (int)((v0.PackedBoneIndices >> 8) & 0xFFu);
+            int idx2 = (int)((v0.PackedBoneIndices >> 16) & 0xFFu);
+            int idx3 = (int)((v0.PackedBoneIndices >> 24) & 0xFFu);
+            Assert.Equal(4, idx0, "Top-4 weight slot 0 is b4 (0.80)");
+            Assert.Equal(3, idx1, "Top-4 weight slot 1 is b3 (0.20)");
+            Assert.Equal(2, idx2, "Top-4 weight slot 2 is b2 (0.15)");
+            Assert.Equal(1, idx3, "Top-4 weight slot 3 is b1 (0.10); b0 (0.05) dropped");
+            Assert.Near(0.80f / 1.25f, v0.BoneWeights.X, 1e-4f, "Normalized b4 weight == 0.64");
+            Assert.Near(0.20f / 1.25f, v0.BoneWeights.Y, 1e-4f, "Normalized b3 weight == 0.16");
+            Assert.Near(0.15f / 1.25f, v0.BoneWeights.Z, 1e-4f, "Normalized b2 weight == 0.12");
+            Assert.Near(0.10f / 1.25f, v0.BoneWeights.W, 1e-4f, "Normalized b1 weight == 0.08");
+            Assert.Near(1.0f, v0.WeightSum, 1e-4f, "Normalized WeightSum == 1.0");
+
+            // Also verify duplicate bone weight entries merged cleanly (b4: 0.30 + 0.50 = 0.80)
+            Rig2DMeshVertex v1 = asset->MeshVertices[1];
+            Assert.Equal(4, (int)(v1.PackedBoneIndices & 0xFFu), "Merged duplicate b4 sorted first");
+            Assert.Equal(0, (int)((v1.PackedBoneIndices >> 8) & 0xFFu), "b0 sorted second");
+            Assert.Near(0.80f, v1.BoneWeights.X, 1e-4f, "Merged b4 weight == 0.80");
+            Assert.Near(0.20f, v1.BoneWeights.Y, 1e-4f, "b0 weight == 0.20");
+
+            // (b) P0-4: Verify colliding drawOrder offsets produce a valid bijection of all 4 unique slots
+            EntityId e = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, e, Vec3.Zero);
+            TransformSystem.PropagateHierarchy(ref world.Transforms);
+            Rig2DInstanceHandle iH = Rig2DSystem.AddInstance(ref world.Rigs, e, aH);
+            Rig2DSystem.SetAnimation(ref world.Rigs, iH, "collide_order", track: 0, loop: false, mixDuration: 0f);
+            alloc.BeginFrame();
+            Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, 0f, ref alloc.Frame, ref alloc.Scratch);
+
+            Rig2DInstanceData* inst = Rig2DSystem.TryGetInstance(in world.Rigs, iH);
+            int* drawOrder = world.Rigs.DrawOrder + inst->SlotSliceStart;
+            bool[] seen = new bool[4];
+            for (int s = 0; s < 4; s++)
+            {
+                int slotIdx = drawOrder[s];
+                Assert.True((uint)slotIdx < 4u, $"drawOrder[{s}] in bounds (got {slotIdx})");
+                Assert.True(!seen[slotIdx], $"drawOrder[{s}] slot {slotIdx} is unique (no collision drop/dup)");
+                seen[slotIdx] = true;
+            }
+
+            // (c) P1-1: Rig2DRangePool double-free & overlap protection preserves UsedCount and FreeRangeCount
+            var pool = Rig2DRangePool.Create(ref alloc.Persistent, totalCapacity: 32, maxFreeRanges: 8);
+            int rA = pool.Allocate(8);
+            int rB = pool.Allocate(8);
+            int rC = pool.Allocate(8);
+            Assert.Equal(0, rA, "Range A allocated at 0");
+            Assert.Equal(8, rB, "Range B allocated at 8");
+            Assert.Equal(16, rC, "Range C allocated at 16");
+            Assert.Equal(24, pool.UsedCount, "UsedCount == 24 after 3x8 allocations");
+
+            pool.Free(rB, 8);
+            Assert.Equal(16, pool.UsedCount, "UsedCount == 16 after freeing B");
+            Assert.Equal(2, pool.FreeRangeCount, "FreeRangeCount == 2 after freeing middle range B");
+
+            // Exact double-free + sub-range + partial overlaps must all be safe no-ops
+            pool.Free(rB, 8);
+            pool.Free(rB + 2, 4);
+            pool.Free(rB - 2, 6);
+            pool.Free(rB + 4, 6);
+            Assert.Equal(16, pool.UsedCount, "Double-free & overlapping frees preserved UsedCount == 16");
+            Assert.Equal(2, pool.FreeRangeCount, "Double-free & overlapping frees preserved FreeRangeCount == 2");
+
+            pool.Free(rA, 8);
+            pool.Free(rC, 8);
+            Assert.Equal(0, pool.UsedCount, "UsedCount == 0 after freeing A and C");
+            Assert.Equal(1, pool.FreeRangeCount, "Coalesced back to 1 contiguous free range");
+            Assert.Equal(32, pool.FreeCounts[0], "Full capacity 32 recovered");
+
+            // Double-free on fully free pool must remain a safe no-op
+            pool.Free(0, 8);
+            Assert.Equal(0, pool.UsedCount, "Double-free on fully free pool preserves UsedCount == 0");
+            Assert.Equal(1, pool.FreeRangeCount, "Double-free on fully free pool preserves FreeRangeCount == 1");
+        }
+        finally
+        {
+            bundleArena.Dispose();
+            alloc.Dispose();
+        }
+        Assert.Equal(0L, NativeMemoryTracker.LiveBytes, "Zero native leaks after drawOrder/weights/pool tests");
+    }
+
     private static void TestCorruptBrigAndCycles()
     {
         NativeMemoryTracker.ResetStatsForTest();
@@ -729,6 +1103,91 @@ public static unsafe class Rig2DTests
             try { Rig2DLoader.LoadFromMemory(badVer, ref bundleArena, ref rigs, bId); }
             catch (InvalidDataException) { threwVer = true; }
             Assert.True(threwVer, "Unsupported BRIG version rejected");
+
+            // P1-2: Non-finite OriginOffset in BRIG header rejected & rolled back
+            byte[] badOrigin = (byte[])goodBrig.Clone();
+            fixed (byte* pBad = badOrigin)
+            {
+                BrigHeader* hPtr = (BrigHeader*)pBad;
+                hPtr->OriginOffset.X = float.NaN;
+            }
+            bool threwNanOrigin = false;
+            try { Rig2DLoader.LoadFromMemory(badOrigin, ref bundleArena, ref rigs, bId); }
+            catch (InvalidDataException) { threwNanOrigin = true; }
+            Assert.True(threwNanOrigin, "Non-finite OriginOffset rejected by Rig2DLoader");
+            Assert.Equal(offBefore, bundleArena.Offset, "Non-finite OriginOffset rolled back bundleArena");
+
+            // P1-2: Out-of-range bone timeline TargetIndex rejected & rolled back
+            byte[] badTimeline = (byte[])goodBrig.Clone();
+            BrigHeader knightHdr = MemoryMarshal.Read<BrigHeader>(badTimeline);
+            Assert.True(knightHdr.TimelineCount > 0, "Knight rig has bone timeline to corrupt");
+            int tlByteOff = sizeof(BrigHeader)
+                + knightHdr.BoneCount * sizeof(Rig2DBoneSetupData)
+                + knightHdr.BoneCount * sizeof(Rig2DAffine2D)
+                + knightHdr.SlotCount * sizeof(Rig2DSlotSetupData)
+                + knightHdr.AttachmentCount * sizeof(Rig2DAttachmentData)
+                + knightHdr.MeshVertexCount * sizeof(Rig2DMeshVertex)
+                + knightHdr.MeshIndexCount * sizeof(uint)
+                + knightHdr.SequenceFrameNameCount * sizeof(StringId)
+                + knightHdr.SkinCount * sizeof(Rig2DSkinData)
+                + knightHdr.SkinEntryCount * sizeof(Rig2DSkinEntry)
+                + knightHdr.IkConstraintCount * sizeof(Rig2DIkConstraintData)
+                + knightHdr.TransformConstraintCount * sizeof(Rig2DTransformConstraintData)
+                + knightHdr.SpringConstraintCount * sizeof(Rig2DSpringConstraintData)
+                + knightHdr.ConstraintOrderCount * sizeof(Rig2DConstraintOrderItem)
+                + knightHdr.ClipCount * sizeof(Rig2DAnimClipData);
+            fixed (byte* pTl = badTimeline)
+            {
+                Rig2DTimelineData* tlPtr = (Rig2DTimelineData*)(pTl + tlByteOff);
+                tlPtr->TargetIndex = 99;
+            }
+            bool threwBadTl = false;
+            try { Rig2DLoader.LoadFromMemory(badTimeline, ref bundleArena, ref rigs, bId); }
+            catch (InvalidDataException) { threwBadTl = true; }
+            Assert.True(threwBadTl, "Out-of-range bone timeline TargetIndex rejected by Rig2DLoader");
+            Assert.Equal(offBefore, bundleArena.Offset, "Out-of-range bone timeline rolled back bundleArena");
+
+            // P1-2: 2-bone IK where BoneA == BoneB rejected & rolled back
+            const string ikJson = """
+            {
+              "name": "ik_corrupt",
+              "bones": [
+                { "name": "root", "x": 0, "y": 0 },
+                { "name": "a", "parent": "root", "x": 0, "y": 0, "length": 40 },
+                { "name": "b", "parent": "a", "x": 40, "y": 0, "length": 40 },
+                { "name": "tgt", "parent": "root", "x": 50, "y": 20 }
+              ],
+              "slots": [],
+              "skins": { "default": {} },
+              "constraints": {
+                "ik": [
+                  { "name": "bad_ik", "order": 0, "bones": ["a", "b"], "target": "tgt", "mix": 1.0 }
+                ]
+              }
+            }
+            """;
+            byte[] badIk = Rig2DCompiler.CompileFromJsonBytes(Encoding.UTF8.GetBytes(ikJson));
+            BrigHeader ikHdr = MemoryMarshal.Read<BrigHeader>(badIk);
+            int ikByteOff = sizeof(BrigHeader)
+                + ikHdr.BoneCount * sizeof(Rig2DBoneSetupData)
+                + ikHdr.BoneCount * sizeof(Rig2DAffine2D)
+                + ikHdr.SlotCount * sizeof(Rig2DSlotSetupData)
+                + ikHdr.AttachmentCount * sizeof(Rig2DAttachmentData)
+                + ikHdr.MeshVertexCount * sizeof(Rig2DMeshVertex)
+                + ikHdr.MeshIndexCount * sizeof(uint)
+                + ikHdr.SequenceFrameNameCount * sizeof(StringId)
+                + ikHdr.SkinCount * sizeof(Rig2DSkinData)
+                + ikHdr.SkinEntryCount * sizeof(Rig2DSkinEntry);
+            fixed (byte* pIk = badIk)
+            {
+                Rig2DIkConstraintData* ikPtr = (Rig2DIkConstraintData*)(pIk + ikByteOff);
+                ikPtr->BoneB = ikPtr->BoneA;
+            }
+            bool threwSameIk = false;
+            try { Rig2DLoader.LoadFromMemory(badIk, ref bundleArena, ref rigs, bId); }
+            catch (InvalidDataException) { threwSameIk = true; }
+            Assert.True(threwSameIk, "2-bone IK with BoneA == BoneB rejected by Rig2DLoader");
+            Assert.Equal(offBefore, bundleArena.Offset, "BoneA == BoneB IK rolled back bundleArena");
         }
         finally
         {
@@ -749,6 +1208,7 @@ public static unsafe class Rig2DTests
         Directory.CreateDirectory(distDir);
 
         var alloc = EngineAllocators.Create(8 * 1024 * 1024, 4 * 1024 * 1024, 4 * 1024 * 1024, 512 * 1024);
+        var mulArena = LinearArena.Create(64 * 1024);
         var world = EngineWorld.Create(ref alloc.Persistent, 256, 64);
         var bundles = BundleManager.Create(ref alloc.Persistent, 8);
 
@@ -823,12 +1283,60 @@ public static unsafe class Rig2DTests
             string pngPath = Path.Combine(AppContext.BaseDirectory, "verify_rig2d_test.png");
             GpuSystem.SaveCaptureTextureToPng(ref *gpu, pngPath);
             Assert.True(File.Exists(pngPath) && new FileInfo(pngPath).Length > 1024, "Saved verify_rig2d_test.png");
+
+            // P1-5 / P0-3: Add a Multiply-blended Rig2D slot sharing the same BC3 atlas to verify alpha-safe Multiply
+            // pipeline compilation, pipeline-before-buffer bind ordering, and darkening blend on WARP D3D12 / lavapipe Vulkan!
+            const string mulJson = """
+            {
+              "name": "mul_shadow",
+              "pixelsPerUnit": 100,
+              "bones": [{ "name": "root", "x": 0, "y": 0 }],
+              "slots": [{ "name": "shade", "bone": "root", "attachment": "shade_img", "blend": "multiply" }],
+              "skins": {
+                "default": {
+                  "shade": {
+                    "shade_img": { "type": "region", "image": "parts/torso", "x": 0, "y": 40, "width": 96, "height": 96 }
+                  }
+                }
+              }
+            }
+            """;
+            byte[] mulBrig = Rig2DCompiler.CompileFromJsonBytes(Encoding.UTF8.GetBytes(mulJson));
+            Rig2DAssetHandle mulAssetH = Rig2DLoader.LoadFromMemory(mulBrig, ref mulArena, ref world.Rigs, BundleId.Create(99, 1));
+            EntityId mulEnt = EntitySystem.Spawn(ref world.Entities);
+            TransformSystem.Add(ref world.Transforms, mulEnt, new Vec3(140f, 140f, 0f));
+            Rig2DInstanceHandle mulInstH = Rig2DSystem.AddInstance(ref world.Rigs, mulEnt, mulAssetH, layerMask: 1u << 31, orderInLayer: 10, depthTest: false);
+            Rig2DInstanceData* mulInst = Rig2DSystem.TryGetInstance(in world.Rigs, mulInstH);
+            mulInst->Scale = new Vec2(100f, 100f);
+            Rig2DSystem.SetTint(ref world.Rigs, mulInstH, new ColorF(0.45f, 0.45f, 0.45f, 1.0f));
+
+            alloc.BeginFrame();
+            EngineWorldSystem.StepCoreSystems(ref world, ref alloc, 0f, 640, 360);
+            BatchRenderer.RenderFrame(ref *gpu, ref world, ref alloc, SceneLighting.Default, captureToOffscreen: true);
+
+            RenderStats stMul = gpu->LastFrameStats;
+            Assert.Equal(4, stMul.Rig2DInstances, "4 Rig2D instances rendered with Multiply overlay");
+            Assert.Equal(2, stMul.DrawCalls, $"3 AlphaBlend rigs (1 batch) + 1 Multiply rig (1 batch) = 2 draw calls (got {stMul.DrawCalls})");
+            Assert.Equal(2, stMul.SetPassCalls, $"2 SetPassCalls (AlphaBlend -> Multiply pipeline switch, got {stMul.SetPassCalls})");
+
+            byte[] rgbaMul = new byte[640 * 360 * 4];
+            Assert.True(GpuSystem.ReadCaptureTextureRgba(ref *gpu, rgbaMul), "ReadCaptureTextureRgba succeeded after Multiply pass");
+            long lumBefore = 0, lumAfter = 0;
+            for (int y = 0; y < 360; y++)
+            for (int x = 80; x < 200; x++)
+            {
+                int o = (y * 640 + x) * 4;
+                lumBefore += rgba[o + 0] + rgba[o + 1] + rgba[o + 2];
+                lumAfter += rgbaMul[o + 0] + rgbaMul[o + 1] + rgbaMul[o + 2];
+            }
+            Assert.True(lumAfter < lumBefore && lumAfter > 0, $"Multiply blend darkened overlapped knight region cleanly (before={lumBefore}, after={lumAfter})");
         }
         finally
         {
             BundleSystem.UnloadAll(ref bundles, ref world);
             GpuSystem.Dispose(ref *gpu, ref world.Assets);
             PlatformSystem.Shutdown(ref window);
+            mulArena.Dispose();
             alloc.Dispose();
             if (Directory.Exists(tmpRoot)) Directory.Delete(tmpRoot, recursive: true);
         }

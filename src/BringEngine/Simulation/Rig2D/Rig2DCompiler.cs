@@ -360,41 +360,9 @@ public static unsafe class Rig2DCompiler
             }
             else
             {
-                ref readonly Rig2DAffine2D pw = ref bindWorld[p];
-                switch (bs.Inherit)
-                {
-                    case Rig2DInheritMode.OnlyTranslation:
-                    {
-                        float wx = pw.A * bs.X + pw.C * bs.Y + pw.Tx;
-                        float wy = pw.B * bs.X + pw.D * bs.Y + pw.Ty;
-                        bindWorld[i] = Rig2DAffine2D.FromTrsShear(wx, wy, bs.RotationDeg, bs.ScaleX, bs.ScaleY, bs.ShearX, bs.ShearY);
-                        break;
-                    }
-                    case Rig2DInheritMode.NoRotation:
-                    {
-                        float wx = pw.A * bs.X + pw.C * bs.Y + pw.Tx;
-                        float wy = pw.B * bs.X + pw.D * bs.Y + pw.Ty;
-                        float psx = pw.WorldScaleX;
-                        float psy = pw.WorldScaleY * (pw.Determinant < 0f ? -1f : 1f);
-                        bindWorld[i] = Rig2DAffine2D.FromTrsShear(wx, wy, bs.RotationDeg, bs.ScaleX * psx, bs.ScaleY * psy, bs.ShearX, bs.ShearY);
-                        break;
-                    }
-                    case Rig2DInheritMode.NoScale:
-                    {
-                        float wx = pw.A * bs.X + pw.C * bs.Y + pw.Tx;
-                        float wy = pw.B * bs.X + pw.D * bs.Y + pw.Ty;
-                        float pRot = pw.WorldRotationRad * DetMath.Rad2Deg;
-                        float signY = pw.Determinant < 0f ? -1f : 1f;
-                        bindWorld[i] = Rig2DAffine2D.FromTrsShear(wx, wy, pRot + bs.RotationDeg, bs.ScaleX, bs.ScaleY * signY, bs.ShearX, bs.ShearY);
-                        break;
-                    }
-                    default:
-                    {
-                        Rig2DAffine2D loc = Rig2DAffine2D.FromTrsShear(bs.X, bs.Y, bs.RotationDeg, bs.ScaleX, bs.ScaleY, bs.ShearX, bs.ShearY);
-                        bindWorld[i] = Rig2DAffine2D.Multiply(in pw, in loc);
-                        break;
-                    }
-                }
+                bindWorld[i] = Rig2DSystem.ComputeBoneWorldFromParent(
+                    in bindWorld[p], bs.Inherit,
+                    bs.X, bs.Y, bs.RotationDeg, bs.ScaleX, bs.ScaleY, bs.ShearX, bs.ShearY);
             }
             boneInvBind[i] = Rig2DAffine2D.Invert(in bindWorld[i]);
         }
@@ -467,6 +435,7 @@ public static unsafe class Rig2DCompiler
                     if (pa.Vertices.Count >= 3 && pa.Triangles.Count >= 3)
                     {
                         vCount = pa.Vertices.Count;
+                        var mergedWeights = new List<(int BoneIdx, float Weight)>(8);
                         for (int v = 0; v < vCount; v++)
                         {
                             Vec2 uv = v < pa.Uvs.Count ? pa.Uvs[v] : Vec2.Zero;
@@ -475,22 +444,39 @@ public static unsafe class Rig2DCompiler
                             if (v < pa.Weights.Count && pa.Weights[v].Length > 0)
                             {
                                 var wArr = pa.Weights[v];
-                                // Keep top 4 positive weights
-                                int count = 0;
-                                for (int k = 0; k < wArr.Length && count < 4; k++)
+                                mergedWeights.Clear();
+                                // Collect all valid weights (merging duplicate bone entries), then keep top 4 highest
+                                for (int k = 0; k < wArr.Length; k++)
                                 {
                                     float wt = wArr[k].Weight;
-                                    if (wt <= 1e-6f) continue;
+                                    if (!float.IsFinite(wt) || wt <= 1e-6f) continue;
                                     if (!boneIndexByName.TryGetValue(wArr[k].BoneName, out int bIdx))
                                         throw new InvalidDataException($"Rig2D '{rigName}' mesh '{pa.Name}' vertex {v} references unknown bone '{wArr[k].BoneName}'.");
-                                    switch (count)
+                                    int existing = -1;
+                                    for (int m = 0; m < mergedWeights.Count; m++)
                                     {
-                                        case 0: b0 = (byte)bIdx; w0 = wt; break;
-                                        case 1: b1 = (byte)bIdx; w1 = wt; break;
-                                        case 2: b2 = (byte)bIdx; w2 = wt; break;
-                                        case 3: b3 = (byte)bIdx; w3 = wt; break;
+                                        if (mergedWeights[m].BoneIdx == bIdx) { existing = m; break; }
                                     }
-                                    count++;
+                                    if (existing >= 0)
+                                        mergedWeights[existing] = (bIdx, mergedWeights[existing].Weight + wt);
+                                    else
+                                        mergedWeights.Add((bIdx, wt));
+                                }
+                                mergedWeights.Sort((a, b) =>
+                                {
+                                    int cmp = b.Weight.CompareTo(a.Weight);
+                                    return cmp != 0 ? cmp : a.BoneIdx.CompareTo(b.BoneIdx);
+                                });
+                                int take = Math.Min(4, mergedWeights.Count);
+                                for (int k = 0; k < take; k++)
+                                {
+                                    switch (k)
+                                    {
+                                        case 0: b0 = (byte)mergedWeights[k].BoneIdx; w0 = mergedWeights[k].Weight; break;
+                                        case 1: b1 = (byte)mergedWeights[k].BoneIdx; w1 = mergedWeights[k].Weight; break;
+                                        case 2: b2 = (byte)mergedWeights[k].BoneIdx; w2 = mergedWeights[k].Weight; break;
+                                        case 3: b3 = (byte)mergedWeights[k].BoneIdx; w3 = mergedWeights[k].Weight; break;
+                                    }
                                 }
                             }
                             float wSum = w0 + w1 + w2 + w3;
@@ -802,25 +788,26 @@ public static unsafe class Rig2DCompiler
                         }
                         else if (pk.DrawOrderOffsets != null && pk.DrawOrderOffsets.Count > 0)
                         {
-                            intVal = drawOrderPool.Count;
-                            int[] perm = new int[sc];
-                            for (int s = 0; s < sc; s++) perm[s] = -1;
-                            var unchanged = new List<int>(sc);
-                            var shifted = new bool[sc];
-                            for (int oi = 0; oi < pk.DrawOrderOffsets.Count; oi++)
+                            if (sc > 0)
                             {
-                                if (!slotIndexByName.TryGetValue(pk.DrawOrderOffsets[oi].Slot, out int sIdx)) continue;
-                                int targetPos = Math.Clamp(sIdx + pk.DrawOrderOffsets[oi].Offset, 0, sc - 1);
-                                perm[targetPos] = sIdx;
-                                shifted[sIdx] = true;
+                                intVal = drawOrderPool.Count;
+                                var order = new List<int>(sc);
+                                for (int s = 0; s < sc; s++) order.Add(s);
+                                for (int oi = 0; oi < pk.DrawOrderOffsets.Count; oi++)
+                                {
+                                    if (!slotIndexByName.TryGetValue(pk.DrawOrderOffsets[oi].Slot, out int sIdx)) continue;
+                                    int curPos = order.IndexOf(sIdx);
+                                    if (curPos < 0) continue;
+                                    int targetPos = Math.Clamp(curPos + pk.DrawOrderOffsets[oi].Offset, 0, sc - 1);
+                                    order.RemoveAt(curPos);
+                                    order.Insert(targetPos, sIdx);
+                                }
+                                for (int s = 0; s < sc; s++)
+                                    drawOrderPool.Add(order[s]);
                             }
-                            for (int s = 0; s < sc; s++)
-                                if (!shifted[s]) unchanged.Add(s);
-                            int u = 0;
-                            for (int s = 0; s < sc; s++)
+                            else
                             {
-                                if (perm[s] < 0 && u < unchanged.Count) perm[s] = unchanged[u++];
-                                drawOrderPool.Add(perm[s] >= 0 ? perm[s] : s);
+                                intVal = -1;
                             }
                         }
                         else
@@ -1881,7 +1868,7 @@ public static unsafe class Rig2DCompiler
         }
     }
 
-    private static Rig2DInheritMode ParseInheritMode(string s) => s.ToLowerInvariant() switch
+    public static Rig2DInheritMode ParseInheritMode(string? s) => (s ?? "").ToLowerInvariant() switch
     {
         "onlytranslation" or "only_translation" => Rig2DInheritMode.OnlyTranslation,
         "norotation" or "no_rotation" => Rig2DInheritMode.NoRotation,

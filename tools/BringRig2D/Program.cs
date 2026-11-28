@@ -69,6 +69,7 @@ public static unsafe class Program
             Tolerance = 65f,
             Feather = 28f,
             Despill = true,
+            GlobalKey = false,
             Trim = true,
             Pad = 4,
             SplitIslands = false,
@@ -86,6 +87,7 @@ public static unsafe class Program
             else if (a == "--feather") { if (!NextFloat(args, ref i, a, out opts.Feather)) return 2; }
             else if (a == "--despill") opts.Despill = true;
             else if (a == "--no-despill") opts.Despill = false;
+            else if (a == "--global-key") opts.GlobalKey = true;
             else if (a == "--trim") opts.Trim = true;
             else if (a == "--no-trim") opts.Trim = false;
             else if (a == "--pad") { if (!NextInt(args, ref i, a, out opts.Pad)) return 2; }
@@ -312,7 +314,7 @@ public static unsafe class Program
     {
         Console.WriteLine($"{EngineInfo.Name} v{EngineInfo.Version} - BringRig2D (Zero-Editor 2D Skeletal Rigging & AI Authoring CLI)");
         Console.WriteLine("Commands:");
-        Console.WriteLine("  BringRig2D prep     --input <img|dir> --output <out> [--key auto|green|magenta|#RRGGBB] [--tolerance 65] [--feather 28] [--despill] [--trim] [--pad 4] [--split-islands] [--min-area 256] [--manifest <out.json>]");
+        Console.WriteLine("  BringRig2D prep     --input <img|dir> --output <out> [--key auto|green|magenta|#RRGGBB] [--tolerance 65] [--feather 28] [--despill] [--global-key] [--trim] [--pad 4] [--split-islands] [--min-area 256] [--manifest <out.json>]");
         Console.WriteLine("  BringRig2D mesh     --rig <file.rig2d.json> [--images <dir>] [--density 24] [--margin 2] [--smooth 3] [--out <file.rig2d.json>]");
         Console.WriteLine("  BringRig2D validate --rig <file.rig2d.json> [--images <dir>]");
         Console.WriteLine("  BringRig2D render   --rig <file.rig2d.json> --out <dir> [--images <dir>] [--anim all|<name>] [--skin <name>] [--width 512] [--height 512] [--frames 8] [--fps 12] [--clean] [--overlay] [--weights] [--strip] [--gif] [--bg #161B2A]");

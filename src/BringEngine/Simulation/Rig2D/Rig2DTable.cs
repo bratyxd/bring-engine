@@ -80,15 +80,22 @@ public unsafe struct Rig2DRangePool
 
     public void Free(int start, int count)
     {
-        if (count <= 0 || start < 0 || start + count > TotalCapacity) return;
+        if (count <= 0 || start < 0 || start > TotalCapacity - count) return;
 
         int pos = 0;
         while (pos < FreeRangeCount && FreeStarts[pos] < start)
             pos++;
 
+        // Reject overlapping or already-free ranges (safe double-free no-op)
+        if (pos > 0 && FreeStarts[pos - 1] + FreeCounts[pos - 1] > start)
+            return;
+        if (pos < FreeRangeCount && start + count > FreeStarts[pos])
+            return;
+
         bool mergeLeft = pos > 0 && (FreeStarts[pos - 1] + FreeCounts[pos - 1] == start);
         bool mergeRight = pos < FreeRangeCount && (start + count == FreeStarts[pos]);
 
+        bool freed = false;
         if (mergeLeft && mergeRight)
         {
             FreeCounts[pos - 1] += count + FreeCounts[pos];
@@ -99,15 +106,18 @@ public unsafe struct Rig2DRangePool
                 FreeCounts[pos + k] = FreeCounts[pos + k + 1];
             }
             FreeRangeCount--;
+            freed = true;
         }
         else if (mergeLeft)
         {
             FreeCounts[pos - 1] += count;
+            freed = true;
         }
         else if (mergeRight)
         {
             FreeStarts[pos] = start;
             FreeCounts[pos] += count;
+            freed = true;
         }
         else if (FreeRangeCount < FreeRangeCap)
         {
@@ -119,10 +129,14 @@ public unsafe struct Rig2DRangePool
             FreeStarts[pos] = start;
             FreeCounts[pos] = count;
             FreeRangeCount++;
+            freed = true;
         }
 
-        UsedCount -= count;
-        if (UsedCount < 0) UsedCount = 0;
+        if (freed)
+        {
+            UsedCount -= count;
+            if (UsedCount < 0) UsedCount = 0;
+        }
     }
 }
 

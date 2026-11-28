@@ -958,15 +958,13 @@ public static unsafe class Rig2DSystem
                     SampleClipBones(asset, in clip, tr.Time, sampleB, bc);
                     ApplyCrossfadedBones(asset, localPose, sampleA, sampleB, bc, mixT, alpha, additive);
 
-                    // Non-bone timelines: crossfade colors/mixes/deforms, step discrete attachment/draw-order at mixT >= 0.5
-                    ApplyClipNonBoneTimelines(
-                        ref table, in inst, asset, in fromClip, tr.FromTime,
+                    // Non-bone timelines: crossfade continuous channels in scratch first (no setup bleed), step discrete at mixT >= 0.5
+                    ApplyCrossfadedNonBoneTimelines(
+                        ref table, in inst, asset,
+                        in fromClip, tr.FromTime,
+                        in clip, tr.Time,
                         slotStates, drawOrder, seqKeyed, constraintMix, ikSoftness, ikBend,
-                        alpha * (1f - mixT), additive, applyDiscrete: mixT < 0.5f, ref deformCursor);
-                    ApplyClipNonBoneTimelines(
-                        ref table, in inst, asset, in clip, tr.Time,
-                        slotStates, drawOrder, seqKeyed, constraintMix, ikSoftness, ikBend,
-                        alpha * mixT, additive, applyDiscrete: mixT >= 0.5f, ref deformCursor);
+                        mixT, alpha, additive, ref deformCursor, ref scratchArena);
                 }
                 else
                 {
@@ -1070,15 +1068,19 @@ public static unsafe class Rig2DSystem
                 }
             }
 
-            // Compute entity displacement in skeleton pixel space for spring inertia
+            // Compute entity displacement in skeleton pixel space for spring inertia (accounting for Flip & Scale)
             Vec2 entDeltaSkel = Vec2.Zero;
             if (inst.HasPrevEntityPos != 0 && dt > 1e-6f)
             {
                 Vec3 worldDelta = entWorldPos - inst.PrevEntityPos;
                 float ppu = asset->PixelsPerUnit > 1e-5f ? asset->PixelsPerUnit : 100f;
-                float flipX = inst.FlipX != 0 ? -1f : 1f;
-                float flipY = inst.FlipY != 0 ? -1f : 1f;
-                entDeltaSkel = new Vec2(worldDelta.X * ppu * flipX, worldDelta.Y * ppu * flipY);
+                float sx = inst.Scale.X * (inst.FlipX != 0 ? -1f : 1f);
+                float sy = inst.Scale.Y * (inst.FlipY != 0 ? -1f : 1f);
+                float invSx = (float.IsFinite(sx) && DetMath.Abs(sx) > 1e-5f) ? (1f / sx) : 1f;
+                float invSy = (float.IsFinite(sy) && DetMath.Abs(sy) > 1e-5f) ? (1f / sy) : 1f;
+                float dxSkel = worldDelta.X * ppu * invSx;
+                float dySkel = worldDelta.Y * ppu * invSy;
+                entDeltaSkel = new Vec2(float.IsFinite(dxSkel) ? dxSkel : 0f, float.IsFinite(dySkel) ? dySkel : 0f);
             }
             inst.PrevEntityPos = entWorldPos;
             inst.HasPrevEntityPos = 1;
@@ -1129,6 +1131,54 @@ public static unsafe class Rig2DSystem
     // Bone Hierarchy Computation (with all 4 Rig2DInheritModes)
     // =========================================================================
 
+    /// <summary>
+    /// Computes a child bone's 2D world affine transform from its parent's world transform and inherit mode.
+    /// Shared across Rig2DSystem (runtime solver), Rig2DCompiler (bind pose), and BringRig2D AutoMesher.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Rig2DAffine2D ComputeBoneWorldFromParent(
+        in Rig2DAffine2D parentWorld,
+        Rig2DInheritMode inherit,
+        float x,
+        float y,
+        float rotDeg,
+        float sx,
+        float sy,
+        float shearX,
+        float shearY)
+    {
+        switch (inherit)
+        {
+            case Rig2DInheritMode.OnlyTranslation:
+            {
+                float wx = parentWorld.A * x + parentWorld.C * y + parentWorld.Tx;
+                float wy = parentWorld.B * x + parentWorld.D * y + parentWorld.Ty;
+                return Rig2DAffine2D.FromTrsShear(wx, wy, rotDeg, sx, sy, shearX, shearY);
+            }
+            case Rig2DInheritMode.NoRotation:
+            {
+                float wx = parentWorld.A * x + parentWorld.C * y + parentWorld.Tx;
+                float wy = parentWorld.B * x + parentWorld.D * y + parentWorld.Ty;
+                float psx = parentWorld.WorldScaleX;
+                float psy = parentWorld.WorldScaleY * (parentWorld.Determinant < 0f ? -1f : 1f);
+                return Rig2DAffine2D.FromTrsShear(wx, wy, rotDeg, sx * psx, sy * psy, shearX, shearY);
+            }
+            case Rig2DInheritMode.NoScale:
+            {
+                float wx = parentWorld.A * x + parentWorld.C * y + parentWorld.Tx;
+                float wy = parentWorld.B * x + parentWorld.D * y + parentWorld.Ty;
+                float pRotDeg = parentWorld.WorldRotationRad * DetMath.Rad2Deg;
+                float signY = parentWorld.Determinant < 0f ? -1f : 1f;
+                return Rig2DAffine2D.FromTrsShear(wx, wy, pRotDeg + rotDeg, sx, sy * signY, shearX, shearY);
+            }
+            default:
+            {
+                Rig2DAffine2D local = Rig2DAffine2D.FromTrsShear(x, y, rotDeg, sx, sy, shearX, shearY);
+                return Rig2DAffine2D.Multiply(in parentWorld, in local);
+            }
+        }
+    }
+
     private static void ComputeSetupWorldPose(Rig2DAssetData* asset, Rig2DAffine2D* worldBones)
     {
         for (int b = 0; b < asset->BoneCount; b++)
@@ -1157,47 +1207,7 @@ public static unsafe class Rig2DSystem
             return;
         }
 
-        ref readonly Rig2DAffine2D pw = ref worldBones[p];
-        switch (bs.Inherit)
-        {
-            case Rig2DInheritMode.Normal:
-            {
-                Rig2DAffine2D local = Rig2DAffine2D.FromTrsShear(lp.X, lp.Y, lp.RotDeg, lp.ScaleX, lp.ScaleY, lp.ShearX, lp.ShearY);
-                worldBones[b] = Rig2DAffine2D.Multiply(in pw, in local);
-                break;
-            }
-            case Rig2DInheritMode.OnlyTranslation:
-            {
-                float wx = pw.A * lp.X + pw.C * lp.Y + pw.Tx;
-                float wy = pw.B * lp.X + pw.D * lp.Y + pw.Ty;
-                worldBones[b] = Rig2DAffine2D.FromTrsShear(wx, wy, lp.RotDeg, lp.ScaleX, lp.ScaleY, lp.ShearX, lp.ShearY);
-                break;
-            }
-            case Rig2DInheritMode.NoRotation:
-            {
-                float wx = pw.A * lp.X + pw.C * lp.Y + pw.Tx;
-                float wy = pw.B * lp.X + pw.D * lp.Y + pw.Ty;
-                float psx = pw.WorldScaleX;
-                float psy = pw.WorldScaleY * (pw.Determinant < 0f ? -1f : 1f);
-                worldBones[b] = Rig2DAffine2D.FromTrsShear(wx, wy, lp.RotDeg, lp.ScaleX * psx, lp.ScaleY * psy, lp.ShearX, lp.ShearY);
-                break;
-            }
-            case Rig2DInheritMode.NoScale:
-            {
-                float wx = pw.A * lp.X + pw.C * lp.Y + pw.Tx;
-                float wy = pw.B * lp.X + pw.D * lp.Y + pw.Ty;
-                float pRotDeg = pw.WorldRotationRad * DetMath.Rad2Deg;
-                float signY = pw.Determinant < 0f ? -1f : 1f;
-                worldBones[b] = Rig2DAffine2D.FromTrsShear(wx, wy, pRotDeg + lp.RotDeg, lp.ScaleX, lp.ScaleY * signY, lp.ShearX, lp.ShearY);
-                break;
-            }
-            default:
-            {
-                Rig2DAffine2D local = Rig2DAffine2D.FromTrsShear(lp.X, lp.Y, lp.RotDeg, lp.ScaleX, lp.ScaleY, lp.ShearX, lp.ShearY);
-                worldBones[b] = Rig2DAffine2D.Multiply(in pw, in local);
-                break;
-            }
-        }
+        worldBones[b] = ComputeBoneWorldFromParent(in worldBones[p], bs.Inherit, lp.X, lp.Y, lp.RotDeg, lp.ScaleX, lp.ScaleY, lp.ShearX, lp.ShearY);
     }
 
     private static void UpdateBoneSubtree(Rig2DAssetData* asset, BoneLocalPose* localPose, Rig2DAffine2D* worldBones, byte* dirty, int rootBone)
@@ -1547,6 +1557,371 @@ public static unsafe class Rig2DSystem
         }
     }
 
+    private static float GetSetupConstraintMix(Rig2DAssetData* asset, int constraintOrderIndex)
+    {
+        ref readonly Rig2DConstraintOrderItem ord = ref asset->ConstraintOrder[constraintOrderIndex];
+        return ord.Kind switch
+        {
+            Rig2DConstraintKind.Ik => asset->IkConstraints[ord.Index].Mix,
+            Rig2DConstraintKind.Transform => 1f,
+            Rig2DConstraintKind.Spring => asset->SpringConstraints[ord.Index].Mix,
+            _ => 1f,
+        };
+    }
+
+    private static bool ClipHasNonBoneTimelines(Rig2DAssetData* asset, in Rig2DAnimClipData clip)
+    {
+        if (clip.TimelineCount <= 0 || asset->Timelines == null || asset->Keyframes == null) return false;
+        for (int i = 0; i < clip.TimelineCount; i++)
+        {
+            if (asset->Timelines[clip.TimelineStart + i].Target >= Rig2DTimelineTarget.SlotAttachment)
+                return true;
+        }
+        return false;
+    }
+
+    private static void ApplyCrossfadedNonBoneTimelines(
+        ref Rig2DTable table,
+        in Rig2DInstanceData inst,
+        Rig2DAssetData* asset,
+        in Rig2DAnimClipData fromClip,
+        float fromTime,
+        in Rig2DAnimClipData toClip,
+        float toTime,
+        Rig2DRuntimeSlotState* slotStates,
+        int* drawOrder,
+        byte* seqKeyed,
+        float* constraintMix,
+        float* ikSoftness,
+        sbyte* ikBend,
+        float mixT,
+        float alpha,
+        bool additive,
+        ref int deformCursor,
+        ref LinearArena scratchArena)
+    {
+        if (!ClipHasNonBoneTimelines(asset, in fromClip) && !ClipHasNonBoneTimelines(asset, in toClip))
+            return;
+
+        // 1. Apply discrete channels (SlotAttachment, SlotSequenceFrame, DrawOrder, ikBend) from active half first
+        if (mixT < 0.5f)
+            ApplyClipDiscreteNonBoneTimelines(in inst, asset, in fromClip, fromTime, slotStates, drawOrder, seqKeyed, ikBend);
+        else
+            ApplyClipDiscreteNonBoneTimelines(in inst, asset, in toClip, toTime, slotStates, drawOrder, seqKeyed, ikBend);
+
+        int sc = asset->SlotCount;
+        int cc = asset->ConstraintOrderCount;
+        int ikc = asset->IkConstraintCount;
+
+        ArenaMarker mark = scratchArena.SaveMarker();
+        try
+        {
+            ColorF* lightA = sc > 0 ? scratchArena.AllocUninitialized<ColorF>(sc, 16) : null;
+            ColorF* lightB = sc > 0 ? scratchArena.AllocUninitialized<ColorF>(sc, 16) : null;
+            byte* hasLightA = sc > 0 ? scratchArena.Alloc<byte>(sc, 16) : null;
+            byte* hasLightB = sc > 0 ? scratchArena.Alloc<byte>(sc, 16) : null;
+
+            ColorF* darkA = sc > 0 ? scratchArena.AllocUninitialized<ColorF>(sc, 16) : null;
+            ColorF* darkB = sc > 0 ? scratchArena.AllocUninitialized<ColorF>(sc, 16) : null;
+            byte* hasDarkA = sc > 0 ? scratchArena.Alloc<byte>(sc, 16) : null;
+            byte* hasDarkB = sc > 0 ? scratchArena.Alloc<byte>(sc, 16) : null;
+
+            float* mixA = cc > 0 ? scratchArena.AllocUninitialized<float>(cc, 16) : null;
+            float* mixB = cc > 0 ? scratchArena.AllocUninitialized<float>(cc, 16) : null;
+            byte* hasMixA = cc > 0 ? scratchArena.Alloc<byte>(cc, 16) : null;
+            byte* hasMixB = cc > 0 ? scratchArena.Alloc<byte>(cc, 16) : null;
+
+            float* softA = ikc > 0 ? scratchArena.AllocUninitialized<float>(ikc, 16) : null;
+            float* softB = ikc > 0 ? scratchArena.AllocUninitialized<float>(ikc, 16) : null;
+            byte* hasSoftA = ikc > 0 ? scratchArena.Alloc<byte>(ikc, 16) : null;
+            byte* hasSoftB = ikc > 0 ? scratchArena.Alloc<byte>(ikc, 16) : null;
+
+            int* deformTlA = sc > 0 ? scratchArena.AllocUninitialized<int>(sc, 16) : null;
+            int* deformTlB = sc > 0 ? scratchArena.AllocUninitialized<int>(sc, 16) : null;
+            for (int s = 0; s < sc; s++)
+            {
+                deformTlA[s] = -1;
+                deformTlB[s] = -1;
+            }
+
+            // 2. Sample continuous channels from both clips into zero-GC scratch buffers
+            SampleClipContinuousNonBone(asset, in fromClip, fromTime, slotStates,
+                lightA, hasLightA, darkA, hasDarkA, mixA, hasMixA, softA, hasSoftA, deformTlA);
+            SampleClipContinuousNonBone(asset, in toClip, toTime, slotStates,
+                lightB, hasLightB, darkB, hasDarkB, mixB, hasMixB, softB, hasSoftB, deformTlB);
+
+            // 3. Crossfade SlotColor & SlotDarkColor (unkeyed side falls back to setup pose; zero setup bleed!)
+            if (slotStates != null)
+            {
+                for (int s = 0; s < sc; s++)
+                {
+                    if (hasLightA[s] != 0 || hasLightB[s] != 0)
+                    {
+                        ColorF setupLight = asset->Slots[s].LightColor;
+                        ColorF ca = hasLightA[s] != 0 ? lightA[s] : setupLight;
+                        ColorF cb = hasLightB[s] != 0 ? lightB[s] : setupLight;
+                        ColorF mixed = ColorF.Lerp(ca, cb, mixT);
+                        slotStates[s].LightColor = ColorF.Lerp(slotStates[s].LightColor, mixed, alpha);
+                    }
+                    if (hasDarkA[s] != 0 || hasDarkB[s] != 0)
+                    {
+                        ColorF setupDark = asset->Slots[s].DarkColor;
+                        ColorF ca = hasDarkA[s] != 0 ? darkA[s] : setupDark;
+                        ColorF cb = hasDarkB[s] != 0 ? darkB[s] : setupDark;
+                        ColorF mixed = ColorF.Lerp(ca, cb, mixT);
+                        slotStates[s].DarkColor = ColorF.Lerp(slotStates[s].DarkColor, mixed, alpha);
+                    }
+                }
+            }
+
+            // 4. Crossfade ConstraintMix & ikSoftness (unkeyed side falls back to setup pose)
+            if (constraintMix != null)
+            {
+                for (int ci = 0; ci < cc; ci++)
+                {
+                    if (hasMixA[ci] != 0 || hasMixB[ci] != 0)
+                    {
+                        float setupMix = GetSetupConstraintMix(asset, ci);
+                        float ma = hasMixA[ci] != 0 ? mixA[ci] : setupMix;
+                        float mb = hasMixB[ci] != 0 ? mixB[ci] : setupMix;
+                        float mixed = DetMath.Lerp(ma, mb, mixT);
+                        constraintMix[ci] = DetMath.Lerp(constraintMix[ci], mixed, alpha);
+                    }
+                }
+            }
+            if (ikSoftness != null)
+            {
+                for (int ii = 0; ii < ikc; ii++)
+                {
+                    if (hasSoftA[ii] != 0 || hasSoftB[ii] != 0)
+                    {
+                        float setupSoft = asset->IkConstraints[ii].Softness;
+                        float sa = hasSoftA[ii] != 0 ? softA[ii] : setupSoft;
+                        float sb = hasSoftB[ii] != 0 ? softB[ii] : setupSoft;
+                        float mixed = DetMath.Lerp(sa, sb, mixT);
+                        ikSoftness[ii] = DetMath.Lerp(ikSoftness[ii], mixed, alpha);
+                    }
+                }
+            }
+
+            // 5. Crossfade MeshDeform per slot (unkeyed side falls back to Vec2.Zero)
+            if (asset->DeformPool != null && table.FrameDeformDeltas.Ptr != null && slotStates != null)
+            {
+                for (int s = 0; s < sc; s++)
+                {
+                    int tlIdxA = deformTlA[s];
+                    int tlIdxB = deformTlB[s];
+                    if (tlIdxA < 0 && tlIdxB < 0) continue;
+
+                    int attIdx = slotStates[s].ActiveAttachmentIndex;
+                    if ((uint)attIdx >= (uint)asset->AttachmentCount) continue;
+                    int vc = asset->Attachments[attIdx].VertexCount;
+                    if (vc <= 0) continue;
+
+                    int dstOff = slotStates[s].DeformVertexOffset;
+                    bool freshSlot = slotStates[s].DeformVertexCount != vc;
+                    if (freshSlot)
+                    {
+                        if (deformCursor + vc > table.FrameDeformDeltas.Length) continue;
+                        dstOff = deformCursor;
+                        deformCursor += vc;
+                        slotStates[s].DeformVertexOffset = dstOff;
+                        slotStates[s].DeformVertexCount = vc;
+                        for (int v = 0; v < vc; v++)
+                            table.FrameDeformDeltas.Ptr[dstOff + v] = Vec2.Zero;
+                    }
+
+                    ArenaMarker defMark = scratchArena.SaveMarker();
+                    try
+                    {
+                        Vec2* tmpA = scratchArena.Alloc<Vec2>(vc, 16);
+                        Vec2* tmpB = scratchArena.Alloc<Vec2>(vc, 16);
+
+                        if (tlIdxA >= 0)
+                        {
+                            ref readonly Rig2DTimelineData tlA = ref asset->Timelines[tlIdxA];
+                            SampleDeformTimeline(asset->Keyframes + tlA.KeyStart, tlA.KeyCount, fromTime,
+                                asset->DeformPool, asset->DeformPoolCount, tmpA, vc, 1f, accumulate: false);
+                        }
+                        if (tlIdxB >= 0)
+                        {
+                            ref readonly Rig2DTimelineData tlB = ref asset->Timelines[tlIdxB];
+                            SampleDeformTimeline(asset->Keyframes + tlB.KeyStart, tlB.KeyCount, toTime,
+                                asset->DeformPool, asset->DeformPoolCount, tmpB, vc, 1f, accumulate: false);
+                        }
+
+                        Vec2* dst = table.FrameDeformDeltas.Ptr + dstOff;
+                        for (int v = 0; v < vc; v++)
+                        {
+                            Vec2 mixed = Vec2.Lerp(tmpA[v], tmpB[v], mixT);
+                            if (additive)
+                                dst[v] = dst[v] + mixed * alpha;
+                            else
+                                dst[v] = Vec2.Lerp(dst[v], mixed, alpha);
+                        }
+                    }
+                    finally
+                    {
+                        scratchArena.Rollback(defMark);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            scratchArena.Rollback(mark);
+        }
+    }
+
+    private static void ApplyClipDiscreteNonBoneTimelines(
+        in Rig2DInstanceData inst,
+        Rig2DAssetData* asset,
+        in Rig2DAnimClipData clip,
+        float time,
+        Rig2DRuntimeSlotState* slotStates,
+        int* drawOrder,
+        byte* seqKeyed,
+        sbyte* ikBend)
+    {
+        if (clip.TimelineCount <= 0 || asset->Timelines == null || asset->Keyframes == null) return;
+
+        for (int i = 0; i < clip.TimelineCount; i++)
+        {
+            ref readonly Rig2DTimelineData tl = ref asset->Timelines[clip.TimelineStart + i];
+            if (tl.KeyCount <= 0) continue;
+            Rig2DKeyframeData* keys = asset->Keyframes + tl.KeyStart;
+
+            switch (tl.Target)
+            {
+                case Rig2DTimelineTarget.SlotAttachment:
+                    if ((uint)tl.TargetIndex < (uint)asset->SlotCount && slotStates != null)
+                    {
+                        int kIdx = FindStepKeyIndex(keys, tl.KeyCount, time);
+                        var attName = new StringId(keys[kIdx].HashVal);
+                        slotStates[tl.TargetIndex].ActiveAttachmentIndex = attName.IsValid
+                            ? FindAttachmentIndex(asset, tl.TargetIndex, attName, inst.ActiveSkinIndex)
+                            : -1;
+                    }
+                    break;
+
+                case Rig2DTimelineTarget.SlotSequenceFrame:
+                    if ((uint)tl.TargetIndex < (uint)asset->SlotCount && slotStates != null)
+                    {
+                        int kIdx = FindStepKeyIndex(keys, tl.KeyCount, time);
+                        slotStates[tl.TargetIndex].SequenceFrame = keys[kIdx].IntVal;
+                        seqKeyed[tl.TargetIndex] = 1;
+                    }
+                    break;
+
+                case Rig2DTimelineTarget.ConstraintMix:
+                    if ((uint)tl.TargetIndex < (uint)asset->ConstraintOrderCount && ikBend != null)
+                    {
+                        ref readonly Rig2DConstraintOrderItem ord = ref asset->ConstraintOrder[tl.TargetIndex];
+                        if (ord.Kind == Rig2DConstraintKind.Ik && (uint)ord.Index < (uint)asset->IkConstraintCount)
+                        {
+                            int kIdx = FindStepKeyIndex(keys, tl.KeyCount, time);
+                            if (keys[kIdx].IntVal != 0)
+                                ikBend[ord.Index] = keys[kIdx].IntVal > 0 ? (sbyte)1 : (sbyte)-1;
+                        }
+                    }
+                    break;
+
+                case Rig2DTimelineTarget.DrawOrder:
+                    if (drawOrder != null && asset->SlotCount > 0)
+                    {
+                        int kIdx = FindStepKeyIndex(keys, tl.KeyCount, time);
+                        int poolOff = keys[kIdx].IntVal;
+                        if (poolOff < 0)
+                        {
+                            for (int s = 0; s < asset->SlotCount; s++) drawOrder[s] = s;
+                        }
+                        else if (asset->DrawOrderPool != null && poolOff + asset->SlotCount <= asset->DrawOrderPoolCount)
+                        {
+                            for (int s = 0; s < asset->SlotCount; s++)
+                                drawOrder[s] = asset->DrawOrderPool[poolOff + s];
+                        }
+                    }
+                    break;
+            }
+        }
+    }
+
+    private static void SampleClipContinuousNonBone(
+        Rig2DAssetData* asset,
+        in Rig2DAnimClipData clip,
+        float time,
+        Rig2DRuntimeSlotState* slotStates,
+        ColorF* lightDst,
+        byte* hasLight,
+        ColorF* darkDst,
+        byte* hasDark,
+        float* mixDst,
+        byte* hasMix,
+        float* softDst,
+        byte* hasSoft,
+        int* deformTlDst)
+    {
+        if (clip.TimelineCount <= 0 || asset->Timelines == null || asset->Keyframes == null) return;
+
+        for (int i = 0; i < clip.TimelineCount; i++)
+        {
+            int absTlIdx = clip.TimelineStart + i;
+            ref readonly Rig2DTimelineData tl = ref asset->Timelines[absTlIdx];
+            if (tl.KeyCount <= 0) continue;
+            Rig2DKeyframeData* keys = asset->Keyframes + tl.KeyStart;
+
+            switch (tl.Target)
+            {
+                case Rig2DTimelineTarget.SlotColor:
+                    if ((uint)tl.TargetIndex < (uint)asset->SlotCount && lightDst != null)
+                    {
+                        SampleVec4(keys, tl.KeyCount, time, out float r, out float g, out float b, out float a);
+                        lightDst[tl.TargetIndex] = new ColorF(r, g, b, a);
+                        hasLight[tl.TargetIndex] = 1;
+                    }
+                    break;
+
+                case Rig2DTimelineTarget.SlotDarkColor:
+                    if ((uint)tl.TargetIndex < (uint)asset->SlotCount && darkDst != null)
+                    {
+                        SampleVec4(keys, tl.KeyCount, time, out float r, out float g, out float b, out float a);
+                        darkDst[tl.TargetIndex] = new ColorF(r, g, b, a);
+                        hasDark[tl.TargetIndex] = 1;
+                    }
+                    break;
+
+                case Rig2DTimelineTarget.ConstraintMix:
+                    if ((uint)tl.TargetIndex < (uint)asset->ConstraintOrderCount && mixDst != null)
+                    {
+                        SampleVec2(keys, tl.KeyCount, time, out float mixVal, out float softVal);
+                        mixDst[tl.TargetIndex] = DetMath.Clamp01(mixVal);
+                        hasMix[tl.TargetIndex] = 1;
+
+                        ref readonly Rig2DConstraintOrderItem ord = ref asset->ConstraintOrder[tl.TargetIndex];
+                        if (ord.Kind == Rig2DConstraintKind.Ik && (uint)ord.Index < (uint)asset->IkConstraintCount && softDst != null)
+                        {
+                            int kIdx = FindStepKeyIndex(keys, tl.KeyCount, time);
+                            if (softVal >= 0f && keys[kIdx].V1 >= 0f)
+                            {
+                                softDst[ord.Index] = softVal;
+                                hasSoft[ord.Index] = 1;
+                            }
+                        }
+                    }
+                    break;
+
+                case Rig2DTimelineTarget.MeshDeform:
+                    if ((uint)tl.TargetIndex < (uint)asset->AttachmentCount && slotStates != null && deformTlDst != null)
+                    {
+                        int slotIdx = asset->Attachments[tl.TargetIndex].SlotIndex;
+                        if ((uint)slotIdx < (uint)asset->SlotCount && slotStates[slotIdx].ActiveAttachmentIndex == tl.TargetIndex)
+                            deformTlDst[slotIdx] = absTlIdx;
+                    }
+                    break;
+            }
+        }
+    }
+
     private static void ApplyClipNonBoneTimelines(
         ref Rig2DTable table,
         in Rig2DInstanceData inst,
@@ -1669,7 +2044,7 @@ public static unsafe class Rig2DSystem
                         }
 
                         SampleDeformTimeline(keys, tl.KeyCount, time, asset->DeformPool, asset->DeformPoolCount,
-                            table.FrameDeformDeltas.Ptr + dstOff, vc, alpha, additive || !freshSlot);
+                            table.FrameDeformDeltas.Ptr + dstOff, vc, alpha, accumulate: additive);
                     }
                     break;
             }
@@ -2143,11 +2518,22 @@ public static unsafe class Rig2DSystem
             return;
         }
 
+        // Guard against any non-finite spring runtime state before integrating
+        if (!float.IsFinite(st.AngleOffsetDeg)) st.AngleOffsetDeg = 0f;
+        if (!float.IsFinite(st.AngleVelDeg)) st.AngleVelDeg = 0f;
+        if (!float.IsFinite(st.PosOffsetX)) st.PosOffsetX = 0f;
+        if (!float.IsFinite(st.PosOffsetY)) st.PosOffsetY = 0f;
+        if (!float.IsFinite(st.VelX)) st.VelX = 0f;
+        if (!float.IsFinite(st.VelY)) st.VelY = 0f;
+
         if (dt > 1e-6f && mix > 1e-5f)
         {
             float dx = (curX - st.PrevWorldX) + entDeltaSkel.X;
             float dy = (curY - st.PrevWorldY) + entDeltaSkel.Y;
             float dAngle = WrapAngleDeg(curAngleDeg - st.PrevWorldAngleDeg);
+            if (!float.IsFinite(dx)) dx = 0f;
+            if (!float.IsFinite(dy)) dy = 0f;
+            if (!float.IsFinite(dAngle)) dAngle = 0f;
 
             float invDt = 1f / DetMath.Max(dt, 1f / 240f);
             float boneAngleRad = (curAngleDeg + st.AngleOffsetDeg) * DetMath.Deg2Rad;
@@ -2160,23 +2546,28 @@ public static unsafe class Rig2DSystem
             float gravityTorque = (-sp.Gravity * ny) * 0.08f;
             float windTorque = (sp.Wind * nx) * 0.08f;
             float extTorque = linearImpulse + angularImpulse + gravityTorque + windTorque;
+            if (!float.IsFinite(extTorque)) extTorque = 0f;
 
             float k = DetMath.Max(0.1f, sp.Strength);
             float damp = DetMath.Max(0.1f, sp.Damping);
             float invMass = 1f / DetMath.Max(0.05f, sp.Mass);
-            float maxAng = sp.MaxAngleDeg > 0f ? sp.MaxAngleDeg : 45f;
+            float maxAng = sp.MaxAngleDeg > 0f && float.IsFinite(sp.MaxAngleDeg) ? sp.MaxAngleDeg : 45f;
+            float maxVel = DetMath.Max(1000f, maxAng * 40f);
 
-            // Fixed substepping guarantees deterministic stability even at variable/large dt
-            int steps = dt > (1f / 60f) ? Math.Min(8, (int)MathF.Ceiling(dt * 60f)) : 1;
-            float h = dt / steps;
+            // Cap effective spring dt to 8/60s so substep h <= 1/60s always (prevents Euler divergence on hitch/tab-out spikes)
+            float simDt = DetMath.Min(dt, 8f / 60f);
+            int steps = simDt > (1f / 60f) ? Math.Min(8, (int)MathF.Ceiling(simDt * 60f)) : 1;
+            float h = simDt / steps;
 
             for (int step = 0; step < steps; step++)
             {
                 if (DetMath.Abs(sp.RotateScale) > 1e-5f)
                 {
                     float acc = (-k * st.AngleOffsetDeg - damp * st.AngleVelDeg + extTorque) * invMass;
-                    st.AngleVelDeg += acc * h;
-                    st.AngleOffsetDeg += st.AngleVelDeg * h;
+                    float nextVel = st.AngleVelDeg + acc * h;
+                    st.AngleVelDeg = float.IsFinite(nextVel) ? DetMath.Clamp(nextVel, -maxVel, maxVel) : 0f;
+                    float nextAng = st.AngleOffsetDeg + st.AngleVelDeg * h;
+                    st.AngleOffsetDeg = float.IsFinite(nextAng) ? nextAng : 0f;
                     if (st.AngleOffsetDeg > maxAng)
                     {
                         st.AngleOffsetDeg = maxAng;
@@ -2193,10 +2584,22 @@ public static unsafe class Rig2DSystem
                 {
                     float fx = (-dx * invDt * sp.Inertia + sp.Wind * 0.1f) * sp.PosScaleX;
                     float fy = (-dy * invDt * sp.Inertia - sp.Gravity * 0.1f) * sp.PosScaleY;
-                    st.VelX += ((-k * st.PosOffsetX - damp * st.VelX + fx) * invMass) * h;
-                    st.VelY += ((-k * st.PosOffsetY - damp * st.VelY + fy) * invMass) * h;
-                    st.PosOffsetX = DetMath.Clamp(st.PosOffsetX + st.VelX * h, -maxAng, maxAng);
-                    st.PosOffsetY = DetMath.Clamp(st.PosOffsetY + st.VelY * h, -maxAng, maxAng);
+                    if (!float.IsFinite(fx)) fx = 0f;
+                    if (!float.IsFinite(fy)) fy = 0f;
+
+                    float nextVx = st.VelX + ((-k * st.PosOffsetX - damp * st.VelX + fx) * invMass) * h;
+                    float nextVy = st.VelY + ((-k * st.PosOffsetY - damp * st.VelY + fy) * invMass) * h;
+                    st.VelX = float.IsFinite(nextVx) ? DetMath.Clamp(nextVx, -maxVel, maxVel) : 0f;
+                    st.VelY = float.IsFinite(nextVy) ? DetMath.Clamp(nextVy, -maxVel, maxVel) : 0f;
+
+                    float nextPx = st.PosOffsetX + st.VelX * h;
+                    float nextPy = st.PosOffsetY + st.VelY * h;
+                    st.PosOffsetX = float.IsFinite(nextPx) ? nextPx : 0f;
+                    st.PosOffsetY = float.IsFinite(nextPy) ? nextPy : 0f;
+                    if (st.PosOffsetX > maxAng) { st.PosOffsetX = maxAng; if (st.VelX > 0f) st.VelX = 0f; }
+                    else if (st.PosOffsetX < -maxAng) { st.PosOffsetX = -maxAng; if (st.VelX < 0f) st.VelX = 0f; }
+                    if (st.PosOffsetY > maxAng) { st.PosOffsetY = maxAng; if (st.VelY > 0f) st.VelY = 0f; }
+                    else if (st.PosOffsetY < -maxAng) { st.PosOffsetY = -maxAng; if (st.VelY < 0f) st.VelY = 0f; }
                 }
             }
         }

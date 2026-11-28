@@ -193,10 +193,11 @@ public static class AutoMesher
     {
         float step = MathF.Max(8f, density);
         bool[] mask = BuildDilatedAlphaMask(rgba, w, h, Math.Clamp(margin, 0, 12));
+        bool[] contourMask = FilterConnectedComponents(mask, w, h);
 
-        // 1. Extract outer boundary contour points (pixel space) and simplify with RDP
+        // 1. Extract outer boundary contour points (pixel space) from largest silhouette component and simplify with RDP
         var pointsPx = new List<Vec2>();
-        var contour = ExtractOuterContour(mask, w, h);
+        var contour = ExtractOuterContour(contourMask, w, h);
         if (contour.Count >= 3)
         {
             float eps = MathF.Max(1.8f, step * 0.14f);
@@ -462,6 +463,79 @@ public static class AutoMesher
         return dst;
     }
 
+    private static bool[] FilterConnectedComponents(bool[] mask, int w, int h)
+    {
+        int n = w * h;
+        int[] labels = new int[n];
+        var compAreas = new List<int> { 0 }; // 1-based component labels
+        var queue = new Queue<int>();
+        int totalOpaque = 0;
+
+        for (int i = 0; i < n; i++)
+        {
+            if (!mask[i] || labels[i] != 0) continue;
+            int label = compAreas.Count;
+            int area = 0;
+            labels[i] = label;
+            queue.Enqueue(i);
+
+            while (queue.Count > 0)
+            {
+                int cur = queue.Dequeue();
+                area++;
+                int cx = cur % w;
+                int cy = cur / w;
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    int ny = cy + dy;
+                    if ((uint)ny >= (uint)h) continue;
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        if (dx == 0 && dy == 0) continue;
+                        int nx = cx + dx;
+                        if ((uint)nx >= (uint)w) continue;
+                        int nIdx = ny * w + nx;
+                        if (mask[nIdx] && labels[nIdx] == 0)
+                        {
+                            labels[nIdx] = label;
+                            queue.Enqueue(nIdx);
+                        }
+                    }
+                }
+            }
+
+            compAreas.Add(area);
+            totalOpaque += area;
+        }
+
+        if (compAreas.Count <= 1) return mask;
+
+        int largestLabel = 1;
+        int largestArea = compAreas[1];
+        for (int l = 2; l < compAreas.Count; l++)
+        {
+            if (compAreas[l] > largestArea)
+            {
+                largestArea = compAreas[l];
+                largestLabel = l;
+            }
+        }
+
+        // Remove tiny stray speckles (< 1% of opaque area) from mask, and trace only the largest component contour
+        int minKeepArea = Math.Max(4, totalOpaque / 100);
+        bool[] largestMask = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            int l = labels[i];
+            if (l == 0) continue;
+            if (l == largestLabel)
+                largestMask[i] = true;
+            else if (compAreas[l] < minKeepArea)
+                mask[i] = false;
+        }
+        return largestMask;
+    }
+
     private static List<Vec2> ExtractOuterContour(bool[] mask, int w, int h)
     {
         // Moore-Neighbor boundary tracing starting at topmost-leftmost opaque pixel
@@ -699,7 +773,7 @@ public static class AutoMesher
         var list = new List<BoneInfo>();
         if (root["bones"] is not JsonArray arr) return list;
 
-        var raw = new List<(string Name, string Parent, float X, float Y, float Rot, float Sx, float Sy, float Shx, float Shy, float Len)>();
+        var raw = new List<(string Name, string Parent, float X, float Y, float Rot, float Sx, float Sy, float Shx, float Shy, float Len, Rig2DInheritMode Inherit)>();
         foreach (var n in arr)
         {
             if (n is not JsonObject o) continue;
@@ -713,10 +787,11 @@ public static class AutoMesher
                 o["scaleY"]?.GetValue<float>() ?? 1f,
                 o["shearX"]?.GetValue<float>() ?? 0f,
                 o["shearY"]?.GetValue<float>() ?? 0f,
-                o["length"]?.GetValue<float>() ?? 0f));
+                o["length"]?.GetValue<float>() ?? 0f,
+                Rig2DCompiler.ParseInheritMode(o["inherit"]?.GetValue<string>())));
         }
 
-        // Resolve iteratively so parents always precede children
+        // Resolve iteratively so parents always precede children, honoring all 4 Rig2DInheritModes
         var resolved = new bool[raw.Count];
         for (int pass = 0; pass < raw.Count; pass++)
         {
@@ -730,16 +805,15 @@ public static class AutoMesher
                 {
                     if (!byName.TryGetValue(b.Parent, out pIdx)) continue;
                 }
-                Rig2DAffine2D loc = Rig2DAffine2D.FromTrsShear(b.X, b.Y, b.Rot, b.Sx, b.Sy, b.Shx, b.Shy);
                 Rig2DAffine2D bw;
                 if (pIdx >= 0)
                 {
                     Rig2DAffine2D parentBind = list[pIdx].BindWorld;
-                    bw = Rig2DAffine2D.Multiply(in parentBind, in loc);
+                    bw = Rig2DSystem.ComputeBoneWorldFromParent(in parentBind, b.Inherit, b.X, b.Y, b.Rot, b.Sx, b.Sy, b.Shx, b.Shy);
                 }
                 else
                 {
-                    bw = loc;
+                    bw = Rig2DAffine2D.FromTrsShear(b.X, b.Y, b.Rot, b.Sx, b.Sy, b.Shx, b.Shy);
                 }
                 byName[b.Name] = list.Count;
                 list.Add(new BoneInfo { Name = b.Name, ParentIdx = pIdx, Length = b.Len, BindWorld = bw });

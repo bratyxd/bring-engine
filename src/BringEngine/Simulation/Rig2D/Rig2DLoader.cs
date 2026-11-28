@@ -29,6 +29,9 @@ public static unsafe class Rig2DLoader
             throw new InvalidDataException($"Invalid BRIG magic 0x{hdr.Magic:X8}.");
         if (hdr.Version != BrigHeader.CurrentVersion)
             throw new InvalidDataException($"Unsupported BRIG version {hdr.Version}.");
+        if (!float.IsFinite(hdr.OriginOffset.X) || !float.IsFinite(hdr.OriginOffset.Y) ||
+            !float.IsFinite(hdr.BoundsSize.X) || !float.IsFinite(hdr.BoundsSize.Y))
+            throw new InvalidDataException("Corrupt BRIG header: non-finite OriginOffset or BoundsSize.");
 
         if (hdr.BoneCount < 0 || hdr.BoneCount > Rig2DAssetData.MaxBonesPerRig ||
             hdr.SlotCount < 0 || hdr.AttachmentCount < 0 ||
@@ -133,7 +136,7 @@ public static unsafe class Rig2DLoader
             for (int i = 0; i < hdr.IkConstraintCount; i++)
             {
                 if ((uint)iks[i].BoneA >= (uint)hdr.BoneCount ||
-                    (iks[i].BoneB != -1 && (uint)iks[i].BoneB >= (uint)hdr.BoneCount) ||
+                    (iks[i].BoneB != -1 && ((uint)iks[i].BoneB >= (uint)hdr.BoneCount || iks[i].BoneB == iks[i].BoneA)) ||
                     (uint)iks[i].TargetBone >= (uint)hdr.BoneCount)
                     throw new InvalidDataException($"Corrupt BRIG IK constraint {i}.");
             }
@@ -171,32 +174,58 @@ public static unsafe class Rig2DLoader
                 if (tl.KeyStart < 0 || tl.KeyCount < 0 || tl.KeyStart + tl.KeyCount > hdr.KeyframeCount)
                     throw new InvalidDataException($"Corrupt BRIG timeline {i} keyframe range.");
 
-                if (tl.Target == Rig2DTimelineTarget.DrawOrder)
+                switch (tl.Target)
                 {
-                    for (int k = 0; k < tl.KeyCount; k++)
-                    {
-                        int off = keyframes[tl.KeyStart + k].IntVal;
-                        if (off != -1 && (off < 0 || off + hdr.SlotCount > hdr.DrawOrderPoolCount))
-                            throw new InvalidDataException($"Corrupt BRIG drawOrder keyframe pool offset {off}.");
-                        if (off >= 0)
+                    case Rig2DTimelineTarget.BoneRotate:
+                    case Rig2DTimelineTarget.BoneTranslate:
+                    case Rig2DTimelineTarget.BoneScale:
+                    case Rig2DTimelineTarget.BoneShear:
+                        if ((uint)tl.TargetIndex >= (uint)hdr.BoneCount)
+                            throw new InvalidDataException($"Corrupt BRIG bone timeline {i} bone index {tl.TargetIndex}.");
+                        break;
+
+                    case Rig2DTimelineTarget.SlotAttachment:
+                    case Rig2DTimelineTarget.SlotColor:
+                    case Rig2DTimelineTarget.SlotDarkColor:
+                    case Rig2DTimelineTarget.SlotSequenceFrame:
+                        if ((uint)tl.TargetIndex >= (uint)hdr.SlotCount)
+                            throw new InvalidDataException($"Corrupt BRIG slot timeline {i} slot index {tl.TargetIndex}.");
+                        break;
+
+                    case Rig2DTimelineTarget.ConstraintMix:
+                        if ((uint)tl.TargetIndex >= (uint)hdr.ConstraintOrderCount)
+                            throw new InvalidDataException($"Corrupt BRIG constraint timeline {i} constraint index {tl.TargetIndex}.");
+                        break;
+
+                    case Rig2DTimelineTarget.DrawOrder:
+                        for (int k = 0; k < tl.KeyCount; k++)
                         {
-                            for (int s = 0; s < hdr.SlotCount; s++)
-                                if ((uint)drawOrderPool[off + s] >= (uint)hdr.SlotCount)
-                                    throw new InvalidDataException($"Corrupt BRIG drawOrder slot index.");
+                            int off = keyframes[tl.KeyStart + k].IntVal;
+                            if (off != -1 && (off < 0 || off + hdr.SlotCount > hdr.DrawOrderPoolCount))
+                                throw new InvalidDataException($"Corrupt BRIG drawOrder keyframe pool offset {off}.");
+                            if (off >= 0)
+                            {
+                                for (int s = 0; s < hdr.SlotCount; s++)
+                                    if ((uint)drawOrderPool[off + s] >= (uint)hdr.SlotCount)
+                                        throw new InvalidDataException($"Corrupt BRIG drawOrder slot index.");
+                            }
                         }
-                    }
-                }
-                else if (tl.Target == Rig2DTimelineTarget.MeshDeform)
-                {
-                    if ((uint)tl.TargetIndex >= (uint)hdr.AttachmentCount)
-                        throw new InvalidDataException($"Corrupt BRIG deform timeline {i} attachment index {tl.TargetIndex}.");
-                    int vc = attachments[tl.TargetIndex].VertexCount;
-                    for (int k = 0; k < tl.KeyCount; k++)
-                    {
-                        int off = keyframes[tl.KeyStart + k].IntVal;
-                        if (off < 0 || off + vc > hdr.DeformPoolCount)
-                            throw new InvalidDataException($"Corrupt BRIG deform keyframe pool offset {off}.");
-                    }
+                        break;
+
+                    case Rig2DTimelineTarget.MeshDeform:
+                        if ((uint)tl.TargetIndex >= (uint)hdr.AttachmentCount)
+                            throw new InvalidDataException($"Corrupt BRIG deform timeline {i} attachment index {tl.TargetIndex}.");
+                        int vc = attachments[tl.TargetIndex].VertexCount;
+                        for (int k = 0; k < tl.KeyCount; k++)
+                        {
+                            int off = keyframes[tl.KeyStart + k].IntVal;
+                            if (off < 0 || off + vc > hdr.DeformPoolCount)
+                                throw new InvalidDataException($"Corrupt BRIG deform keyframe pool offset {off}.");
+                        }
+                        break;
+
+                    default:
+                        throw new InvalidDataException($"Corrupt BRIG timeline {i} unknown target {(byte)tl.Target}.");
                 }
             }
 

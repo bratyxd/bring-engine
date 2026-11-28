@@ -85,7 +85,7 @@ Shipped inside every `bring-sdk-vX.Y.Z.zip` with zero external ML/Node dependenc
 # 1. Generate a starter rig template (biped | quadruped | creature | prop)
 BringRig2D template --type biped --name hero --out raw/hero.rig2d.json
 
-# 2. Clean AI-generated part PNGs (auto/explicit chroma key, soft feather, despill, tight trim + pad, optional island split)
+# 2. Clean AI-generated part PNGs (border flood-fill + tight interior key removal, 3px edge feather/despill, tight trim + pad, optional --global-key / --split-islands)
 BringRig2D prep --input raw_gen/ --output raw/parts/ --key auto --despill --trim --pad 4 --manifest raw/prep_manifest.json
 
 # 3. Auto-triangulate silhouette meshes & compute smooth bone weights (honoring autoMesh + weightPins)

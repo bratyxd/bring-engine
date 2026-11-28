@@ -841,12 +841,7 @@ public static unsafe class BatchRenderer
                 var cu = new SimpleCameraUniformsGpu { ViewProj = cam.ViewProjMatrix, CameraPosTime = new Vec4(cam.ShakenPosition, packet.WorldTotalTime) };
                 SDL.PushGPUVertexUniformData(cmd, 0, (nint)(&cu), (uint)sizeof(SimpleCameraUniformsGpu));
 
-                var rvb = new SDL.GPUBufferBinding { Buffer = gpu.Rig2DVertexBuffer, Offset = 0 };
-                var rib = new SDL.GPUBufferBinding { Buffer = gpu.Rig2DIndexBuffer, Offset = 0 };
-                SDL.BindGPUVertexBuffers(pass, 0, (nint)(&rvb), 1);
-                SDL.BindGPUIndexBuffer(pass, in rib, SDL.GPUIndexElementSize.IndexElementSize32Bit);
-                boundMeshSlot = -1;
-                quadIndexBound = false;
+                bool rig2DBuffersBound = false;
                 boundSamplerCount = -1;
 
                 for (int bi = 0; bi < cam.Rig2DBatchCount; bi++)
@@ -872,6 +867,17 @@ public static unsafe class BatchRenderer
                         boundPipeline = pipe;
                         stats.PipelineBinds++;
                         passChanged = true;
+                    }
+
+                    if (!rig2DBuffersBound || passChanged)
+                    {
+                        var rvb = new SDL.GPUBufferBinding { Buffer = gpu.Rig2DVertexBuffer, Offset = 0 };
+                        var rib = new SDL.GPUBufferBinding { Buffer = gpu.Rig2DIndexBuffer, Offset = 0 };
+                        SDL.BindGPUVertexBuffers(pass, 0, (nint)(&rvb), 1);
+                        SDL.BindGPUIndexBuffer(pass, in rib, SDL.GPUIndexElementSize.IndexElementSize32Bit);
+                        rig2DBuffersBound = true;
+                        boundMeshSlot = -1;
+                        quadIndexBound = false;
                     }
 
                     int neededSamplers = sSlot->FragmentSamplerCount;
@@ -2333,7 +2339,6 @@ public static unsafe class BatchRenderer
                     }
 
                     if (addedIndices == 0u) continue;
-                    emittedAnyForRig = true;
 
                     // Coalesce consecutive draws with identical GPU state into ONE batched draw call!
                     if (outBatches.Count > batchStart)
@@ -2347,16 +2352,21 @@ public static unsafe class BatchRenderer
                             prev.IndexOffset + prev.IndexCount == idxStart)
                         {
                             prev.IndexCount += addedIndices;
+                            emittedAnyForRig = true;
                             continue;
                         }
                     }
 
                     if (outBatches.Count >= outBatches.Capacity)
                     {
+                        // Roll back vertices & indices emitted for this unbatchable slot so no orphans remain
+                        outVerts.Count = (int)baseVert;
+                        outIndices.Count = (int)idxStart;
                         warnedCap = true;
                         break;
                     }
 
+                    emittedAnyForRig = true;
                     outBatches.Add(new Rig2DBatchCmd
                     {
                         TextureGpuSlot = texSlot,

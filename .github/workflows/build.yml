@@ -151,7 +151,13 @@ jobs:
           dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r win-x64
           ./tools/BringPacker/bin/Release/net10.0/win-x64/publish/BringPacker.exe --help
           dotnet publish tools/BringRig2D/BringRig2D.csproj -c Release -r win-x64
-          ./tools/BringRig2D/bin/Release/net10.0/win-x64/publish/BringRig2D.exe --help
+          $rig = "./tools/BringRig2D/bin/Release/net10.0/win-x64/publish/BringRig2D.exe"
+          & $rig --help
+          $smoke = Join-Path $env:RUNNER_TEMP "rig2d_ci_smoke"
+          New-Item -ItemType Directory -Force -Path $smoke | Out-Null
+          & $rig template --type biped --name ci_smoke --out (Join-Path $smoke "ci_smoke.rig2d.json")
+          & $rig validate --rig (Join-Path $smoke "ci_smoke.rig2d.json")
+          Remove-Item -Recurse -Force $smoke
       - name: Publish & verify ShowcaseGame (Self-Contained ReadyToRun + Headless + Render)
         shell: pwsh
         run: |
@@ -196,7 +202,13 @@ jobs:
           dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r linux-x64
           ./tools/BringPacker/bin/Release/net10.0/linux-x64/publish/BringPacker --help
           dotnet publish tools/BringRig2D/BringRig2D.csproj -c Release -r linux-x64
-          ./tools/BringRig2D/bin/Release/net10.0/linux-x64/publish/BringRig2D --help
+          RIG=./tools/BringRig2D/bin/Release/net10.0/linux-x64/publish/BringRig2D
+          "$RIG" --help
+          SMOKE="${RUNNER_TEMP}/rig2d_ci_smoke"
+          mkdir -p "$SMOKE"
+          "$RIG" template --type biped --name ci_smoke --out "${SMOKE}/ci_smoke.rig2d.json"
+          "$RIG" validate --rig "${SMOKE}/ci_smoke.rig2d.json"
+          rm -rf "$SMOKE"
       - name: Publish & verify ShowcaseGame (Self-Contained ReadyToRun + Headless + Render)
         run: |
           dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r linux-x64
@@ -232,7 +244,13 @@ jobs:
           dotnet publish tools/BringPacker/BringPacker.csproj -c Release -r osx-arm64
           ./tools/BringPacker/bin/Release/net10.0/osx-arm64/publish/BringPacker --help
           dotnet publish tools/BringRig2D/BringRig2D.csproj -c Release -r osx-arm64
-          ./tools/BringRig2D/bin/Release/net10.0/osx-arm64/publish/BringRig2D --help
+          RIG=./tools/BringRig2D/bin/Release/net10.0/osx-arm64/publish/BringRig2D
+          "$RIG" --help
+          SMOKE="${RUNNER_TEMP}/rig2d_ci_smoke"
+          mkdir -p "$SMOKE"
+          "$RIG" template --type biped --name ci_smoke --out "${SMOKE}/ci_smoke.rig2d.json"
+          "$RIG" validate --rig "${SMOKE}/ci_smoke.rig2d.json"
+          rm -rf "$SMOKE"
       - name: Publish & verify ShowcaseGame (Self-Contained ReadyToRun Headless)
         run: |
           dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r osx-arm64

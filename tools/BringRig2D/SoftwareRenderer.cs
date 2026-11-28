@@ -68,8 +68,8 @@ public static unsafe class SoftwareRenderer
         string rigDir = Path.GetDirectoryName(Path.GetFullPath(rigPath)) ?? ".";
         string imgBase = !string.IsNullOrEmpty(opts.ImagesDir) ? Path.GetFullPath(opts.ImagesDir) : rigDir;
 
-        // 1. Load loose part PNGs keyed by normalized region StringId (matching Rig2DCompiler.NormalizeRegionKey)
-        var imageMap = LoadReferencedImages(rigPath, imgBase, rigDir);
+        // 1. Load loose part PNGs keyed by normalized region StringId + event name lookup from .rig2d.json
+        LoadRigJsonMetadata(rigPath, imgBase, rigDir, out var imageMap, out var eventNames);
 
         // 2. Compile .rig2d.json -> BRIG and load into a real Bring EngineWorld!
         byte[] brig = Rig2DCompiler.CompileFromFile(rigPath);
@@ -179,8 +179,15 @@ public static unsafe class SoftwareRenderer
                                 Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, h, ref alloc.Frame, ref alloc.Scratch);
                                 var fired = Rig2DSystem.GetFiredEvents(in world.Rigs);
                                 for (int e = 0; e < fired.Length; e++)
+                                {
                                     if (fired[e].Instance == animInst)
-                                        frameEvents.Add($"EV:{fired[e].IntVal}");
+                                    {
+                                        string label = eventNames.TryGetValue(fired[e].EventName.Value, out string? evName) && !string.IsNullOrEmpty(evName)
+                                            ? evName
+                                            : $"EV:{fired[e].IntVal}";
+                                        frameEvents.Add(label);
+                                    }
+                                }
                             }
 
                             byte[] cellBuf = CreateBackdrop(cellW, cellH, opts.BgColor, checker: false);
@@ -251,24 +258,31 @@ public static unsafe class SoftwareRenderer
         }
     }
 
-    private static Dictionary<ulong, LoadedImage> LoadReferencedImages(string rigPath, string imgBase, string rigDir)
+    private static void LoadRigJsonMetadata(
+        string rigPath,
+        string imgBase,
+        string rigDir,
+        out Dictionary<ulong, LoadedImage> imageMap,
+        out Dictionary<ulong, string> eventNames)
     {
-        var map = new Dictionary<ulong, LoadedImage>();
+        imageMap = new Dictionary<ulong, LoadedImage>();
+        eventNames = new Dictionary<ulong, string>();
         byte[] raw = File.ReadAllBytes(rigPath);
         if (raw.Length >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) raw = raw[3..];
         if (JsonNode.Parse(raw, documentOptions: new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true }) is not JsonObject root)
-            return map;
+            return;
 
+        var imgDict = imageMap;
         void TryLoad(string rel)
         {
             if (string.IsNullOrEmpty(rel)) return;
             string key = Rig2DCompiler.NormalizeRegionKey(rel);
             ulong hash = StringId.Hash(key).Value;
-            if (map.ContainsKey(hash)) return;
+            if (imgDict.ContainsKey(hash)) return;
             string? full = AutoMesher.ResolveImagePath(imgBase, rigDir, rel);
             if (full == null) return;
             ImageResult dec = ImageResult.FromMemory(File.ReadAllBytes(full), ColorComponents.RedGreenBlueAlpha);
-            map[hash] = new LoadedImage { Rgba = dec.Data, Width = dec.Width, Height = dec.Height };
+            imgDict[hash] = new LoadedImage { Rgba = dec.Data, Width = dec.Width, Height = dec.Height };
         }
 
         if (root["skins"] is JsonObject skins)
@@ -293,7 +307,31 @@ public static unsafe class SoftwareRenderer
                 }
             }
         }
-        return map;
+
+        if (root["events"] is JsonObject evDefs)
+        {
+            foreach (var evKv in evDefs)
+            {
+                if (!string.IsNullOrEmpty(evKv.Key))
+                    eventNames[StringId.Hash(evKv.Key).Value] = evKv.Key;
+            }
+        }
+
+        if (root["animations"] is JsonObject anims)
+        {
+            foreach (var animKv in anims)
+            {
+                if (animKv.Value is not JsonObject animObj) continue;
+                if (animObj["events"] is not JsonArray evArr) continue;
+                foreach (var evNode in evArr)
+                {
+                    if (evNode is not JsonObject evObj) continue;
+                    string? evName = evObj["name"]?.GetValue<string>();
+                    if (!string.IsNullOrEmpty(evName))
+                        eventNames[StringId.Hash(evName).Value] = evName;
+                }
+            }
+        }
     }
 
     private static void ComputeFraming(
