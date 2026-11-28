@@ -41,7 +41,7 @@ public unsafe struct EngineWorld
         int maxRig2DAssets = 128,
         int maxRig2DInstances = 256)
     {
-        int maxAnimPlayers = maxEntities < 512 ? 256 : (maxEntities <= 1024 ? 512 : 1024);
+        int maxAnimPlayers = maxEntities < 512 ? 128 : (maxEntities <= 1024 ? 256 : 1024);
         int maxSpritePlayers = maxEntities < 512 ? 512 : (maxEntities <= 1024 ? 1024 : 2048);
 
         return new EngineWorld
