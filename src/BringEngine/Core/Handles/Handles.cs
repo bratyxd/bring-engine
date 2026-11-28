@@ -541,3 +541,45 @@ public readonly struct SpriteAnimClipHandle : IEquatable<SpriteAnimClipHandle>
     public static bool operator !=(SpriteAnimClipHandle a, SpriteAnimClipHandle b) => a.Raw != b.Raw;
     public override string ToString() => IsValid ? $"SpriteAnimClip({Index}:g{Generation})" : "SpriteAnimClip(Invalid)";
 }
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct Rig2DAssetHandle : IEquatable<Rig2DAssetHandle>
+{
+    public readonly uint Raw;
+    public static readonly Rig2DAssetHandle Invalid = default;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Rig2DAssetHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Rig2DAssetHandle Create(uint index, uint generation) => new Rig2DAssetHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(Rig2DAssetHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is Rig2DAssetHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(Rig2DAssetHandle a, Rig2DAssetHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(Rig2DAssetHandle a, Rig2DAssetHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"Rig2DAsset({Index}:g{Generation})" : "Rig2DAsset(Invalid)";
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct Rig2DInstanceHandle : IEquatable<Rig2DInstanceHandle>
+{
+    public readonly uint Raw;
+    public static readonly Rig2DInstanceHandle Invalid = default;
+    public bool IsValid => (Raw >> HandlePacking.GenerationShift) != 0;
+    public uint Index => HandlePacking.UnpackIndex(Raw);
+    public uint Generation => HandlePacking.UnpackGeneration(Raw);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Rig2DInstanceHandle(uint raw) => Raw = raw;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Rig2DInstanceHandle Create(uint index, uint generation) => new Rig2DInstanceHandle(HandlePacking.Pack(index, generation));
+    public bool Equals(Rig2DInstanceHandle other) => Raw == other.Raw;
+    public override bool Equals(object? obj) => obj is Rig2DInstanceHandle other && Raw == other.Raw;
+    public override int GetHashCode() => (int)Raw;
+    public static bool operator ==(Rig2DInstanceHandle a, Rig2DInstanceHandle b) => a.Raw == b.Raw;
+    public static bool operator !=(Rig2DInstanceHandle a, Rig2DInstanceHandle b) => a.Raw != b.Raw;
+    public override string ToString() => IsValid ? $"Rig2DInstance({Index}:g{Generation})" : "Rig2DInstance(Invalid)";
+}

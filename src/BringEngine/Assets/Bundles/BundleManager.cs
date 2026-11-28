@@ -13,6 +13,7 @@ using BringEngine.Core.Handles;
 using BringEngine.Core.Logging;
 using BringEngine.Core.Memory;
 using BringEngine.Simulation.Animation;
+using BringEngine.Simulation.Rig2D;
 using BringEngine.Simulation.World;
 
 namespace BringEngine.Assets.Bundles;
@@ -242,6 +243,7 @@ public static unsafe class BundleSystem
         {
             AssetSystem.UnloadByBundle(ref world.Assets, b.Handle);
             AnimationSystem.UnregisterByBundle(ref world.Animations, b.Handle);
+            Rig2DSystem.UnregisterByBundle(ref world.Rigs, b.Handle);
             if (b.Arena.IsValid)
                 b.Arena.Dispose();
             b.Loaded = 0;
@@ -279,6 +281,7 @@ public static unsafe class BundleSystem
 
         AssetSystem.UnloadByBundle(ref world.Assets, b.Handle);
         AnimationSystem.UnregisterByBundle(ref world.Animations, b.Handle);
+        Rig2DSystem.UnregisterByBundle(ref world.Rigs, b.Handle);
         b.Arena.Dispose();
         b.Loaded = 0;
 
@@ -297,6 +300,7 @@ public static unsafe class BundleSystem
                 nuint reclaimedBytes = b.Arena.Capacity;
                 AssetSystem.UnloadByBundle(ref world.Assets, b.Handle);
                 AnimationSystem.UnregisterByBundle(ref world.Animations, b.Handle);
+                Rig2DSystem.UnregisterByBundle(ref world.Rigs, b.Handle);
                 b.Arena.Dispose();
                 b.Loaded = 0;
                 b.RefCount = 0;
@@ -391,6 +395,15 @@ public static unsafe class BundleSystem
                     else if (type == "font")
                     {
                         SdfFontLoader.BakeSdfFromSystemOrFile(string.IsNullOrEmpty(full) ? null : full, ref bundleArena, ref world.Assets, bundle, nameId, fontSize, log: log);
+                    }
+                    else if (type == "rig2d")
+                    {
+                        if (string.IsNullOrEmpty(full) || !File.Exists(full))
+                            throw new FileNotFoundException($"Manifest rig2d asset '{name}' not found: '{full}'.", full);
+                        byte[] brigBytes = full.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
+                            ? Rig2DCompiler.CompileFromFile(full)
+                            : File.ReadAllBytes(full);
+                        Rig2DLoader.LoadFromMemory(brigBytes, ref bundleArena, ref world.Rigs, bundle, nameId);
                     }
                     else
                     {

@@ -9,6 +9,7 @@ using BringEngine.Simulation.Camera;
 using BringEngine.Simulation.Input;
 using BringEngine.Simulation.Particles;
 using BringEngine.Simulation.RenderData;
+using BringEngine.Simulation.Rig2D;
 using BringEngine.Simulation.Tween;
 
 namespace BringEngine.Simulation.World;
@@ -25,6 +26,7 @@ public unsafe struct EngineWorld
     public CameraTable Cameras;
     public TweenTable Tweens;
     public AnimationTable Animations;
+    public Rig2DTable Rigs;
     public ParticleTable Particles;
     public RenderComponentTables RenderComponents;
     public AssetRegistry Assets;
@@ -35,7 +37,9 @@ public unsafe struct EngineWorld
     public static EngineWorld Create(
         ref LinearArena persistentArena,
         int maxEntities = 16384,
-        int maxParticles = 16384)
+        int maxParticles = 16384,
+        int maxRig2DAssets = 128,
+        int maxRig2DInstances = 256)
     {
         return new EngineWorld
         {
@@ -44,6 +48,7 @@ public unsafe struct EngineWorld
             Cameras = CameraTable.Create(ref persistentArena, 32),
             Tweens = TweenTable.Create(ref persistentArena, 4096),
             Animations = AnimationTable.Create(ref persistentArena, 256, 512, 1024, 256, 2048),
+            Rigs = Rig2DTable.Create(ref persistentArena, maxRig2DAssets, maxRig2DInstances),
             Particles = ParticleTable.Create(ref persistentArena, maxParticles, 256),
             RenderComponents = RenderComponentTables.Create(ref persistentArena, 8192, 4096, 1024),
             Assets = AssetRegistry.Create(ref persistentArena, 1024, 512, 1024, 64, 256),
@@ -92,6 +97,7 @@ public static unsafe class EngineWorldSystem
 
             TransformSystem.Remove(ref world.Transforms, cur);
             AnimationSystem.RemoveByEntity(ref world.Animations, cur);
+            Rig2DSystem.RemoveByEntity(ref world.Rigs, cur);
             RenderComponentSystem.RemoveByEntity(ref world.RenderComponents, cur);
             TweenSystem.KillByEntity(ref world.Tweens, cur);
             EntitySystem.Destroy(ref world.Entities, cur);
@@ -104,6 +110,7 @@ public static unsafe class EngineWorldSystem
         CameraSystem.DestroyByScene(ref world.Cameras, scene);
         ParticleSystem.DestroyByScene(ref world.Particles, scene);
         AnimationSystem.RemoveByScene(ref world.Animations, scene);
+        Rig2DSystem.RemoveByScene(ref world.Rigs, scene);
         RenderComponentSystem.RemoveByScene(ref world.RenderComponents, scene);
 
         ArenaMarker mark = tempArena.SaveMarker();
@@ -113,6 +120,7 @@ public static unsafe class EngineWorldSystem
             EntityId e = entities[i];
             TransformSystem.Remove(ref world.Transforms, e);
             AnimationSystem.RemoveByEntity(ref world.Animations, e);
+            Rig2DSystem.RemoveByEntity(ref world.Rigs, e);
             RenderComponentSystem.RemoveByEntity(ref world.RenderComponents, e);
             TweenSystem.KillByEntity(ref world.Tweens, e);
             EntitySystem.Destroy(ref world.Entities, e);
@@ -121,7 +129,7 @@ public static unsafe class EngineWorldSystem
     }
 
     /// <summary>
-    /// Advances core engine simulation systems (Tweens -> Transforms -> Animations -> Particles -> Cameras -> Text clocks).
+    /// Advances core engine simulation systems (Tweens -> Transforms -> Animations -> Rig2D -> Particles -> Cameras -> Text clocks).
     /// Completely headless and zero-GC. Pass an optional JobScheduler* to accelerate large transform hierarchies
     /// and particle pools automatically above their parallel thresholds (small counts stay single-threaded inline).
     /// </summary>
@@ -136,6 +144,7 @@ public static unsafe class EngineWorldSystem
         TweenSystem.StepAll(ref world.Tweens, ref world.Transforms, ref world.Cameras, ref world.RenderComponents, dt);
         TransformSystem.PropagateHierarchy(ref world.Transforms, jobs);
         AnimationSystem.StepAll(ref world.Animations, dt, ref alloc.Frame, ref alloc.Scratch);
+        Rig2DSystem.StepAll(ref world.Rigs, in world.Transforms, dt, ref alloc.Frame, ref alloc.Scratch);
         ParticleSystem.Step(ref world.Particles, in world.Transforms, dt, jobs);
         CameraSystem.UpdateAll(ref world.Cameras, in world.Transforms, dt, viewportWidth, viewportHeight);
         RenderComponentSystem.StepTextAnimClocks(ref world.RenderComponents, dt);
