@@ -42,8 +42,18 @@ dotnet publish src/ShowcaseGame/ShowcaseGame.csproj -c Release -r osx-arm64 -o d
 ```
 See [`docs/agents/14-publishing-and-distribution.md`](docs/agents/14-publishing-and-distribution.md) for Linux executable/symlink packaging, macOS `.app` bundling and signing/notarization without a Mac, and baseline release sizes.
 
+## Mandatory Engine Review & Fix Phase (All Agents)
+Whenever **engine code** is updated (any change under `src/BringEngine/`, `tools/BringPacker/`, `tools/BringRig2D/`, `src/ShowcaseGame/`, shaders, project files, or `tests/BringEngine.Tests/`), work is **NOT** complete when the implementor finishes. Every AI agent working on Bring Engine — locally or in any external environment — MUST execute this post-implementation review and fix cycle before pushing to CI or tagging a release:
+
+1. **Implementation**: Implement the engine change, add/update tests in `tests/BringEngine.Tests/`, sync affected docs, and confirm `dotnet build BringEngine.sln -c Release` succeeds with **0 warnings, 0 errors** (engine tests run on CI only).
+2. **Independent PR Review Plan — From Scratch (`Neon xhigh`)**: Perform a fresh PR code review directly against the actual `git diff` and affected source/shader/test/doc files (never relying on or rubber-stamping the implementor's summary). Audit correctness & edge cases, Zero-OOP compliance, explicit native allocators / 0-GC hot paths / 0 native leaks, determinism & Sim/View separation, threading & Two-Zone async contracts, cross-OS HLSL/GPU portability, selective `LogSystem` diagnostics, tests, and docs. Produce a prioritized **PR Review Plan** (severity, file/line, root cause, required fix & regression test) — or an explicit clean sign-off if zero actionable findings exist.
+3. **Dedicated Fix Phase (`Neon high`)**: Hand the review plan to a dedicated fix pass to apply every finding, add regression tests in `tests/BringEngine.Tests/` for every bug caught in review, sync affected docs, and re-verify a clean `dotnet build BringEngine.sln -c Release`.
+4. **Re-Verification (`Neon xhigh`)**: Verify the fix-phase diff against every item in the review plan so nothing is missed or regressed before pushing to `main` and running 3-OS GitHub Actions CI.
+
+Pure documentation / README-only updates (`*.md`, `docs/**` with zero code changes) are exempt and ship via the fast docs-only release path below. See [`AGENTS.md`](AGENTS.md) and [`docs/agents/15-engine-ci-and-releasing.md`](docs/agents/15-engine-ci-and-releasing.md) for full details.
+
 ## Releases & CI
-- **Mandatory Engine PR Review & Fix Phase**: Whenever engine code is updated, after the implementor agent finishes, every agent MUST use **`Neon xhigh`** to create a PR review plan from scratch and **`Neon high`** to apply that review plan in a dedicated fix phase before pushing to CI or releasing.
+- **Mandatory Review Gate**: All engine code updates must complete the **Mandatory Engine Review & Fix Phase** above before pushing to CI or releasing.
 - **Engine tests run on GitHub Actions CI only** (do not tie up the local machine running engine test suites).
 - **Code changes** pushed to `main` or PRs run the full 3-OS CoreCLR matrix (`windows-x64`, `linux-x64`, `macos-arm64`) in `.github/workflows/build.yml`. Tagged code releases (`vX.Y.Z`) run the full test matrix plus standalone SDK verification in `.github/workflows/release.yml` before publishing `bring-sdk-vX.Y.Z.zip`.
 - **Docs / README-only updates** pushed to `main` (with zero code changes since the latest tag) **skip the test suite** and automatically bump the patch version (`vX.Y.Z` → `vX.Y.(Z+1)`) and publish a new `bring-sdk-vX.Y.(Z+1).zip` GitHub Release.

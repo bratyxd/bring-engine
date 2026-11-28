@@ -38,7 +38,7 @@
    - Use 9-slice `SpriteDrawMode.Sliced` / `SlicedNoCenter` for scalable UI panels in a single instanced draw call. See [`docs/agents/13-asset-compression-atlases-and-9slice.md`](docs/agents/13-asset-compression-atlases-and-9slice.md).
 
 6. **Mandatory PR Review & Fix Phase for Engine Code Updates (Every Agent)**
-   - Whenever **engine code** is updated (any change under `src/BringEngine/`, `tools/BringPacker/`, `src/ShowcaseGame/`, shaders, project files, or `tests/BringEngine.Tests/`), work is **NOT** done when the implementor agent finishes.
+   - Whenever **engine code** is updated (any change under `src/BringEngine/`, `tools/BringPacker/`, `tools/BringRig2D/`, `src/ShowcaseGame/`, shaders, project files, or `tests/BringEngine.Tests/`), work is **NOT** done when the implementor agent finishes.
    - **PR Review Plan (`Neon xhigh`)**: After the implementor agent is done, use **`Neon xhigh`** to perform a fresh PR code review directly against the actual diff and affected files and **create a review plan from scratch**.
    - **Fix Phase (`Neon high`)**: Hand that review plan to **`Neon high`** to **apply the review plan and run a fix phase** (fixes, regression tests, doc sync, clean build — with `Neon xhigh` re-verifying blocking fixes) before pushing to GitHub Actions CI or tagging a release.
    - Pure docs/README-only updates (`*.md`, `docs/**`) are exempt. See [`docs/agents/15-engine-ci-and-releasing.md`](docs/agents/15-engine-ci-and-releasing.md).

@@ -22,7 +22,7 @@ Games consume released SDK archives (`bring-sdk-vX.Y.Z.zip`) from GitHub Release
 
 ## 2. Mandatory Post-Implementation PR Review & Fix Phase (Engine Code Changes)
 
-> **Binding for every agent**: Whenever **engine code** is updated (any change to `src/BringEngine/`, `tools/BringPacker/`, `src/ShowcaseGame/`, shaders, project files, or `tests/BringEngine.Tests/`), work is **NOT** complete when the implementor agent finishes. Every agent MUST run a PR-style review and fix phase before pushing to CI, tagging a release, or reporting done.
+> **Binding for every agent**: Whenever **engine code** is updated (any change to `src/BringEngine/`, `tools/BringPacker/`, `tools/BringRig2D/`, `src/ShowcaseGame/`, shaders, project files, or `tests/BringEngine.Tests/`), work is **NOT** complete when the implementor agent finishes. Every agent MUST run a PR-style review and fix phase before pushing to CI, tagging a release, or reporting done.
 
 1. **Implementation Phase (Implementor Agent)**:
    - Implement the engine change, add/update tests in `tests/BringEngine.Tests/`, update affected docs, and confirm a clean `dotnet build BringEngine.sln -c Release` (zero warnings).
