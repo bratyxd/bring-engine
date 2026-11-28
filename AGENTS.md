@@ -9,7 +9,7 @@
 
 1. **NO OOP — Pure Data + Static Systems**
    - NEVER use class inheritance, `virtual`, `override`, `abstract`, or interface dispatch in engine or game code.
-   - Store all state in `[StructLayout(LayoutKind.Sequential)]` `unmanaged struct` tables (SoA / dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `AnimPlayerHandle`, `SpriteAnimPlayerHandle`, `SpriteAnimClipHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`, `HttpRequestHandle`, `WebSocketHandle`, `LogFileHandle`, `SaveOpHandle`, `AudioClipHandle`, `AudioVoiceHandle` — 26 total).
+   - Store all state in `[StructLayout(LayoutKind.Sequential)]` `unmanaged struct` tables (SoA / dense sparse sets) referenced by 32-bit generational handles (`EntityId`, `SceneId`, `BundleId`, `MeshHandle`, `TextureHandle`, `MaterialHandle`, `ShaderHandle`, `FontHandle`, `GltfHandle`, `AnimClipHandle`, `SkeletonHandle`, `AnimPlayerHandle`, `SpriteAnimPlayerHandle`, `SpriteAnimClipHandle`, `Rig2DAssetHandle`, `Rig2DInstanceHandle`, `TweenHandle`, `EmitterHandle`, `CameraHandle`, `SpriteHandle`, `TextHandle`, `JobHandle`, `HttpRequestHandle`, `WebSocketHandle`, `LogFileHandle`, `SaveOpHandle`, `AudioClipHandle`, `AudioVoiceHandle` — 28 total).
    - Put behavior in `public static unsafe class <Feature>System` methods and use unmanaged function pointers (`delegate*<...>`) for callbacks.
 
 2. **Desktop CoreCLR (.NET 10) + Self-Contained ReadyToRun — Windows, Linux (Steam Deck), macOS**
@@ -52,11 +52,12 @@
   - `Core/` — `Memory/` (`LinearArena`, `PoolAllocator<T>`, `FreeListAllocator`, `EngineAllocators`, native containers, `FixedString*`, `StringId`), `Logging/` (`LogSystem`, zero-GC UTF-8 `[InterpolatedStringHandler]`, rolling files), `Storage/` (`PlatformPaths`, `SaveSystem`, atomic `.tmp`/`.bak` `BSAV` + Raw JSON + `SaveChunkWriter`/`SaveChunkReader`), `Profiling/` (`FrameProfiler`, `ProfilerSystem`), `Threading/` (`EnginePipelineSystem`, `JobSystem`), `Handles/`, `Math/` (`Fix32/64`, `FixVec2/3`, `DetMath`, `DetRng`, `Vec/Quat/Mat4`).
   - `Audio/` — `WavDecoder` (8/16/24/32-bit PCM & IEEE Float WAV + procedural wave helpers), `AudioSystem` (dedicated `BringEngine.AudioMixer` thread, SDL3 `SDL_AudioStream`, 4 volume/mute buses, pitch/pan/loop/stealing, headless fallback).
   - `Networking/` — Zero-dependency `.NET 10` BCL networking (`HttpSystem`, `WebSocketSystem`), zero-GC binary `NetWriter`/`NetReader`/`NetHash.Crc32`, pluggable `NetTransportVTable`, and deterministic `LoopbackTransportSystem`.
-  - `Simulation/` — `EntityTable`, `TransformTable`, `EngineWorld`, `CameraTable`, `InputState`, `TweenTable`, `AnimationTable`, `ParticleTable`, `RenderComponentTables`, `SceneManager`.
+  - `Simulation/` — `EntityTable`, `TransformTable`, `EngineWorld`, `CameraTable`, `InputState`, `TweenTable`, `AnimationTable`, `Rig2D` (`Rig2DData`, `Rig2DTable`, `Rig2DSolver`, `Rig2DCompiler`, `Rig2DLoader`), `ParticleTable`, `RenderComponentTables`, `SceneManager`.
   - `Assets/` — `AssetRegistry`, `BundleManager`, `Compression/` (BC1/BC3 `BRTX`, LZ4/Brotli, `BGLB`), `Atlases/` (`AtlasPacker`), `Packing/` (`AssetPackBuilder` / `AssetPackLoader`), `TextureLoader`, `SdfFontLoader`, `GltfLoader`, `GlbBuilder`.
   - `Rendering/` — `SdlPlatform`, `FramePacer`, `GpuContext`, `ShaderSystem` (`SDL_shadercross`), `SceneLighting` (incl. directional shadow mapping), `TextLayoutSystem`, `RenderPacket`, `BatchRenderer`, `ProfilerOverlay`.
-  - `Shaders/` — Built-in HLSL shaders (`pbr_mesh.hlsl`, `shadow_depth.hlsl`, `sprite_3d.hlsl`, `sdf_text.hlsl`, `particle.hlsl`).
+  - `Shaders/` — Built-in HLSL shaders (`pbr_mesh.hlsl`, `shadow_depth.hlsl`, `sprite_3d.hlsl`, `rig_2d.hlsl`, `sdf_text.hlsl`, `particle.hlsl`).
 - `tools/BringPacker/` — CoreCLR CLI bundler for `.bpack` bundles and `--verify-no-loose-textures`.
+- `tools/BringRig2D/` — CoreCLR zero-editor 2D skeletal rigging & AI authoring CLI (`prep`, `mesh`, `validate`, `render`, `template`, `pack`).
 - `src/ShowcaseGame/` — Canonical reference game (**"Bring Arena"**).
 - `tests/BringEngine.Tests/` — CoreCLR engine test suite (run on GitHub Actions CI only).
 
@@ -91,6 +92,7 @@
 | 17 | [`17-logging.md`](docs/agents/17-logging.md) | Zero-GC core `LogSystem`, unified OS paths (`PlatformPaths`), `LogFileHandle`, 10k-line FIFO trimming, and selective logging discipline |
 | 18 | [`18-save-system.md`](docs/agents/18-save-system.md) | Crash-safe atomic `SaveSystem` (`.tmp`/`.bak`, CRC32 recovery, LZ4/Brotli), Raw JSON vs. `BSAV`+JSON vs. versioned binary `SaveChunks` |
 | 19 | [`19-audio.md`](docs/agents/19-audio.md) | Zero-GC core `AudioSystem` (SDL3 `SDL_AudioStream`, dedicated mixer thread, WAV/`.bpack`, `Master`/`Music`/`Sfx`/`Ui` buses, pitch/pan/loop, headless fallback) |
+| 20 | [`20-2d-skeletal-rigging.md`](docs/agents/20-2d-skeletal-rigging.md) | Zero-OOP/0-GC `Rig2D` skeletal & deformable mesh animation (IK, springs, skins, FFD, 8-track mixer, batched `rig_2d.hlsl`), `.bpack` `BRIG` packing & `BringRig2D` CLI |
 
 ---
 

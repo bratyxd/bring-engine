@@ -24,6 +24,7 @@ public static class Program
         TweenAnimParticleTests.RunAll();
         AssetBundleSceneGltfTests.RunAll();
         AssetPackingAndNineSliceTests.RunAll(headlessOnly);
+        Rig2DTests.RunAll(headlessOnly);
         RenderTests.RunAll(headlessOnly);
         ProfilingAndPacingTests.RunAll(headlessOnly);
 
